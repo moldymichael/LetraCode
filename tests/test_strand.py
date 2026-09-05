@@ -1,5 +1,8 @@
 import hashlib
 import os
+import multiprocessing
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -117,3 +120,96 @@ def test_atomic_write_failure_leaves_original_content(tmp_path, monkeypatch):
     with pytest.raises(OSError, match='disk failure'):
         strand.replace('global', 'New content', original['sha256'])
     assert strand.snapshot('global')['text'] == original['text']
+
+
+def test_file_swapped_to_fifo_during_open_is_rejected_without_blocking(tmp_path):
+    strand = Store(tmp_path / 'data').strand
+    target = strand.root / 'memory/global.md'
+    context = multiprocessing.get_context('fork')
+    result = context.Queue()
+
+    def read_during_swap():
+        original_open = os.open
+
+        def swap(name, flags, *args, **kwargs):
+            if name == 'global.md':
+                target.unlink()
+                os.mkfifo(target)
+            return original_open(name, flags, *args, **kwargs)
+
+        os.open = swap
+        try:
+            strand.snapshot('global')
+            result.put('accepted FIFO')
+        except (ValueError, OSError) as error:
+            result.put(str(error))
+
+    child = context.Process(target=read_during_swap)
+    child.start()
+    child.join(1)
+    blocked = child.is_alive()
+    if blocked:
+        child.terminate()
+        child.join()
+    assert not blocked, 'Memory read blocked after target changed to FIFO'
+    assert 'Unsafe' in result.get(timeout=1)
+
+
+@pytest.mark.parametrize('grow_during_open', [False, True])
+def test_oversized_external_file_is_preserved_and_read_fails_explicitly(tmp_path, monkeypatch, grow_during_open):
+    strand = Store(tmp_path / 'data').strand
+    target = strand.root / 'memory/global.md'
+    oversized = b'x' * (2 * 1024 * 1024 + 1)
+    if grow_during_open:
+        original_open = os.open
+
+        def grow(name, flags, *args, **kwargs):
+            if name == 'global.md':
+                target.write_bytes(oversized)
+            return original_open(name, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, 'open', grow)
+    else:
+        target.write_bytes(oversized)
+    with pytest.raises(ValueError, match='too large|size limit'):
+        strand.snapshot('global')
+    assert target.read_bytes() == oversized
+
+
+def test_oversized_write_is_rejected_without_changing_memory(tmp_path):
+    strand = Store(tmp_path / 'data').strand
+    before = strand.snapshot('global')
+    with pytest.raises(ValueError, match='too large|size limit'):
+        strand.replace('global', 'x' * (2 * 1024 * 1024 + 1), before['sha256'])
+    assert strand.snapshot('global') == before
+
+
+def test_separate_instances_cannot_both_save_against_the_same_snapshot(tmp_path, monkeypatch):
+    first = Store(tmp_path / 'data').strand
+    second = Store(tmp_path / 'data').strand
+    before = first.snapshot('global')
+    barrier = threading.Barrier(2)
+    original_replace = os.replace
+
+    def race(src, dst, *args, **kwargs):
+        if str(dst) == 'global.md':
+            try:
+                barrier.wait(timeout=0.25)
+            except threading.BrokenBarrierError:
+                pass
+        return original_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'replace', race)
+
+    def save(strand, content):
+        try:
+            strand.replace('global', content, before['sha256'])
+            return 'saved'
+        except ValueError as error:
+            assert 'changed' in str(error)
+            return 'conflict'
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        one = executor.submit(save, first, 'First change')
+        two = executor.submit(save, second, 'Second change')
+        assert sorted([one.result(timeout=3), two.result(timeout=3)]) == ['conflict', 'saved']

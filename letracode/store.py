@@ -59,10 +59,9 @@ class Store:
             ''')
         self.path.chmod(0o600)
         if version == 1:
-            self._migration_backup()
-        self.strand = StrandFiles(self.directory / 'strand')
-        if version == 1:
             self._migrate_memory()
+        else:
+            self.strand = StrandFiles(self.directory / 'strand')
 
     def _migration_backup(self):
         directory = self.directory / 'migration-backups'
@@ -84,6 +83,16 @@ class Store:
     def _migrate_memory(self):
         changes = []
         with self.connection() as db:
+            # Lock legacy writers before backing up or reading their values.
+            db.execute('BEGIN IMMEDIATE')
+            version = db.execute('PRAGMA user_version').fetchone()[0]
+            if version == 2:
+                self.strand = StrandFiles(self.directory / 'strand')
+                return
+            if version != 1:
+                raise RuntimeError('Database version changed before memory migration')
+            self._migration_backup()
+            self.strand = StrandFiles(self.directory / 'strand')
             rows = db.execute('SELECT id,memory FROM projects').fetchall()
             # Check every destination before moving any legacy text. Matching
             # files permit safe recovery after a crash preceding SQLite commit.

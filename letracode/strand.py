@@ -6,6 +6,7 @@ All paths are app-owned; no-follow directory descriptors prevent link redirectio
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
 import re
@@ -15,6 +16,10 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+
+MAX_FILE_BYTES = 2 * 1024 * 1024
+# JSON escaping can expand a supported memory file by up to six times.
+MAX_RECEIPT_BYTES = 16 * 1024 * 1024
 
 
 def digest(data: bytes) -> str:
@@ -46,34 +51,44 @@ def safe_directory(path: Path, create=False):
         os.close(fd)
 
 
-def _read_at(fd, name):
+def _read_at(fd, name, max_bytes=MAX_FILE_BYTES):
     try:
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise ValueError(f'Unsafe file or linked target: {name}')
-    stream = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    if info.st_size > max_bytes:
+        raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
+    stream = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     with os.fdopen(stream, 'rb') as incoming:
         opened = os.fstat(incoming.fileno())
-        if opened.st_nlink != 1 or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+        if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+            raise ValueError(f'Unsafe file or linked target: {name}')
+        if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
             raise ValueError(f'File changed while opening: {name}')
-        data = incoming.read()
+        if opened.st_size > max_bytes:
+            raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
+        data = incoming.read(max_bytes + 1)
+        if len(data) > max_bytes:
+            raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
         after = os.fstat(incoming.fileno())
         if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
             raise ValueError(f'File changed while reading: {name}')
     return data
 
 
-def safe_read(path: Path):
+def safe_read(path: Path, max_bytes=MAX_FILE_BYTES):
     with safe_directory(path.parent) as fd:
-        return _read_at(fd, path.name)
+        return _read_at(fd, path.name, max_bytes)
 
 
-def safe_write(path: Path, data: bytes, expected_sha256: str | None):
+def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_bytes=MAX_FILE_BYTES):
     """Atomically replace only a matching regular file; None means create only."""
+    if len(data) > max_bytes:
+        raise ValueError(f'File is too large (size limit {max_bytes} bytes): {path}')
     with safe_directory(path.parent) as fd:
-        original = _read_at(fd, path.name)
+        original = _read_at(fd, path.name, max_bytes)
         current_hash = None if original is None else digest(original)
         if current_hash != expected_sha256:
             raise ValueError(f'File changed; reload to resolve the conflict: {path}')
@@ -89,7 +104,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None):
                 a, b = os.fstat(fd), os.fstat(fresh)
                 if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
                     raise ValueError('Directory changed during write')
-            if _read_at(fd, path.name) != original:
+            if _read_at(fd, path.name, max_bytes) != original:
                 raise ValueError(f'File changed; reload to resolve the conflict: {path}')
             os.replace(temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
             os.fsync(fd)
@@ -124,6 +139,24 @@ class StrandFiles:
             )
             self.ensure(scope, text=initial)
 
+    @contextmanager
+    def _operation(self):
+        """Serialize cooperating writers across Store instances and processes."""
+        with self._lock, safe_directory(self.root) as directory:
+            fd = os.open('.write-lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=directory)
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError('Unsafe linked Strand write lock')
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                try:
+                    yield
+                finally:
+                    fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
+
     def path(self, scope, project_id=None):
         if scope == 'project':
             if not isinstance(project_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', project_id):
@@ -137,7 +170,7 @@ class StrandFiles:
 
     def ensure(self, scope, project_id=None, text=''):
         path = self.path(scope, project_id)
-        with self._lock:
+        with self._operation():
             if safe_read(path) is None:
                 safe_write(path, text.encode('utf-8'), None)
         return path
@@ -152,7 +185,7 @@ class StrandFiles:
     def replace(self, scope, text, expected_sha256, project_id=None, origin='user'):
         if not isinstance(text, str) or not isinstance(expected_sha256, str):
             raise ValueError('Text and an expected snapshot hash are required')
-        with self._lock:
+        with self._operation():
             return self._change(scope, text, expected_sha256, project_id, origin, text)
 
     def remember(self, scope, text, project_id=None, origin='', *, expected_sha256):
@@ -160,7 +193,7 @@ class StrandFiles:
             raise ValueError('Remember only writes global, project or learning memory')
         if not isinstance(text, str) or not text.strip():
             raise ValueError('Memory text must not be empty')
-        with self._lock:
+        with self._operation():
             before = self.snapshot(scope, project_id)
             ident = uuid.uuid4().hex
             date = datetime.now(timezone.utc).isoformat(timespec='seconds')
@@ -172,6 +205,8 @@ class StrandFiles:
 
     def _change(self, scope, text, expected_sha256, project_id, origin, saved_text,
                 ident=None, date=None, undo_of=None):
+        if len(text.encode('utf-8')) > MAX_FILE_BYTES:
+            raise ValueError(f'Memory file is too large (size limit {MAX_FILE_BYTES} bytes)')
         before = self.snapshot(scope, project_id)
         if before['sha256'] != expected_sha256:
             raise ValueError('File changed; reload to resolve the conflict')
@@ -189,11 +224,12 @@ class StrandFiles:
             receipt['undo_of'] = undo_of
         safe_write(backup, before['text'].encode('utf-8'), None)
         prepared = json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8')
-        safe_write(receipt_path, prepared, None)
+        safe_write(receipt_path, prepared, None, max_bytes=MAX_RECEIPT_BYTES)
         safe_write(path, text.encode('utf-8'), expected_sha256)
         receipt['status'] = 'saved'
         try:
-            safe_write(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8'), digest(prepared))
+            safe_write(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8'),
+                       digest(prepared), max_bytes=MAX_RECEIPT_BYTES)
         except OSError:
             # The prepared receipt is durable before the file changes. It can be
             # recovered by comparing the committed hash after a disk failure.
@@ -203,7 +239,7 @@ class StrandFiles:
     def receipt(self, receipt_id):
         if not isinstance(receipt_id, str) or not re.fullmatch(r'[a-f0-9]{32}', receipt_id):
             raise ValueError('Invalid receipt ID')
-        raw = safe_read(self.root / '.receipts' / f'{receipt_id}.json')
+        raw = safe_read(self.root / '.receipts' / f'{receipt_id}.json', MAX_RECEIPT_BYTES)
         if raw is None:
             raise ValueError('Receipt not found')
         record = json.loads(raw)
@@ -225,7 +261,7 @@ class StrandFiles:
         return sorted(records, key=lambda row: (row['date'], row['id']), reverse=True)[:limit]
 
     def undo(self, receipt_id):
-        with self._lock:
+        with self._operation():
             record = self.receipt(receipt_id)
             if record['status'] != 'saved':
                 raise ValueError('Unconfirmed write cannot be undone')
@@ -288,12 +324,13 @@ class StrandFiles:
                     if stat.S_ISDIR(info.st_mode):
                         yield from walk(path)
                     elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                        if path.suffix.lower() != '.gguf' and not name.startswith('.strand-'):
-                            data = safe_read(path)
+                        if path.suffix.lower() != '.gguf' and name != '.write-lock' and not name.startswith('.strand-'):
+                            limit = MAX_RECEIPT_BYTES if path.parent == self.root / '.receipts' else MAX_FILE_BYTES
+                            data = safe_read(path, limit)
                             if data is None:
                                 raise ValueError('Strand file disappeared during backup')
                             yield path.relative_to(self.root).as_posix(), data
                     else:
                         raise ValueError(f'Unsafe linked file in Strand backup: {path}')
-        with self._lock:
+        with self._operation():
             yield from walk(self.root)

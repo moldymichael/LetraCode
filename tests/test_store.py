@@ -151,6 +151,31 @@ def test_partial_migration_failure_rolls_back_new_files_and_can_retry(tmp_path, 
     assert restored.project('second')['memory'] == 'Second legacy note'
 
 
+def test_migration_locks_legacy_memory_before_reading_and_clearing(tmp_path, monkeypatch):
+    import letracode.store as store_module
+
+    directory = tmp_path / 'data'
+    ident = legacy_fixture(directory)
+    real_write = store_module.safe_write
+    locked = []
+
+    def concurrent_legacy_edit(path, data, expected):
+        if path.name == f'{ident}.md':
+            with sqlite3.connect(directory / 'letracode.sqlite3', timeout=0) as other:
+                try:
+                    other.execute('UPDATE projects SET memory=? WHERE id=?', ('A concurrent edit', ident))
+                    locked.append(False)
+                except sqlite3.OperationalError as error:
+                    assert 'locked' in str(error)
+                    locked.append(True)
+        return real_write(path, data, expected)
+
+    monkeypatch.setattr(store_module, 'safe_write', concurrent_legacy_edit)
+    migrated = Store(directory)
+    assert locked == [True], 'Migration allowed a legacy edit that its final clear would erase'
+    assert migrated.project(ident)['memory'] == 'Preserve the legacy memory'
+
+
 def test_backup_restores_memory_receipts_and_safe_future_manifests(tmp_path):
     original = Store(tmp_path / 'data')
     ident = original.create_project('Novel')
