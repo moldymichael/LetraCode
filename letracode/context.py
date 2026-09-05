@@ -157,24 +157,23 @@ def build_context(project: dict | None, roots: list[str], query: str, budget=160
         output += '\n## Editable Strand identity and working preferences\n' + strand.core()
     if provenance:
         output += '\n## Runtime provenance (reported by the application)\n' + provenance + '\n'
+    if project:
+        for label, key in [('Project','title'),('Instructions','instructions'),('Memory','memory'),('Current Context','current_context')]:
+            if key == 'memory' and strand is not None:
+                continue
+            value = project.get(key, '')
+            if len(value) > 12000:
+                raise ValueError(f'{label} exceeds 12,000 characters. Shorten it or move reference material to a linked file.')
+            output += f'\n## {label}\n{value}\n'
     if len(output) > budget:
-        raise ValueError('Strand identity/preferences and core instructions exceed the context budget. Shorten these files; core instructions were not truncated.')
+        raise ValueError('Strand identity/preferences or project core instructions exceed the context budget. Shorten these files; core instructions were not truncated.')
     if strand is not None:
-        # Leave room for project instructions/evidence. The final worker budget
-        # separately protects the current user request and reserved reply.
+        # Instructions are reserved first. Memory is selected within the space
+        # left over, with explicit partial coverage and a paging tool.
         memory_budget = min(6000, max(0, (budget - len(output)) // 2))
         output += strand.context(project['id'] if project else None, query, memory_budget)
     if not project:
         return output
-    for label, key in [('Project','title'),('Instructions','instructions'),('Memory','memory'),('Current Context','current_context')]:
-        if key == 'memory' and strand is not None:
-            continue  # The authoritative file was selected above.
-        value = project.get(key, '')
-        if len(value) > 12000:
-            raise ValueError(f'{label} exceeds 12,000 characters. Shorten it or move reference material to a linked file.')
-        output += f'\n## {label}\n{value}\n'
-    if len(output) > budget - 1000:
-        raise ValueError('Project context exceeds the model budget. Increase context size in Model Setup or shorten Memory/Current Context/Instructions.')
     files = ProjectFiles(roots)
     inventory = files.inventory(cancel=cancel)
     output += '\n## Linked roots\n' + '\n'.join(roots)[:1500]

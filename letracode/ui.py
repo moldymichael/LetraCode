@@ -20,6 +20,7 @@ from . import __version__
 from .dialogs import ApprovalDialog, LinksDialog, ModelDialog
 from .engine import EngineConfig, LocalEngine
 from .worker import ConversationWorker
+from .strand_ui import MemoryEditorState, StrandDialog
 
 
 class SafeBrowser(QTextBrowser):
@@ -48,6 +49,7 @@ class MainWindow(QMainWindow):
         self.approval_dialog = None
         self.loading = False
         self.selection_ready = False
+        self.memory_state = None
         self.closing_when_stopped = False
         config_data = self.store.setting('engine',{})
         valid_fields = {f.name for f in dataclasses.fields(EngineConfig)}
@@ -173,7 +175,7 @@ class MainWindow(QMainWindow):
 
         self.context_panel = QWidget(); context = QVBoxLayout(self.context_panel)
         context.setContentsMargins(8,12,12,12)
-        context_title = QLabel('Project context')
+        context_title = QLabel('Strand context')
         font = context_title.font(); font.setBold(True); context_title.setFont(font)
         context.addWidget(context_title)
         self.context_hint = QLabel('Shared with every chat in this project.\nEdits save automatically.')
@@ -187,6 +189,13 @@ class MainWindow(QMainWindow):
             tabs.addTab(edit,label); tabs.setTabToolTip(tabs.count()-1,'Current Context' if key=='current_context' else label)
             self.context_editors[key] = edit
         context.addWidget(tabs,1)
+        self.memory_reload = QPushButton('Reload memory file')
+        self.memory_reload.setToolTip('Use the external file version. Copy any unsaved editor text first; Reload discards that draft.')
+        self.memory_reload.clicked.connect(self.reload_memory)
+        context.addWidget(self.memory_reload)
+        self.strand_button = QPushButton('Strand identity & memory…')
+        self.strand_button.clicked.connect(self.edit_strand)
+        context.addWidget(self.strand_button)
         self.links_summary = QLabel(); self.links_summary.setWordWrap(True); context.addWidget(self.links_summary)
         self.links_button = QPushButton(QIcon.fromTheme('insert-link'),'Linked files & folders…')
         self.links_button.clicked.connect(self.manage_links)
@@ -225,6 +234,7 @@ class MainWindow(QMainWindow):
         self.action(view,'Zoom out',lambda:self.transcript.zoomOut(),'Ctrl+-')
         settings = self.menuBar().addMenu('&Settings')
         self.mutation_actions.append(self.action(settings,'Model Setup…',self.model_setup))
+        self.mutation_actions.append(self.action(settings,'Strand identity & memory…',self.edit_strand))
         self.action(settings,'Unload model from memory',self.unload_model)
         help_menu = self.menuBar().addMenu('&Help')
         self.action(help_menu,'Getting started',self.getting_started)
@@ -283,10 +293,12 @@ class MainWindow(QMainWindow):
         self.composer.setPlainText(chat['draft'] if chat else self.store.setting('unbound_draft_' + (project_id or 'global'),''))
         for key,edit in self.context_editors.items():
             edit.setPlainText(project.get(key,'') if project else '')
-            edit.setEnabled(project is not None)
+            edit.setEnabled(project is not None or key == 'memory')
+        self.memory_state = MemoryEditorState(self.store, 'project' if project else 'global', project_id)
+        self.context_editors['memory'].setPlainText(self.memory_state.text)
         self.links_button.setEnabled(project is not None)
         self.open_project_button.setEnabled(project is not None)
-        self.context_hint.setText('Shared with every chat in this project.\nEdits save automatically.' if project else 'Choose a project to keep shared Memory, Current Context and Instructions here.')
+        self.context_hint.setText(('Project memory' if project else 'Global memory') + ' · edits save automatically.\n' + str(self.memory_state.snapshot['path']))
         self.refresh_links()
         self.loading = False
         self.selection_ready = True
@@ -311,7 +323,39 @@ class MainWindow(QMainWindow):
         else:
             self.store.set_setting('unbound_draft_' + (self.project_id or 'global'),self.composer.toPlainText())
         if self.project_id:
-            self.store.update_project(self.project_id,**{key:edit.toPlainText() for key,edit in self.context_editors.items()})
+            self.store.update_project(self.project_id,**{key:edit.toPlainText() for key,edit in self.context_editors.items() if key != 'memory'})
+        if self.memory_state:
+            ok = self.memory_state.save(self.context_editors['memory'].toPlainText())
+            if not ok:
+                self.context_hint.setText(self.memory_state.error)
+                self.statusBar().showMessage('Memory conflict · external file preserved; editor draft saved separately')
+                return False
+            self.loading = True
+            self.context_editors['memory'].setPlainText(self.memory_state.text)
+            self.loading = False
+        return True
+
+    def reload_memory(self):
+        if not self.memory_state or self.worker:
+            return
+        try:
+            self.memory_state.reload()
+            self.loading = True
+            self.context_editors['memory'].setPlainText(self.memory_state.text)
+            self.loading = False
+            self.context_hint.setText('Reloaded memory from ' + str(self.memory_state.snapshot['path']))
+        except (OSError, ValueError, RuntimeError) as error:
+            self.context_hint.setText(str(error))
+
+    def edit_strand(self):
+        if self.worker:
+            return
+        self.save_editors()
+        dialog = StrandDialog(self.store, self.project_id, self)
+        dialog.exec()
+        # A model or external editor may have changed a memory while our pane
+        # was idle. Its unchanged text is never written back over that change.
+        self.save_editors()
 
     def new_chat(self, checked=False):
         if self.worker:
@@ -375,6 +419,7 @@ class MainWindow(QMainWindow):
         self.save_editors()
         self.chat_id = None; self.project_id = None
         self.selection_ready = False
+        self.memory_state = None
         if kind == 'project': self.store.delete_project(ident)
         else: self.store.delete_chat(ident)
         self.show_selection(None,None); self.refresh_tree()
@@ -418,7 +463,8 @@ class MainWindow(QMainWindow):
             c = self.store.create_chat('New chat',self.project_id)
             self.select_chat(c)
             self.store.set_setting('unbound_draft_' + scope,'')
-        self.save_editors()
+        if self.save_editors() is False:
+            return
         chat = self.store.chat(self.chat_id)
         if chat['title'] == 'New chat':
             self.store.rename_chat(self.chat_id,text.splitlines()[0][:60])
@@ -442,7 +488,9 @@ class MainWindow(QMainWindow):
         for widget in (self.tree,self.search,self.new_chat_button,self.new_project_button,self.model_button,self.composer,self.send_button,self.retry_button,self.mode,self.computer,self.internet,self.actions):
             widget.setEnabled(not busy)
         for edit in self.context_editors.values():
-            edit.setEnabled(not busy and self.project_id is not None)
+            edit.setEnabled(not busy and (self.project_id is not None or edit is self.context_editors['memory']))
+        self.strand_button.setEnabled(not busy)
+        self.memory_reload.setEnabled(not busy)
         self.links_button.setEnabled(not busy and self.project_id is not None)
         for action in self.mutation_actions:
             action.setEnabled(not busy)
@@ -470,6 +518,14 @@ class MainWindow(QMainWindow):
                 result = payload.get('content','')
                 state = 'Denied' if '"denied"' in result else 'Error' if '"error"' in result else 'Complete'
                 chunks.append(f'<p><b>Action · {state}</b> — {html.escape(payload.get("name","tool"))} &nbsp; <a href="letracode:action/{message["id"]}">View details</a></p>')
+                if payload.get('name') == 'remember':
+                    try:
+                        receipt = json.loads(result)
+                        ident = receipt.get('receipt_id') or receipt.get('id')
+                        if ident:
+                            chunks.append('<p><b>Memory saved</b> · ' + html.escape(str(receipt.get('path', ''))) + '<br>' + html.escape(receipt.get('saved_text', '')).replace('\n', '<br>') + f'<br><a href="letracode:undo-memory/{html.escape(ident)}">Undo this save</a></p>')
+                    except (ValueError, TypeError):
+                        pass
                 continue
             name = {'user':'You','assistant':'LetraCode','notice':'Notice'}.get(role,role)
             state = '' if message['status']=='complete' else f' · {message["status"]}'
@@ -514,6 +570,7 @@ class MainWindow(QMainWindow):
         self.worker = None
         if self.approval_dialog: self.approval_dialog.reject()
         self.set_busy(False); self.render_chat(); self.refresh_tree()
+        self.save_editors()
         if worker: worker.deleteLater()
         if self.closing_when_stopped: self.close()
         else: self.composer.setFocus()
@@ -537,6 +594,29 @@ class MainWindow(QMainWindow):
 
     def open_link(self,url):
         text = url.toString()
+        if text.startswith('letracode:undo-memory/'):
+            ident = text.removeprefix('letracode:undo-memory/')
+            # Only real saved tool receipts in this chat create Undo authority;
+            # model-written Markdown cannot address arbitrary receipt IDs.
+            allowed = False
+            for row in self.store.messages(self.chat_id) if self.chat_id else []:
+                if row['role'] != 'tool':
+                    continue
+                try:
+                    message = json.loads(row['payload']).get('message', {})
+                    receipt = json.loads(message.get('content', '{}'))
+                    allowed |= message.get('name') == 'remember' and ident == (receipt.get('receipt_id') or receipt.get('id'))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            if not allowed or self.worker:
+                return
+            try:
+                self.store.strand.undo(ident)
+                self.store.add_message(self.chat_id, 'notice', 'Memory save undone. Previous file contents restored.')
+                self.save_editors(); self.render_chat()
+            except (OSError, ValueError, RuntimeError) as error:
+                QMessageBox.warning(self, 'Memory could not be undone', str(error))
+            return
         if text == 'letracode:setup': self.model_setup(); return
         if text.startswith('letracode:action/'):
             ident = text.rsplit('/',1)[-1]
