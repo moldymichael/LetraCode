@@ -11,6 +11,8 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .strand import StrandFiles, digest, safe_directory, safe_read, safe_write
+
 
 def data_home() -> Path:
     return Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))) / 'letracode'
@@ -22,15 +24,18 @@ def now() -> str:
 
 class Store:
     def __init__(self, directory: Path | None = None):
-        self.directory = Path(directory or data_home())
-        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-        self.directory.chmod(0o700)
+        self.directory = Path(directory or data_home()).absolute()
+        with safe_directory(self.directory, create=True) as fd:
+            os.fchmod(fd, 0o700)
         self.path = self.directory / 'letracode.sqlite3'
+        if self.path.is_symlink() or (self.path.exists() and self.path.stat().st_nlink != 1):
+            raise ValueError('Unsafe linked database')
         with self.connection() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version > 1:
+            if version > 2:
                 raise RuntimeError('This database belongs to a newer LetraCode. Please upgrade the app.')
-            db.executescript('''
+            if version == 0:
+                db.executescript('''
                 PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS projects (
                     id TEXT PRIMARY KEY, title TEXT NOT NULL,
@@ -50,9 +55,62 @@ class Store:
                     project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                     path TEXT NOT NULL, PRIMARY KEY(project_id, path));
                 CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                PRAGMA user_version=1;
+                PRAGMA user_version=2;
             ''')
         self.path.chmod(0o600)
+        if version == 1:
+            self._migration_backup()
+        self.strand = StrandFiles(self.directory / 'strand')
+        if version == 1:
+            self._migrate_memory()
+
+    def _migration_backup(self):
+        directory = self.directory / 'migration-backups'
+        with safe_directory(directory, create=True):
+            pass
+        destination = directory / f'v1-{uuid.uuid4().hex}.sqlite3'
+        safe_write(destination, b'', None)
+        with self.connection() as source:
+            target = sqlite3.connect(destination)
+            try:
+                source.backup(target)
+            finally:
+                target.close()
+        with destination.open('rb') as saved:
+            os.fsync(saved.fileno())
+        with safe_directory(directory) as fd:
+            os.fsync(fd)
+
+    def _migrate_memory(self):
+        changes = []
+        with self.connection() as db:
+            rows = db.execute('SELECT id,memory FROM projects').fetchall()
+            # Check every destination before moving any legacy text. Matching
+            # files permit safe recovery after a crash preceding SQLite commit.
+            for row in rows:
+                path = self.strand.path('project', row['id'])
+                old = safe_read(path)
+                text = row['memory'].encode('utf-8')
+                if old is not None and text and old != text:
+                    raise ValueError(f'Memory migration conflict: {path}')
+                if old is None:
+                    changes.append((path, text))
+            created = []
+            try:
+                for path, content in changes:
+                    safe_write(path, content, None)
+                    created.append((path, content))
+                db.execute("UPDATE projects SET memory=''")
+                db.execute('PRAGMA user_version=2')
+                db.commit()
+            except BaseException:
+                db.rollback()
+                for path, content in reversed(created):
+                    # Never roll back over a user edit made during migration.
+                    with safe_directory(path.parent) as fd:
+                        if safe_read(path) == content:
+                            os.unlink(path.name, dir_fd=fd)
+                raise
 
     @contextmanager
     def connection(self):
@@ -71,21 +129,34 @@ class Store:
 
     def create_project(self, title: str) -> str:
         ident = uuid.uuid4().hex
+        self.strand.ensure('project', ident)
         with self.connection() as db:
             db.execute('INSERT INTO projects(id,title,created) VALUES (?,?,?)', (ident, title.strip() or 'Untitled project', now()))
         return ident
 
     def projects(self):
-        return self.rows('SELECT * FROM projects ORDER BY lower(title),created')
+        rows = self.rows('SELECT * FROM projects ORDER BY lower(title),created')
+        for row in rows:
+            row['memory'] = self.strand.snapshot('project', row['id'])['text']
+        return rows
 
     def project(self, ident):
         rows = self.rows('SELECT * FROM projects WHERE id=?', (ident,))
+        if rows:
+            rows[0]['memory'] = self.strand.snapshot('project', ident)['text']
         return rows[0] if rows else None
 
     def update_project(self, ident, **fields):
         allowed = {'title', 'memory', 'current_context', 'instructions'}
         if not fields or not set(fields) <= allowed:
             raise ValueError('Invalid project field')
+        if not self.rows('SELECT id FROM projects WHERE id=?', (ident,)):
+            return
+        if 'memory' in fields:
+            snapshot = self.strand.snapshot('project', ident)
+            self.strand.replace('project', fields.pop('memory'), snapshot['sha256'], ident, origin='user:project-editor')
+        if not fields:
+            return
         with self.connection() as db:
             db.execute('UPDATE projects SET ' + ','.join(f'{k}=?' for k in fields) + ' WHERE id=?', (*fields.values(), ident))
 
@@ -123,6 +194,22 @@ class Store:
 
     def messages(self, chat_id):
         return self.rows('SELECT * FROM messages WHERE chat_id=? ORDER BY id', (chat_id,))
+
+    def tool_result_page(self, chat_id, result_id, offset=0, max_chars=4000):
+        if type(offset) is not int or offset < 0 or type(max_chars) is not int or not 1 <= max_chars <= 16000:
+            raise ValueError('Invalid saved result page bounds')
+        rows = self.rows("SELECT * FROM messages WHERE id=? AND chat_id=? AND role='tool'", (result_id, chat_id))
+        if not rows:
+            raise ValueError('Saved tool result not found in this chat')
+        message = json.loads(rows[0]['payload']).get('message', {})
+        content = message.get('content', rows[0]['content'])
+        if not isinstance(content, str):
+            content = json.dumps(content, ensure_ascii=False)
+        end = min(len(content), offset + max_chars)
+        return {'result_id': rows[0]['id'], 'name': message.get('name', ''),
+                'tool_call_id': message.get('tool_call_id', ''), 'content': content[offset:end],
+                'offset': offset, 'next_offset': end if end < len(content) else None,
+                'total_chars': len(content), 'sha256': digest(content.encode('utf-8'))}
 
     def add_message(self, chat_id, role, content, status='complete', payload=None):
         with self.connection() as db:
@@ -193,7 +280,19 @@ class Store:
             with zipfile.ZipFile(stage, 'w', zipfile.ZIP_DEFLATED) as archive:
                 archive.write(copy, 'letracode.sqlite3')
                 archive.writestr('letracode.json', json.dumps(exported, ensure_ascii=False, indent=2))
-                archive.writestr('RESTORE.txt', 'Close LetraCode. Keep a copy of the current data folder. Extract letracode.sqlite3 into a NEW empty data folder, then run letracode --data-dir /path/to/folder. Linked files and model weights are not included. The JSON export is also human-readable.\n')
+                for relative, content in self.strand.backup_entries():
+                    archive.writestr('strand/' + relative, content)
+                archive.writestr('RESTORE.txt',
+                    'Close LetraCode. Keep a copy of the current data folder. Extract the complete archive, '
+                    'including strand/ and its hidden .history/ and .receipts/ directories, into a NEW empty data folder.\n'
+                    'Before opening a restored database, remove or retarget linked source roots and any writable '
+                    'destinations to isolated test locations. A copied database retains the original links and settings. '
+                    'For a safe test, use sqlite3 /new/folder/letracode.sqlite3 "DELETE FROM links;" and review settings '
+                    'before launch. Never point a restored test at the original sources.\n'
+                    'Then run letracode --data-dir /new/folder. Ordinary Strand files remain editable there; '
+                    'Undo uses the restored private history. Linked originals and GGUF model weights are excluded. '
+                    'Safe ordinary Strand manifests are included. The JSON export is human-readable; its legacy '
+                    'project memory column is empty because strand/memory/ is authoritative.\n')
             # Stage alongside destination to keep replacing an existing backup atomic.
             fd, name = tempfile.mkstemp(prefix='.letracode-backup-', dir=destination.parent)
             try:

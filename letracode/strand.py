@@ -1,0 +1,299 @@
+"""Authoritative, ordinary Strand files with guarded writes and durable Undo.
+
+No method grants permission: callers must resolve scope and obtain approval first.
+All paths are app-owned; no-follow directory descriptors prevent link redirection.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import stat
+import threading
+import uuid
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+def digest(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+@contextmanager
+def safe_directory(path: Path, create=False):
+    """Open every ancestor without following symlinks, including the data root."""
+    path = Path(path).absolute()
+    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for name in path.parts[1:]:
+            if name in ('.', '..'):
+                raise ValueError('Unsafe directory component')
+            if create:
+                try:
+                    os.mkdir(name, 0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            try:
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            except OSError as error:
+                raise ValueError(f'Unsafe or missing directory (links are refused): {path}') from error
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def _read_at(fd, name):
+    try:
+        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+        raise ValueError(f'Unsafe file or linked target: {name}')
+    stream = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    with os.fdopen(stream, 'rb') as incoming:
+        opened = os.fstat(incoming.fileno())
+        if opened.st_nlink != 1 or (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
+            raise ValueError(f'File changed while opening: {name}')
+        data = incoming.read()
+        after = os.fstat(incoming.fileno())
+        if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+            raise ValueError(f'File changed while reading: {name}')
+    return data
+
+
+def safe_read(path: Path):
+    with safe_directory(path.parent) as fd:
+        return _read_at(fd, path.name)
+
+
+def safe_write(path: Path, data: bytes, expected_sha256: str | None):
+    """Atomically replace only a matching regular file; None means create only."""
+    with safe_directory(path.parent) as fd:
+        original = _read_at(fd, path.name)
+        current_hash = None if original is None else digest(original)
+        if current_hash != expected_sha256:
+            raise ValueError(f'File changed; reload to resolve the conflict: {path}')
+        temporary = '.strand-' + uuid.uuid4().hex
+        try:
+            out_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+            with os.fdopen(out_fd, 'wb') as out:
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+            # Reopen the ancestor chain and compare directory identity before commit.
+            with safe_directory(path.parent) as fresh:
+                a, b = os.fstat(fd), os.fstat(fresh)
+                if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
+                    raise ValueError('Directory changed during write')
+            if _read_at(fd, path.name) != original:
+                raise ValueError(f'File changed; reload to resolve the conflict: {path}')
+            os.replace(temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
+            os.fsync(fd)
+        finally:
+            try:
+                os.unlink(temporary, dir_fd=fd)
+            except FileNotFoundError:
+                pass
+
+
+class StrandFiles:
+    SCOPES = {
+        'identity': 'identity/strand.md',
+        'preferences': 'identity/preferences.md',
+        'global': 'memory/global.md',
+        'learning': 'learning/programming.md',
+    }
+
+    def __init__(self, root: Path):
+        self.root = Path(root).absolute()
+        self._lock = threading.RLock()
+        for relative in ('', 'identity', 'memory', 'memory/projects', 'learning', '.history', '.receipts'):
+            with safe_directory(self.root / relative, create=True):
+                pass
+        for scope in self.SCOPES:
+            initial = (
+                '# Strand\n\nYou are Strand, a general-purpose assistant in LetraCode.\n'
+                'Respect the user’s creative agency: help them think, understand and revise; '
+                'do not take over their writing unless asked.\n'
+                'Memory is selected context, not proof of exhaustive reading or understanding.\n'
+                if scope == 'identity' else ''
+            )
+            self.ensure(scope, text=initial)
+
+    def path(self, scope, project_id=None):
+        if scope == 'project':
+            if not isinstance(project_id, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', project_id):
+                raise ValueError('Invalid project ID')
+            relative = f'memory/projects/{project_id}.md'
+        else:
+            if scope not in self.SCOPES or project_id is not None:
+                raise ValueError('Invalid memory scope or project ID')
+            relative = self.SCOPES[scope]
+        return self.root / relative
+
+    def ensure(self, scope, project_id=None, text=''):
+        path = self.path(scope, project_id)
+        with self._lock:
+            if safe_read(path) is None:
+                safe_write(path, text.encode('utf-8'), None)
+        return path
+
+    def snapshot(self, scope, project_id=None):
+        path = self.path(scope, project_id)
+        data = safe_read(path)
+        if data is None:
+            raise ValueError(f'Memory file is missing: {path}')
+        return {'text': data.decode('utf-8'), 'sha256': digest(data), 'path': str(path)}
+
+    def replace(self, scope, text, expected_sha256, project_id=None, origin='user'):
+        if not isinstance(text, str) or not isinstance(expected_sha256, str):
+            raise ValueError('Text and an expected snapshot hash are required')
+        with self._lock:
+            return self._change(scope, text, expected_sha256, project_id, origin, text)
+
+    def remember(self, scope, text, project_id=None, origin='', *, expected_sha256):
+        if scope not in ('global', 'project', 'learning'):
+            raise ValueError('Remember only writes global, project or learning memory')
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError('Memory text must not be empty')
+        with self._lock:
+            before = self.snapshot(scope, project_id)
+            ident = uuid.uuid4().hex
+            date = datetime.now(timezone.utc).isoformat(timespec='seconds')
+            metadata = json.dumps({'id': ident, 'date': date, 'scope': scope,
+                                   'project_id': project_id, 'origin': origin}, ensure_ascii=False)
+            entry = f'<!-- Strand entry {metadata} -->\n{text}\n'
+            updated = before['text'].rstrip() + ('\n\n' if before['text'].strip() else '') + entry
+            return self._change(scope, updated, expected_sha256, project_id, origin, text, ident, date)
+
+    def _change(self, scope, text, expected_sha256, project_id, origin, saved_text,
+                ident=None, date=None, undo_of=None):
+        before = self.snapshot(scope, project_id)
+        if before['sha256'] != expected_sha256:
+            raise ValueError('File changed; reload to resolve the conflict')
+        ident = ident or uuid.uuid4().hex
+        date = date or datetime.now(timezone.utc).isoformat(timespec='seconds')
+        path = self.path(scope, project_id)
+        backup = self.root / '.history' / f'{ident}.md'
+        receipt_path = self.root / '.receipts' / f'{ident}.json'
+        receipt = {'id': ident, 'receipt_id': ident, 'date': date, 'scope': scope,
+                   'project_id': project_id, 'origin': origin, 'path': str(path),
+                   'relative_path': path.relative_to(self.root).as_posix(),
+                   'saved_text': saved_text, 'before_sha256': before['sha256'],
+                   'after_sha256': digest(text.encode('utf-8')), 'status': 'prepared'}
+        if undo_of:
+            receipt['undo_of'] = undo_of
+        safe_write(backup, before['text'].encode('utf-8'), None)
+        prepared = json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8')
+        safe_write(receipt_path, prepared, None)
+        safe_write(path, text.encode('utf-8'), expected_sha256)
+        receipt['status'] = 'saved'
+        try:
+            safe_write(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8'), digest(prepared))
+        except OSError:
+            # The prepared receipt is durable before the file changes. It can be
+            # recovered by comparing the committed hash after a disk failure.
+            return self.receipt(ident)
+        return receipt
+
+    def receipt(self, receipt_id):
+        if not isinstance(receipt_id, str) or not re.fullmatch(r'[a-f0-9]{32}', receipt_id):
+            raise ValueError('Invalid receipt ID')
+        raw = safe_read(self.root / '.receipts' / f'{receipt_id}.json')
+        if raw is None:
+            raise ValueError('Receipt not found')
+        record = json.loads(raw)
+        path = self.path(record['scope'], record.get('project_id'))
+        if record['id'] != receipt_id or record['relative_path'] != path.relative_to(self.root).as_posix():
+            raise ValueError('Invalid receipt destination')
+        record['path'] = str(path)
+        if record['status'] == 'prepared':
+            current = self.snapshot(record['scope'], record.get('project_id'))['sha256']
+            record['status'] = 'saved' if current == record['after_sha256'] else 'unconfirmed'
+        return record
+
+    def receipts(self, limit=50):
+        if not isinstance(limit, int) or limit < 1 or limit > 1000:
+            raise ValueError('Invalid receipt limit')
+        with safe_directory(self.root / '.receipts') as fd:
+            ids = [name[:-5] for name in os.listdir(fd) if re.fullmatch(r'[a-f0-9]{32}\.json', name)]
+        records = [self.receipt(ident) for ident in ids]
+        return sorted(records, key=lambda row: (row['date'], row['id']), reverse=True)[:limit]
+
+    def undo(self, receipt_id):
+        with self._lock:
+            record = self.receipt(receipt_id)
+            if record['status'] != 'saved':
+                raise ValueError('Unconfirmed write cannot be undone')
+            backup = safe_read(self.root / '.history' / f'{receipt_id}.md')
+            if backup is None or digest(backup) != record['before_sha256']:
+                raise ValueError('Undo backup is missing or changed')
+            return self._change(record['scope'], backup.decode('utf-8'), record['after_sha256'],
+                                record.get('project_id'), 'user:undo', backup.decode('utf-8'), undo_of=receipt_id)
+
+    def core(self):
+        return '\n\n'.join(self.snapshot(scope)['text'] for scope in ('identity', 'preferences'))
+
+    def read_page(self, scope, project_id=None, offset=0, max_chars=4000):
+        if type(offset) is not int or offset < 0 or type(max_chars) is not int or not 1 <= max_chars <= 16000:
+            raise ValueError('Invalid memory page bounds')
+        source = self.snapshot(scope, project_id)
+        content = source.pop('text')
+        end = min(len(content), offset + max_chars)
+        return {**source, 'scope': scope, 'project_id': project_id, 'text': content[offset:end],
+                'offset': offset, 'next_offset': end if end < len(content) else None, 'total_chars': len(content)}
+
+    def context(self, project_id, query, budget):
+        """Select applicable excerpts; budget is characters, never a token claim."""
+        if type(budget) is not int or budget < 0:
+            raise ValueError('Invalid memory context budget')
+        if budget == 0:
+            return ''
+        sources = [('global', None), ('learning', None)]
+        if project_id is not None:
+            sources.insert(1, ('project', project_id))
+        notes = [(scope, self.snapshot(scope, ident)['text']) for scope, ident in sources]
+        notes = [(scope, content) for scope, content in notes if content.strip()]
+        if not notes:
+            return ''
+        full = '\n\n'.join(f'[{scope} memory]\n{content}' for scope, content in notes)
+        if len(full) <= budget:
+            return full
+        # Keep the coverage warning even for very small budgets.
+        marker = '[Partial memory coverage; use read_memory for more.]\n'
+        if budget <= len(marker):
+            return marker[:budget]
+        terms = set(re.findall(r'\w+', query.lower()))
+        excerpts = []
+        allowance = max(0, (budget - len(marker) - 2 * len(notes)) // len(notes))
+        for scope, content in notes:
+            heading = f'[{scope} memory excerpt]\n'
+            blocks = re.split(r'\n\s*\n', content)
+            ranked = sorted(enumerate(blocks), key=lambda item: (-len(terms & set(re.findall(r'\w+', item[1].lower()))), item[0]))
+            selected = '\n\n'.join(block for _, block in ranked)
+            excerpts.append((heading + selected[:max(0, allowance - len(heading))])[:allowance])
+        return (marker + '\n\n'.join(excerpts))[:budget]
+
+    def backup_entries(self):
+        """Yield verified bytes, retaining ordinary future notes/manifests, excluding weights."""
+        def walk(directory):
+            with safe_directory(directory) as fd:
+                for name in sorted(os.listdir(fd)):
+                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    path = directory / name
+                    if stat.S_ISDIR(info.st_mode):
+                        yield from walk(path)
+                    elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                        if path.suffix.lower() != '.gguf' and not name.startswith('.strand-'):
+                            data = safe_read(path)
+                            if data is None:
+                                raise ValueError('Strand file disappeared during backup')
+                            yield path.relative_to(self.root).as_posix(), data
+                    else:
+                        raise ValueError(f'Unsafe linked file in Strand backup: {path}')
+        with self._lock:
+            yield from walk(self.root)
