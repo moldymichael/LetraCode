@@ -13,6 +13,10 @@ class ScriptedEngine:
         context_size = 8192
         max_tokens = 1024
     config = Config()
+    def request_usage(self, messages, tools, cancel, thinking=False):
+        from letracode.budgeting import RequestUsage
+        size = len(json.dumps({'messages': messages, 'tools': tools}, ensure_ascii=False))
+        return RequestUsage((size + 1) // 2, self.config.max_tokens, 128, 'synthetic tokenizer')
     def start(self, cancel, on_status=lambda _: None):
         pass
     def complete(self, messages, tools, cancel, on_delta, thinking=False):
@@ -62,16 +66,64 @@ def test_incomplete_tool_history_gets_explicit_unknown_outcomes(tmp_path):
     assert 'unknown' in messages[3]['content'].lower()
 
 
-def test_excess_tool_requests_do_not_poison_next_chat_turn(tmp_path):
+def test_excess_tool_requests_are_all_saved_as_not_executed_and_pause(tmp_path):
     class TooMany(ScriptedEngine):
-        def complete(self,*args,**kwargs):
-            return {'role':'assistant','content':'Many actions','tool_calls':[{'id':str(i),'type':'function','function':{'name':'list_files','arguments':'{}'}} for i in range(9)]}
-    from letracode.worker import conversation_messages
-    s=Store(tmp_path/'data'); c=s.create_chat('Limits'); s.add_message(c,'user','Do work')
-    w=ConversationWorker(s,c,TooMany()); w.run()
-    s.add_message(c,'user','Continue')
-    messages,_=conversation_messages(s.messages(c),'System',20000)
-    assert all(not m.get('tool_calls') for m in messages)
+        requests = 0
+        def complete(self, messages, *args, **kwargs):
+            self.requests += 1
+            assert_paired_tools(messages)
+            return {'role':'assistant','content':'Many actions','tool_calls':[
+                {'id':f'{self.requests}_{i}','type':'function','function':{
+                    'name':'write_file','arguments':json.dumps({'path':str(tmp_path / 'never.txt'), 'content':'bad'})}}
+                for i in range(9)]}
+    store=Store(tmp_path/'data'); chat=store.create_chat('Limits')
+    store.add_message(chat,'user','Do work')
+    engine = TooMany()
+    worker=ConversationWorker(store,chat,engine)
+    approvals=[]
+    worker.approval_needed.connect(lambda pending: (approvals.append(pending), pending.decide(False)))
+    worker.run()
+    rows = store.messages(chat)
+    assert engine.requests == 2
+    assert not approvals
+    assert not (tmp_path / 'never.txt').exists()
+    outcomes = [json.loads(json.loads(row['payload'])['message']['content']) for row in rows if row['role']=='tool']
+    assert len(outcomes) == 18
+    assert all(result['executed'] is False and result['code']=='tool_batch_limit' for result in outcomes)
+    assert rows[-1]['status'] == 'paused'
+    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'tool_batch_limit'
+    reopened = Store(tmp_path / 'data')
+    ConversationWorker(reopened,chat,engine).run()
+    assert engine.requests == 2  # Only a new explicit user turn can resume.
+    assert reopened.messages(chat) == rows
+    paired = [json.loads(row['payload'])['message'] for row in rows if row['role'] in ('assistant','tool')]
+    assert_paired_tools(paired)
+
+
+def test_excess_batch_allows_one_smaller_correction(tmp_path):
+    class Corrected(ScriptedEngine):
+        requests = 0
+        def complete(self, messages, *args, **kwargs):
+            self.requests += 1
+            assert_paired_tools(messages)
+            if self.requests == 3:
+                return {'role':'assistant','content':'Done.'}
+            count = 9 if self.requests == 1 else 1
+            return {'role':'assistant','content':'Inspect','tool_calls':[
+                {'id':f'{self.requests}_{i}','type':'function','function':{
+                    'name':'read_file','arguments':json.dumps({'path':str(path)})}} for i in range(count)]}
+    store,chat,paths=linked_reading_chat(tmp_path,1)
+    path=paths[0]
+    engine=Corrected()
+    engine.config=type('Config', (), {'context_size':32768, 'max_tokens':1024})()
+    ConversationWorker(store,chat,engine).run()
+    rows=store.messages(chat)
+    assert engine.requests==3
+    assert rows[-1]['content']=='Done.'
+    outcomes=[json.loads(json.loads(row['payload'])['message']['content']) for row in rows if row['role']=='tool']
+    assert len(outcomes)==10
+    assert all(result['executed'] is False for result in outcomes[:9])
+    assert outcomes[-1]['path']==str(path)
 
 
 def assert_paired_tools(messages):
@@ -233,6 +285,88 @@ def test_context_packing_never_shortens_an_oversized_user_prompt(tmp_path):
     chat = store.create_chat('Long prompt')
     prompt = 'Keep every user instruction. ' * 1000
     store.add_message(chat, 'user', prompt)
-    with pytest.raises(ValueError, match='latest conversation turn'):
+    from letracode.engine import ContextOverflowError
+    with pytest.raises(ContextOverflowError, match='latest conversation turn'):
         conversation_messages(store.messages(chat), 'System instructions', 8000)
     assert store.messages(chat)[0]['content'] == prompt
+
+
+def test_action_round_pause_resumes_from_saved_history_without_reexecution(tmp_path):
+    class Endless(ScriptedEngine):
+        requests=0
+        def complete(self, messages, *args, **kwargs):
+            self.requests+=1
+            return {'role':'assistant','content':'Inspect missing source','tool_calls':[{
+                'id':str(self.requests),'type':'function','function':{
+                    'name':'read_file','arguments':json.dumps({'path':str(path)})}}]}
+    store=Store(tmp_path/'data'); chat=store.create_chat('Pause')
+    path=tmp_path/'missing.txt'
+    engine=Endless()
+    store.add_message(chat,'user','Inspect')
+    worker=ConversationWorker(store,chat,engine)
+    worker.approval_needed.connect(lambda pending: pending.decide(False))
+    worker.run()
+    rows=store.messages(chat)
+    assert engine.requests==10
+    assert rows[-1]['status']=='paused'
+    checkpoint=json.loads(rows[-1]['payload'])['checkpoint']
+    assert checkpoint['reason']=='action_round_limit'
+    assert len(checkpoint['saved_result_ids'])==10
+    class Resume(ScriptedEngine):
+        def complete(self,messages,*args,**kwargs):
+            assert_paired_tools(messages)
+            assert 'saved' in messages[0]['content'].lower()
+            return {'role':'assistant','content':'The previous actions are saved.'}
+    reopened=Store(tmp_path/'data')
+    reopened.add_message(chat,'user','Continue with the saved evidence.')
+    ConversationWorker(reopened,chat,Resume()).run()
+    after=reopened.messages(chat)
+    assert len([row for row in after if row['role']=='tool'])==10
+    assert after[-1]['content']=='The previous actions are saved.'
+
+
+def test_compacted_receipts_reference_saved_result_without_protocol_metadata(tmp_path):
+    store,chat,paths=linked_reading_chat(tmp_path,1)
+    engine=ReadingEngine([paths],context_size=8192,max_tokens=1024)
+    ConversationWorker(store,chat,engine).run()
+    row=next(row for row in store.messages(chat) if row['role']=='tool')
+    receipt=json.loads(engine.requests[-1][-1]['content'])
+    assert receipt['result_id']==row['id']
+    assert 'read_tool_result' in receipt['context_note']
+    assert all('saved_result_id' not in message for request in engine.requests for message in request)
+    assert json.loads(row['payload'])['saved_result_id']==row['id']
+
+
+def test_worker_budget_accounts_enabled_schemas_before_generation(tmp_path):
+    from letracode.budgeting import RequestUsage
+    class Measured(ScriptedEngine):
+        requests=[]
+        def request_usage(self,messages,tools,cancel,thinking=False):
+            # This synthetic template expands tool definitions heavily.
+            return RequestUsage(8500 if tools else 100, self.config.max_tokens,128,'synthetic tokenizer')
+        def complete(self,messages,tools,*args,**kwargs):
+            self.requests.append(messages)
+            return {'role':'assistant','content':'Done'}
+    store=Store(tmp_path/'data');chat=store.create_chat('Budget')
+    prompt='Keep this exact request. 漢字 \\ source'
+    store.add_message(chat,'user',prompt)
+    engine=Measured()
+    ConversationWorker(store,chat,engine).run()
+    assert not engine.requests
+    assert store.messages(chat)[0]['content']==prompt
+    assert store.messages(chat)[-1]['status']=='paused'
+    store.add_message(chat,'user','Continue without tools.')
+    ConversationWorker(store,chat,engine,use_tools=False).run()
+    assert len(engine.requests)==1
+
+
+def test_worker_exposes_saved_reads_when_computer_and_web_are_disabled(tmp_path):
+    class Offline(ScriptedEngine):
+        def complete(self,messages,tools,*args,**kwargs):
+            names={tool['function']['name'] for tool in tools}
+            assert names=={'read_tool_result','read_memory'}
+            return {'role':'assistant','content':'Offline history available.'}
+    store=Store(tmp_path/'data');chat=store.create_chat('Offline')
+    store.add_message(chat,'user','Review saved evidence')
+    ConversationWorker(store,chat,Offline(),computer_enabled=False,web_enabled=False).run()
+    assert store.messages(chat)[-1]['content']=='Offline history available.'
