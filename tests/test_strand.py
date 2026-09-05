@@ -52,6 +52,44 @@ def test_receipt_and_undo_survive_restart_and_preserve_external_edits(tmp_path):
     assert again.snapshot('global')['text'] == 'A later user correction'
 
 
+def test_scoped_receipts_filter_before_limit_and_keep_unfiltered_api(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    from itertools import count
+    from types import SimpleNamespace
+    ticks = count()
+    monkeypatch.setattr(strand_module, 'datetime', SimpleNamespace(
+        now=lambda zone:datetime(2026, 9, 5, tzinfo=zone) + timedelta(seconds=next(ticks))))
+    store = Store(tmp_path / 'data')
+    project = store.create_project('First'); other = store.create_project('Second')
+    strand = store.strand
+    saved = []
+    for scope, ident, text in [('project', project, 'First project save'),
+                               ('project', project, 'Second project save'),
+                               ('global', None, 'Global save'),
+                               ('project', other, 'Other project save'),
+                               ('preferences', None, 'Newer preferences save')]:
+        snapshot = strand.snapshot(scope, ident)
+        saved.append(strand.replace(scope, text, snapshot['sha256'], ident))
+
+    assert [row['id'] for row in strand.receipts(1, scope='project', project_id=project)] == [saved[1]['id']]
+    assert [row['id'] for row in strand.receipts(1, scope='global')] == [saved[2]['id']]
+    assert [row['id'] for row in strand.receipts(1, scope='project', project_id=other)] == [saved[3]['id']]
+    assert [row['id'] for row in strand.receipts(1, scope='preferences')] == [saved[4]['id']]
+    assert strand.receipts(scope='identity') == []
+    assert [row['id'] for row in strand.receipts(1)] == [saved[4]['id']]
+    assert len(strand.receipts()) == 5
+
+
+@pytest.mark.parametrize(('scope', 'project_id'), [
+    (None, 'project-id'), ('global', 'project-id'), ('preferences', 'project-id'),
+    ('project', None), ('project', '../escape'), ('unknown', None), ([], None),
+])
+def test_scoped_receipts_reject_invalid_scope_project_pairs(tmp_path, scope, project_id):
+    strand = Store(tmp_path / 'data').strand
+    with pytest.raises(ValueError):
+        strand.receipts(scope=scope, project_id=project_id)
+
+
 def test_guarded_save_never_overwrites_an_external_change(tmp_path):
     strand = Store(tmp_path / 'data').strand
     snapshot = strand.snapshot('preferences')

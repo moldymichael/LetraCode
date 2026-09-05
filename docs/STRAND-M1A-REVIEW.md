@@ -4,9 +4,17 @@ September 5, 2026. This is a development branch for review, not an installed upd
 
 ## Stabilization status (current)
 
+The second stabilization pass starts from clean `cc7b48d` on `codex/strand-m1a` and fixes the three remaining findings: migration rollback losing external corrections, context packing stopping before reaching a fitting allowance, and unrelated saves hiding a project's Undo history. The latest independent review confirmed the previous five scenarios were resolved; these three defects predate `cc7b48d`, with no confirmed regression attributed to that commit.
+
+Fresh verification: **197 automated tests passed**, including 14 new regression cases; all 27 Python files compiled, shell syntax and whitespace checks passed. The supplied context reproduction now generates with **32073 / 32768** estimated tokens. Migration retains external corrections and refuses conflicting retries. The actual Undo menu remains usable after 51 unrelated global saves. No new real-model run was needed for this pass; the Qwen checks below remain historical. Exact commands and observed results are in [VERIFICATION.md](VERIFICATION.md).
+
+The three requested repairs are ready for independent re-review. A separate pre-existing Undo ordering issue remains: same-second receipts can appear out of order, so the default selection can fail safely with a conflict. It is documented in [VERIFICATION.md](VERIFICATION.md) and was not bundled into this pass. The fixed Strand directory and default memory-save review remain unchanged. Nothing was installed, pushed or merged; real data, writing and the working model remain untouched. M1b and training were not started.
+
+## Historical first stabilization (`cc7b48d`)
+
 The newer review reproduced five P2 defects after the earlier 132-test verification. This stabilization started from clean commit `886ff66` on the same branch and corrects all five: commit-time external memory edits, unsent first-message loss, startup failure from one unavailable project memory, orphaned memory after project deletion, and missing evidence references after repeated pauses.
 
-Fresh results: **183 automated tests passed**, including **122 focused storage/UI/tool/continuation tests**; all 27 Python files compiled, shell syntax and whitespace checks passed. One real-Qwen continuation discovered and retrieved the oldest saved result after 25 seeded pauses and context compaction, without rerunning the original action. The owned engine stopped. Exact commands, failed-then-passing regression evidence and limitations appear in [VERIFICATION.md](VERIFICATION.md). The 132-pass figures below are preserved as history.
+Results at that stage: **183 automated tests passed**, including **122 focused storage/UI/tool/continuation tests**; all 27 Python files compiled, shell syntax and whitespace checks passed. One real-Qwen continuation discovered and retrieved the oldest saved result after 25 seeded pauses and context compaction, without rerunning the original action. The owned engine stopped. Exact commands, failed-then-passing regression evidence and limitations appear in [VERIFICATION.md](VERIFICATION.md). The 132-pass figures below are preserved as history.
 
 The fixed Strand root and default review for model-proposed memory saves remain appropriate for M1a. No installed application, live database, real writing files or working model was changed. No M1b work began. This is ready for independent re-review; interactive desktop checks remain below.
 
@@ -14,9 +22,10 @@ The fixed Strand root and default review for model-proposed memory saves remain 
 
 - Review checkout: `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`.
 - Starting commit: `45092f1b1ed2f3a6f3361864f7d8587a87fd82c6` (the context-overflow fix was already present).
-- Stabilization base: `886ff6632969ba141cfe867faa5039df15cb747e`; stabilization is a separate commit on the same M1a branch.
+- First stabilization base: `886ff6632969ba141cfe867faa5039df15cb747e`; resulting commit `cc7b48d`.
+- Second stabilization base: `cc7b48db0434bd86ba35b4c5c35dfbd5f9c62e04`; this pass is another separate commit on the same M1a branch.
 - Original checkout remains `/home/miceoil/Projects/LetraCode`, branch `fix/bound-tool-result-context`, at that same commit. Its untracked `letracode/__pycache__/` and `tests/__pycache__/` were preserved.
-- Current isolated data/logs: this checkout's `.stabilization/` and `stabilization-test-data/`. Earlier historical evidence remains at `/home/miceoil/Projects/strand-m1a-review-PGYug9/`; it was not changed during stabilization.
+- Current isolated logs: `.stabilization/pass2/`; test data: `stabilization-test-data/pass2*`. Earlier `.stabilization/` evidence and `/home/miceoil/Projects/strand-m1a-review-PGYug9/` are retained.
 - No installation, live database migration, model replacement, model download, training, push, or merge into the original branch was performed. The live database still reports schema version 1; its context/GPU settings remain 32768/12.
 
 ## What M1a changes
@@ -38,6 +47,8 @@ A project chat receives global memory, its own project memory and the programmin
 
 `remember` appends an entry with an ID, date, origin and scope. The app chooses the destination from the active chat rather than accepting a model-supplied path or project ID. By default, a dialog shows the scope, destination, text and append preview for approval. Saved text/location and Undo appear in the conversation. The user can optionally grant automatic appends to **only** `learning/programming.md`; that grant permits no source edits, identity changes, commands, other memories or training.
 
+The Undo menu now selects up to 50 receipts **for the chosen scope/project**, so global activity or another project cannot hide that project's entries. Entries sort by timestamp and receipt ID; same-second ordering has the remaining limitation noted above. Older receipts remain on disk. Scope validation and the existing conflict check still apply to Undo; choosing a history entry does not grant model write permission.
+
 Memory editor saves check the file version before replacement. Conflicting editor text is retained separately in SQLite so closing the window does not lose it. Reload uses the external file; copy any local draft you want to keep before reloading. The same check applies to Send and Retry. Native internal action links are removed from model-written Markdown, so a model cannot disguise an Undo button as a documentation link.
 
 At commit time the actual original file is moved into a recovery directory, its bytes are checked, and the new file is published only if the active name is still absent. Every move uses Linux's no-replacement operation, including rollback. An ordinary editor's intervening save wins or produces an explicit conflict with preserved versions. This avoids relying on an advisory lock that other editors can ignore. The [Linux rename documentation](https://man7.org/linux/man-pages/man2/rename.2.html) specifies the no-replacement behavior and that open descriptors survive renames; [fsync documentation](https://man7.org/linux/man-pages/man2/fsync.2.html) explains why directory entries also need syncing.
@@ -50,7 +61,11 @@ Deleting a project now explains and archives its memory under `strand/.deleted-p
 
 The database migration is versioned and backs up version 1 before moving legacy project memory into files. The old editable database memory column is cleared only after successful migration. Migration/recovery, Undo and ZIP restoration are tested on disposable fixtures. Backups include Strand files, receipts and previous versions. Linked originals and model weights remain separate. A copied database retains linked paths: follow its `RESTORE.txt` and remove/retarget links before opening a test restoration.
 
+If a later migration step fails, SQLite rolls back and **already-created memory files stay in place**. Removing them after a contents check could lose an intervening edit or a later save through an open editor descriptor. Retaining them avoids that deletion entirely. Retry reuses matching files without replacing their inodes; a file conflicting with nonempty legacy text stops migration with its path shown. Both the retained external correction and backed-up legacy text remain available for deliberate reconciliation. No automatic overwrite or automatic choice between divergent versions is made.
+
 Request accounting includes enabled tool definitions, the actual chat template, the current request, core instructions and reserved response tokens. This runtime supports `/apply-template` plus `/tokenize`; unsupported builds use an explicitly labeled conservative estimate. Optional retrieved text and saved-result previews can shrink; core instructions and the current request are never silently cut. A request that still cannot fit pauses with its evidence saved.
+
+Several optional-context allowances can produce the same text. The worker now continues reducing the allowance through zero instead of mistaking an unchanged excerpt for proof that the request cannot fit. This permits the reviewed fallback-counter request to generate while preserving the stop for truly oversized core instructions or user input.
 
 Oversized action batches execute nothing and save an outcome for every call. The model gets one bounded correction opportunity when context permits. Repeated oversized batches, true context exhaustion and the ten-round action limit save a pause checkpoint. A new user message can continue from saved results. `read_tool_result` reads pages from the current chat's saved outcomes instead of rerunning commands. “Complete saved result” means the full bounded tool response; this does not remove existing source-file/read/search limits.
 

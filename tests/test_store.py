@@ -126,7 +126,7 @@ def test_future_database_is_rejected_without_downgrade(tmp_path):
         assert db.execute('PRAGMA user_version').fetchone()[0] == 999
 
 
-def test_partial_migration_failure_rolls_back_new_files_and_can_retry(tmp_path, monkeypatch):
+def test_partial_migration_failure_retains_prepared_files_and_reuses_them_on_retry(tmp_path, monkeypatch):
     import letracode.store as store_module
 
     directory = tmp_path / 'data'
@@ -144,14 +144,97 @@ def test_partial_migration_failure_rolls_back_new_files_and_can_retry(tmp_path, 
     monkeypatch.setattr(store_module, 'safe_write', disk_failure)
     with pytest.raises(OSError, match='disk failure'):
         Store(directory)
-    assert not (directory / 'strand/memory/projects' / f'{first}.md').exists()
+    prepared = directory / 'strand/memory/projects' / f'{first}.md'
+    assert prepared.read_text() == 'Preserve the legacy memory'
+    prepared_inode = prepared.stat().st_ino
     with sqlite3.connect(directory / 'letracode.sqlite3') as db:
         assert db.execute('PRAGMA user_version').fetchone()[0] == 1
         assert db.execute('SELECT memory FROM projects WHERE id=?', (first,)).fetchone()[0] == 'Preserve the legacy memory'
     monkeypatch.setattr(store_module, 'safe_write', real_write)
-    restored = Store(directory)
-    assert restored.project(first)['memory'] == 'Preserve the legacy memory'
-    assert restored.project('second')['memory'] == 'Second legacy note'
+    with prepared.open('r+b') as editor:
+        restored = Store(directory)
+        assert restored.project(first)['memory'] == 'Preserve the legacy memory'
+        assert restored.project('second')['memory'] == 'Second legacy note'
+        assert prepared.stat().st_ino == prepared_inode, 'Retry must reuse the prepared file, including any open editor descriptor'
+        editor.write(b'External edit through a descriptor opened before retry')
+        editor.truncate()
+        editor.flush()
+        os.fsync(editor.fileno())
+    assert restored.project(first)['memory'] == 'External edit through a descriptor opened before retry'
+
+
+@pytest.mark.parametrize('editor', ['in_place', 'atomic_replace', 'open_descriptor'])
+def test_migration_rollback_preserves_external_edits_and_retry_refuses_conflict(tmp_path, monkeypatch, editor):
+    import letracode.store as store_module
+
+    directory = tmp_path / 'data'
+    first = legacy_fixture(directory)
+    with sqlite3.connect(directory / 'letracode.sqlite3') as db:
+        db.execute('INSERT INTO projects(id,title,memory,created) VALUES (?,?,?,?)',
+                   ('second', 'Oversized second', 'X' * (2 * 1024 * 1024 + 1), '2026-09-05'))
+    target = directory / 'strand/memory/projects' / f'{first}.md'
+    external = b'External correction must survive failed migration'
+    real_write, real_unlink = store_module.safe_write, os.unlink
+    descriptor = None
+    edited = False
+
+    def edit_file():
+        nonlocal edited
+        edited = True
+        if editor == 'in_place':
+            target.write_bytes(external)
+        elif editor == 'atomic_replace':
+            staging = target.with_suffix('.external')
+            staging.write_bytes(external)
+            os.replace(staging, target)
+
+    def oversized_second(path, content, expected):
+        nonlocal descriptor
+        if path.name == 'second.md' and editor == 'open_descriptor':
+            descriptor = target.open('r+b')
+        return real_write(path, content, expected)
+
+    def intervening_edit(name, *args, **kwargs):
+        # Reproduce the reviewed check/unlink race at the old destructive
+        # boundary. A rollback that retains files has no such boundary.
+        if name == target.name and kwargs.get('dir_fd') is not None and editor != 'open_descriptor':
+            edit_file()
+        return real_unlink(name, *args, **kwargs)
+
+    monkeypatch.setattr(store_module, 'safe_write', oversized_second)
+    monkeypatch.setattr(os, 'unlink', intervening_edit)
+    try:
+        with pytest.raises(ValueError, match='too large'):
+            Store(directory)
+        if descriptor is not None:
+            descriptor.seek(0)
+            descriptor.write(external)
+            descriptor.truncate()
+            descriptor.flush()
+            os.fsync(descriptor.fileno())
+        elif not edited:
+            # With no destructive cleanup, editors can save normally to the
+            # retained pathname after the migration reports its failure.
+            assert target.exists()
+            edit_file()
+    finally:
+        if descriptor is not None:
+            descriptor.close()
+    assert target.read_bytes() == external
+    with sqlite3.connect(directory / 'letracode.sqlite3') as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert db.execute('SELECT memory FROM projects WHERE id=?', (first,)).fetchone()[0] == 'Preserve the legacy memory'
+        db.execute('UPDATE projects SET memory=? WHERE id=?', ('Repaired second', 'second'))
+    backups = list((directory / 'migration-backups').glob('*.sqlite3'))
+    with sqlite3.connect(backups[0]) as backup:
+        assert backup.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert backup.execute('SELECT memory FROM projects WHERE id=?', (first,)).fetchone()[0] == 'Preserve the legacy memory'
+    with pytest.raises(ValueError, match='migration conflict'):
+        Store(directory)
+    assert target.read_bytes() == external
+    with sqlite3.connect(directory / 'letracode.sqlite3') as db:
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 1
+        assert db.execute('SELECT memory FROM projects WHERE id=?', (first,)).fetchone()[0] == 'Preserve the legacy memory'
 
 
 def test_migration_locks_legacy_memory_before_reading_and_clearing(tmp_path, monkeypatch):

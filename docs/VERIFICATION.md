@@ -1,6 +1,58 @@
 # LetraCode — verification and limits
 
-## Strand M1a stabilization — September 5, 2026 (current)
+## Second Strand M1a stabilization — three remaining P2 findings (current)
+
+Started from clean `codex/strand-m1a` at `cc7b48db0434bd86ba35b4c5c35dfbd5f9c62e04`. Fresh baseline: **183 passed in 43.68 s**. The latest independent review confirmed the previous five scenarios were resolved and identified these three older defects; it found no confirmed regression introduced by `cc7b48d`. The earlier 132- and 183-test results below retain their original attribution.
+
+All three supplied reproduction scripts were present and inspected before execution. Copies/adaptations used disposable fixtures inside this worktree; the original `/tmp` scripts were not modified.
+
+| Finding | Root cause and repair | Failing regression and fresh result |
+|---|---|---|
+| Migration rollback loses external corrections | A hash/content check followed by pathname unlink could delete an intervening replacement, and unlinking also detached open editor descriptors. Roll back SQLite while retaining prepared files and their actual inodes. Retry reuses matching files and explicitly refuses conflicting nonempty legacy memory; it never rewrites retained matching files. | The supplied probe lost all three external corrections and silently restored legacy text on retry. Four regression cases failed before repair; now all four pass. Cover in-place/atomic edits at the old unlink boundary, writes through a descriptor after failure, conflict on retry, original DB/backup preservation, and late descriptor writes after a successful matching retry. The prior test expecting deletion was changed deliberately: retaining recoverable files is now the safety invariant. |
+| Context packing stops on an optional-context plateau | Equal text at adjacent allowances did not mean further reduction was exhausted. Remove that early exit and the ten-attempt cap; halve the finite optional allowance until a request fits or zero has been tried. Core instructions and the current request remain intact. | The supplied fallback-counter case measured 34813 tokens at allowances 20000 and 10000, 32852 at 5000, and **32073 / 32768** at 2500. Before repair the worker paused; afterward it generated once and completed. Two regression cases failed before repair and now pass, including a truly oversized request that exhausts reductions through zero and safely pauses. |
+| Unrelated saves hide a project's Undo entries | The global limit was applied before scope filtering. `receipts(limit=50, *, scope=None, project_id=None)` now validates the scope/project pair and filters before sorting/limiting; the dialog supplies its selected scope. Unfiltered callers retain their existing behavior. | One project save followed by 51 global saves showed zero project entries before repair and one afterward. Actual UI Undo restores that project's original memory while global/other-project memory stays unchanged. Nine new cases failed before repair and pass afterward, covering the menu, per-scope limits, compatibility and invalid scope/project pairs. |
+
+Fresh verification commands, run from `/home/miceoil/Projects/LetraCode-strand-m1a`:
+
+```bash
+mkdir -p .stabilization/pass2 stabilization-test-data/pass2
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_store.py -k 'partial_migration_failure or migration_rollback' --basetemp=stabilization-test-data/pass2/migration-final
+# 4 passed, 26 deselected in 1.60 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/pass2-worker-targeted tests/test_worker.py tests/test_tools.py
+# 34 passed in 15.84 s
+
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_strand.py tests/test_strand_ui.py tests/test_ui.py --basetemp=stabilization-test-data/pass2-undo-pytest-full
+# 72 passed in 22.09 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/pass2/full
+# 197 passed in 52.30 s; zero failures/skips
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 27 Python files without writing bytecode
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+git diff --check
+# Both exit 0
+```
+
+The full suite includes all previous five-finding regressions plus **14 new cases**. Logs are retained in `.stabilization/pass2/`: `baseline-tests.log`, `migration-original-red.log`, `migration-tests-{red,green,final}.log`, `context-plateau-original-{red,green}.log`, `worker-targeted-green.log`, `undo-scope-{probe,tests}-{red,green}.log`, `undo-scope-fulltests.log`, and `full-tests-final.log`. The initial copies and corrected context/Undo harnesses are retained alongside their logs or in `stabilization-test-data/pass2-*`. No live-data migration or installed-app test was run.
+
+**Real-model testing:** no new inference run in this pass. The reported packing defect uses the supported fallback counter; its exact request and measured counts were reproduced through the actual worker with a deterministic engine substitute. Existing tests also cover runtime-counted intact core and true overflow. Migration and scoped Undo require no model. The Qwen observations below remain historical evidence and are not presented as fresh verification.
+
+**Remaining limits:** a failed migration leaves SQLite at version 1 with legacy values and its backup, and keeps prepared files at their ordinary paths. External corrections remain recoverable there. A retry conflict still requires deliberate reconciliation before migration can finish; the app does not choose between divergent versions. The Undo menu retains the newest 50 entries **within the selected scope**; older receipts remain on disk, and the receipt API supports limits up to 1000. Interactive KDE dialog/keyboard behavior and physical power-loss/storage-failure behavior were not newly tested. The earlier documented recovery-history, supported-size and filesystem limits still apply. No known unresolved reproduction remains from these three findings.
+
+Independent scoped review also reproduced a **separate, pre-existing Undo ordering issue**: receipt timestamps have whole-second precision and equal dates are sorted by random receipt ID. Same-second saves can therefore appear out of order; the default selection may be an older save, whose Undo is safely refused by the content-hash conflict check. This pass fixes filtering before the scope limit, not chronology within a timestamp tie. The ordering issue remains for independent re-review; it is not a confirmed regression from this pass or `cc7b48d`. Fixture evidence is retained under `stabilization-test-data/pass2-receipt-review/`. Microsecond timestamps alone would not repair existing tied history, so no partial ordering change was bundled into these three fixes.
+
+The fixed `<data-dir>/strand` location and default review of model-proposed memory saves are unchanged. No dependency installation, installed-app change, live-data or writing-file edit, model replacement, push, merge, training or M1b work was performed. This pass is a separate local commit for independent re-review.
+
+## Historical first Strand M1a stabilization — September 5, 2026 (`cc7b48d`)
 
 Started from a clean `codex/strand-m1a` checkout at `886ff6632969ba141cfe867faa5039df15cb747e`. The original context-overflow fix remains present. The baseline suite passed again: **132 passed in 7.73 s**. A newer independent review nevertheless reproduced five P2 bugs; the earlier 132-pass results below are historical evidence, not proof that those bugs were absent.
 

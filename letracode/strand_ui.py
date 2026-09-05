@@ -143,9 +143,7 @@ class StrandDialog(QDialog):
 
     def refresh_receipts(self):
         self.history.clear()
-        for receipt in self.store.strand.receipts():
-            if receipt['scope'] != self.state.scope or receipt.get('project_id') != self.state.project_id:
-                continue
+        for receipt in self.store.strand.receipts(scope=self.state.scope, project_id=self.state.project_id):
             self.history.addItem(f"{receipt['date']} · {receipt['origin']} · {receipt['status']}", receipt['id'])
 
     def undo_selected(self):

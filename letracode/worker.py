@@ -302,7 +302,9 @@ class ConversationWorker(QThread):
                 # template expansion and Unicode can require less evidence.
                 # Rebuild through the context API so identity/project core and
                 # the user request are never sliced to make that evidence fit.
-                for attempt in range(10):
+                # Equal excerpts at adjacent allowances are not a lower bound:
+                # keep halving the finite allowance until zero has been tried.
+                while True:
                     try:
                         messages, trimmed = conversation_messages(self.store.messages(self.chat_id), system,
                             context_size, measure=measure)
@@ -319,8 +321,6 @@ class ConversationWorker(QThread):
                     candidate = build_context(project, roots if self.computer_enabled else [], query,
                         retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance,
                         allow_core_overflow=True)
-                    if candidate == system:
-                        break
                     system = candidate
                 raise overflow
 

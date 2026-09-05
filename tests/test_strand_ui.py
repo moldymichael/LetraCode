@@ -384,3 +384,42 @@ def test_strand_dialog_unavailable_memory_is_readonly_and_reload_recovers(tmp_pa
         assert dialog.save_current()
     finally:
         dialog.close()
+
+
+def test_project_undo_history_survives_more_than_fifty_unrelated_saves(tmp_path, monkeypatch):
+    from datetime import datetime, timedelta
+    from itertools import count
+    from types import SimpleNamespace
+    from PySide6.QtWidgets import QPushButton
+    import letracode.strand as strand_module
+    from letracode.strand_ui import StrandDialog
+
+    # Whole-second receipt dates must put the unrelated saves after this project.
+    ticks = count()
+    monkeypatch.setattr(strand_module, 'datetime', SimpleNamespace(
+        now=lambda zone:datetime(2026, 9, 5, tzinfo=zone) + timedelta(seconds=next(ticks))))
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data')
+    project = store.create_project('Quiet project')
+    other = store.create_project('Unrelated project')
+    store.strand.path('project', project).write_text('Original project memory', encoding='utf-8')
+    before = store.strand.snapshot('project', project)
+    receipt = store.strand.replace('project', 'Project change to undo', before['sha256'], project)
+    store.update_project(other, memory='Keep unrelated project memory')
+    for index in range(51):
+        snapshot = store.strand.snapshot('global')
+        store.strand.replace('global', f'Unrelated global save {index}', snapshot['sha256'])
+    dialog = StrandDialog(store, project)
+    dialog.scope.setCurrentIndex(dialog.scope.findData('project'))
+    try:
+        assert dialog.history.count() == 1
+        assert dialog.history.currentData() == receipt['id']
+        undo = next(button for button in dialog.findChildren(QPushButton)
+                    if button.text() == 'Undo selected saved change')
+        undo.click()
+        assert store.strand.snapshot('project', project)['text'] == 'Original project memory'
+        assert dialog.editor.toPlainText() == 'Original project memory'
+        assert store.strand.snapshot('project', other)['text'] == 'Keep unrelated project memory'
+        assert store.strand.snapshot('global')['text'] == 'Unrelated global save 50'
+    finally:
+        dialog.close()

@@ -410,12 +410,21 @@ class StrandFiles:
                 record['status'] = 'unconfirmed'
         return record
 
-    def receipts(self, limit=50):
+    def receipts(self, limit=50, *, scope=None, project_id=None):
         if not isinstance(limit, int) or limit < 1 or limit > 1000:
             raise ValueError('Invalid receipt limit')
+        if scope is None:
+            if project_id is not None:
+                raise ValueError('Project ID requires a project memory scope')
+        else:
+            if not isinstance(scope, str):
+                raise ValueError('Invalid memory scope')
+            self.path(scope, project_id)
         with safe_directory(self.root / '.receipts') as fd:
             ids = [name[:-5] for name in os.listdir(fd) if re.fullmatch(r'[a-f0-9]{32}\.json', name)]
         records = [self.receipt(ident) for ident in ids]
+        if scope is not None:
+            records = [row for row in records if row['scope'] == scope and row.get('project_id') == project_id]
         return sorted(records, key=lambda row: (row['date'], row['id']), reverse=True)[:limit]
 
     def undo(self, receipt_id):

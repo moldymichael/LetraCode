@@ -691,3 +691,63 @@ def test_runtime_count_pauses_truly_oversized_core_without_truncation(tmp_path):
     assert rows[0]['content']==prompt
     assert rows[-1]['status']=='paused'
     assert json.loads(rows[-1]['payload'])['checkpoint']['reason']=='context_limit'
+
+
+@pytest.mark.parametrize('word_count,should_fit', [(5400, True), (6000, False)])
+def test_fallback_budget_crosses_optional_context_plateau_without_cutting_core_or_user(
+    tmp_path, monkeypatch, word_count, should_fit,
+):
+    from letracode.budgeting import fallback_usage
+    from letracode import worker as worker_module
+
+    class FallbackEngine:
+        # No request_usage method: exercise the supported conservative counter.
+        config = type('Config', (), {'context_size': 32768, 'max_tokens': 1024})()
+
+        def __init__(self):
+            self.generated = []
+
+        def start(self, *args):
+            pass
+
+        def complete(self, messages, *args):
+            self.generated.append(copy.deepcopy(messages))
+            return {'role': 'assistant', 'content': 'The intact request fits.'}
+
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Optional context plateau')
+    (store.strand.root / 'memory/global.md').write_text('Optional memory. ' * 170)
+    prompt = 'Please analyze this passage: ' + 'word ' * word_count
+    store.add_message(chat, 'user', prompt)
+    identity = (store.strand.root / 'identity/strand.md').read_text().strip()
+    preferences = (store.strand.root / 'identity/preferences.md').read_text().strip()
+    built = []
+    build_context = worker_module.build_context
+
+    def record_context(project, roots, query, budget, *args, **kwargs):
+        context = build_context(project, roots, query, budget, *args, **kwargs)
+        built.append((budget, context))
+        return context
+
+    monkeypatch.setattr(worker_module, 'build_context', record_context)
+    engine = FallbackEngine()
+    worker = ConversationWorker(store, chat, engine, use_tools=False)
+    worker.run()
+    assert built[0][1] == built[1][1]  # Smaller allowances can yield identical excerpts.
+    assert all(identity in context and preferences in context for _, context in built)
+    assert store.messages(chat)[0]['content'] == prompt
+    if should_fit:
+        assert len(engine.generated) == 1
+        messages = engine.generated[0]
+        assert messages[-1] == {'role': 'user', 'content': prompt}
+        assert fallback_usage(messages, None, 1024).total_tokens <= 32768
+        assert 'Optional memory and source excerpts omitted' in messages[0]['content']
+        assert store.messages(chat)[-1]['content'] == 'The intact request fits.'
+    else:
+        assert not engine.generated
+        # Even if successive context strings are identical, exhaust permitted
+        # optional reductions before declaring the intact core/request too big.
+        assert built[-1][0] == 0
+        rows = store.messages(chat)
+        assert rows[-1]['status'] == 'paused'
+        assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'context_limit'

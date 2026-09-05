@@ -105,21 +105,19 @@ class Store:
                     raise ValueError(f'Memory migration conflict: {path}')
                 if old is None:
                     changes.append((path, text))
-            created = []
             try:
                 for path, content in changes:
                     safe_write(path, content, None)
-                    created.append((path, content))
                 db.execute("UPDATE projects SET memory=''")
                 db.execute('PRAGMA user_version=2')
                 db.commit()
             except BaseException:
                 db.rollback()
-                for path, content in reversed(created):
-                    # Never roll back over a user edit made during migration.
-                    with safe_directory(path.parent) as fd:
-                        if safe_read(path) == content:
-                            os.unlink(path.name, dir_fd=fd)
+                # Keep prepared files and their actual inodes. Checking bytes
+                # then unlinking can lose intervening edits, including later
+                # writes through an editor's already-open descriptor. Retry
+                # validates these files above and reuses matching destinations;
+                # the legacy values and backup remain intact until DB commit.
                 raise
 
     @contextmanager
