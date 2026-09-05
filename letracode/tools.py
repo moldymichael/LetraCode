@@ -37,7 +37,11 @@ def schema(name, description, properties, required):
 
 
 STRING = {'type':'string'}
+MEMORY_SCOPE = {'type':'string','enum':['global','project','learning']}
 TOOL_SCHEMAS = [
+    schema('read_memory','Read ordinary Strand memory for this chat scope. Pages are partial; follow next_offset. Project means the active project, never another project.', {'scope':MEMORY_SCOPE,'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['scope']),
+    schema('remember','Save a user-requested memory or proposed learning update. Use project for story/project facts, global for shared preferences, learning for correctable programming evidence. Shows destination and text for review unless learning has an explicit grant. No source/identity writes or training.', {'scope':MEMORY_SCOPE,'text':STRING}, ['scope','text']),
+    schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
     schema('list_files','List a local folder (no recursive enumeration). Outside project links requires approval.', {'path':STRING}, ['path']),
     schema('read_file','Read a UTF-8, Markdown, source, PDF or DOCX file with numbered lines. Use start_line and max_lines for long files.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'}}, ['path']),
     schema('search_project','Search linked project text files for evidence. Returns diverse passages with paths and line numbers.', {'query':STRING}, ['query']),
@@ -49,7 +53,8 @@ TOOL_SCHEMAS = [
 
 
 class ToolExecutor:
-    def __init__(self, roots, data_dir, approve, cancel, web_enabled=True, computer_enabled=True):
+    def __init__(self, roots, data_dir, approve, cancel, web_enabled=True, computer_enabled=True, *, store=None, chat_id=None):
+        self.store, self.chat_id = store, chat_id
         self.roots = list(roots)
         self.data_dir = Path(data_dir)
         self.approve = approve
@@ -91,7 +96,7 @@ class ToolExecutor:
             if name in ('web_search','fetch_url'):
                 if not self.web_enabled:
                     raise Denied('Internet access is turned off.')
-            elif not self.computer_enabled:
+            elif name not in ('read_memory', 'read_tool_result') and not self.computer_enabled:
                 raise Denied('Computer tools are turned off.')
             result = getattr(self, '_' + name)(args)
             return json.dumps(result, ensure_ascii=False)
@@ -99,6 +104,49 @@ class ToolExecutor:
             return json.dumps({'denied':str(error)})
         except Exception as error:
             return json.dumps({'error':str(error)[:2500]})
+
+    def _memory_scope(self, args):
+        if self.store is None or not self.chat_id:
+            raise ValueError('Memory requires an active saved chat.')
+        chat = self.store.chat(self.chat_id)
+        if not chat:
+            raise ValueError('This chat no longer exists.')
+        scope = self._str(args, 'scope', 20)
+        if scope not in ('global', 'project', 'learning'):
+            raise ValueError('Memory scope must be global, project or learning. Identity is user-editable only.')
+        project_id = chat['project_id'] if scope == 'project' else None
+        if scope == 'project' and not project_id:
+            raise ValueError('Project memory requires a project chat. Choose a project or explicitly use global scope.')
+        return scope, project_id
+
+    def _read_memory(self, args):
+        scope, project_id = self._memory_scope(args)
+        return self.store.strand.read_page(scope, project_id=project_id,
+            offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
+
+    def _remember(self, args):
+        scope, project_id = self._memory_scope(args)
+        text = self._str(args, 'text', 8000)
+        snapshot = self.store.strand.snapshot(scope, project_id)
+        grant = scope == 'learning' and self.store.setting('strand_learning_grant', False) is True
+        if not grant:
+            diff = '\n'.join(difflib.unified_diff(snapshot['text'].splitlines(),
+                (snapshot['text'].rstrip() + '\n\n' + text).splitlines(),
+                fromfile=str(snapshot['path']), tofile=str(snapshot['path']), lineterm=''))
+            self._ask(ApprovalRequest('Remember this in Strand?',
+                f"Scope: {scope}\nPath: {snapshot['path']}\n\nText to save:\n{text}\n\nAppend preview (the saved entry also records its ID, date and origin):\n{diff}",
+                'memory', 'Save only if the text and scope are right. You can inspect the ordinary file and Undo this save.'))
+        if self.cancel.is_set():
+            raise Denied('Cancelled before saving memory.')
+        return self.store.strand.remember(scope, text, project_id=project_id,
+            origin=f'chat:{self.chat_id}; ' + ('learning grant' if grant else 'user approved'),
+            expected_sha256=snapshot['sha256'])
+
+    def _read_tool_result(self, args):
+        if self.store is None or not self.chat_id:
+            raise ValueError('Saved result retrieval requires an active chat.')
+        return self.store.tool_result_page(self.chat_id, args.get('result_id'),
+            offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
 
     def _list_files(self, args):
         path = self._path(args)
