@@ -142,3 +142,33 @@ def test_dialog_resolution_does_not_revive_old_pane_draft(tmp_path, monkeypatch)
     assert store.setting('strand_draft_global_global') is None
     assert w.save_editors()
     w.close()
+
+
+def test_retry_preserves_conflicting_memory_and_does_not_add_a_turn(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); chat = store.create_chat('Global')
+    store.add_message(chat, 'user', 'An earlier request')
+    w = MainWindow(store); w.select_chat(chat)
+    w.context_editors['memory'].setPlainText('Pending local correction')
+    path = Path(store.strand.snapshot('global')['path']); path.write_text('External correction')
+    before = store.messages(chat)
+    monkeypatch.setattr(w, 'start_worker', lambda:None)
+    w.retry_reply()
+    assert store.messages(chat) == before
+    assert path.read_text() == 'External correction'
+    assert store.setting('strand_draft_global_global')['text'] == 'Pending local correction'
+    w.close()
+
+
+def test_retry_saves_pending_memory_before_starting_the_next_turn(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); chat = store.create_chat('Global')
+    store.add_message(chat, 'user', 'An earlier request')
+    w = MainWindow(store); w.select_chat(chat)
+    w.context_editors['memory'].setPlainText('Corrected before retry')
+    observed = []
+    monkeypatch.setattr(w, 'start_worker', lambda:observed.append(store.strand.snapshot('global')['text']))
+    w.retry_reply()
+    assert observed == ['Corrected before retry']
+    assert len(store.messages(chat)) == 2
+    w.close()

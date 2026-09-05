@@ -592,6 +592,8 @@ class MainWindow(QMainWindow):
     def retry_reply(self):
         if self.worker or not self.chat_id:
             return
+        if self.save_editors() is False:
+            return
         rows = self.store.messages(self.chat_id)
         user = next((r for r in reversed(rows) if r['role']=='user'),None)
         if not user:
