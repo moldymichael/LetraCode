@@ -78,7 +78,7 @@ def compact_tool_results(turn, budget, *, prefix=None, measure=None):
             continue
         if not isinstance(result, dict) or 'denied' in result or 'error' in result:
             continue
-        bulk = {key: result[key] for key in ('text', 'output', 'entries', 'results') if key in result}
+        bulk = {key: result[key] for key in ('text', 'output', 'entries', 'results', 'content') if key in result}
         if not bulk:
             continue
         receipt = {key: value for key, value in result.items() if key not in bulk}
@@ -87,6 +87,12 @@ def compact_tool_results(turn, budget, *, prefix=None, measure=None):
             'Use read_tool_result with result_id and follow next_offset to recover saved output; '
             'never rerun commands or writes to recover it.'))
         if message.get('saved_result_id') is not None:
+            if 'result_id' in receipt:
+                # A retrieved page points at an older saved outcome. Keep that
+                # provenance distinct from this page's own recovery reference.
+                for key in ('result_id', 'offset', 'next_offset', 'total_chars', 'sha256'):
+                    if key in receipt:
+                        receipt['source_' + key] = receipt.pop(key)
             receipt['result_id'] = message['saved_result_id']
 
         def replacement():
@@ -262,7 +268,7 @@ class ConversationWorker(QThread):
                           f'Context: {context_size} tokens; maximum response: {reply_size} tokens. '
                           'Strand identity is editable application context; it does not change model weights.')
             system = build_context(project, roots if self.computer_enabled else [], query,
-                retrieval_budget, self.cancel_event, strand=getattr(self.store, 'strand', None), provenance=provenance)
+                retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance)
             executor = ToolExecutor(roots, self.store.directory, self.ask, self.cancel_event,
                 self.web_enabled, self.computer_enabled, store=self.store, chat_id=self.chat_id)
             self.engine.start(self.cancel_event, self.status.emit)
@@ -277,13 +283,42 @@ class ConversationWorker(QThread):
                 return last_usage.total_tokens
 
             def packed_messages():
-                messages, trimmed = conversation_messages(self.store.messages(self.chat_id), system,
-                    context_size, measure=measure)
-                if trimmed:
-                    self.status.emit('Using bounded context; full conversation and tool results remain saved.')
-                if last_usage and 'estimate' in last_usage.method:
-                    self.status.emit('Using a conservative context estimate; runtime token counting is unavailable.')
-                return messages
+                nonlocal system, retrieval_budget
+                low, high = 0, retrieval_budget
+                overflow = None
+                # The character allowance only seeds retrieval. Escaping, tools,
+                # template expansion and Unicode can require less evidence.
+                # Rebuild through the context API so identity/project core and
+                # the user request are never sliced to make that evidence fit.
+                for attempt in range(10):
+                    try:
+                        messages, trimmed = conversation_messages(self.store.messages(self.chat_id), system,
+                            context_size, measure=measure)
+                        if trimmed or overflow:
+                            self.status.emit('Using bounded context; full conversation and tool results remain saved.')
+                        if last_usage and 'estimate' in last_usage.method:
+                            self.status.emit('Using a conservative context estimate; runtime token counting is unavailable.')
+                        return messages
+                    except ContextOverflowError as error:
+                        overflow = error
+                    high = retrieval_budget
+                    candidate = None
+                    while low < high:
+                        allowance = (low + high) // 2
+                        try:
+                            candidate = build_context(project, roots if self.computer_enabled else [], query,
+                                allowance, self.cancel_event, strand=self.store.strand, provenance=provenance)
+                        except ValueError as error:
+                            if 'context budget' not in str(error):
+                                raise
+                            low = allowance + 1
+                            continue
+                        retrieval_budget = allowance
+                        break
+                    if candidate is None or candidate == system:
+                        break
+                    system = candidate
+                raise overflow
 
             messages = packed_messages()
             batch_retry_used = False

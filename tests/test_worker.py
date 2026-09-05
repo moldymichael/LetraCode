@@ -370,3 +370,65 @@ def test_worker_exposes_saved_reads_when_computer_and_web_are_disabled(tmp_path)
     store.add_message(chat,'user','Review saved evidence')
     ConversationWorker(store,chat,Offline(),computer_enabled=False,web_enabled=False).run()
     assert store.messages(chat)[-1]['content']=='Offline history available.'
+
+
+def test_saved_result_pages_remain_retrievable_after_source_changes_and_compaction(tmp_path):
+    class SavedReader(ScriptedEngine):
+        seen = ''
+        requests = 0
+        def complete(self, messages, *args, **kwargs):
+            self.requests += 1
+            assert_paired_tools(messages)
+            if messages[-1]['role']=='tool':
+                page=json.loads(messages[-1]['content'])
+                assert 'content' in page  # The current bounded page fits in full.
+                self.seen += page['content']
+                offset=page['next_offset']
+                if offset is None:
+                    return {'role':'assistant','content':'Read the saved command output.'}
+            else:
+                offset=0
+            return {'role':'assistant','content':'Read saved evidence','tool_calls':[{
+                'id':f'page_{self.requests}','type':'function','function':{
+                    'name':'read_tool_result','arguments':json.dumps({'result_id':source_id,'offset':offset,'max_chars':1500})}}]}
+    store=Store(tmp_path/'data');chat=store.create_chat('Saved evidence')
+    source=tmp_path/'source.txt';source.write_text('Original file')
+    original=json.dumps({'output':'Saved 漢字 \\ evidence\n'*350, 'exit_code':7, 'timed_out':False},ensure_ascii=False)
+    call={'id':'original','type':'function','function':{'name':'run_command','arguments':json.dumps({'command':'synthetic; never executed','cwd':str(tmp_path)})}}
+    store.add_message(chat,'user','Earlier work')
+    store.add_message(chat,'assistant','Earlier command',payload={'message':{'role':'assistant','content':'Earlier command','tool_calls':[call]}})
+    source_id=store.add_message(chat,'tool',original,payload={'message':{'role':'tool','name':'run_command','tool_call_id':'original','content':original}})
+    source.unlink()
+    store.add_message(chat,'user',f'Read saved result {source_id}.')
+    engine=SavedReader()
+    ConversationWorker(store,chat,engine,computer_enabled=False,web_enabled=False).run()
+    assert engine.seen==original
+    assert not source.exists()
+    assert store.messages(chat)[-1]['content']=='Read the saved command output.'
+    assert len([row for row in store.messages(chat) if row['role']=='tool'])==engine.requests
+    messages,_=conversation_messages(store.messages(chat),'System',6500)
+    receipts=[json.loads(message['content']) for message in messages if message['role']=='tool']
+    assert any(result.get('context_truncated') and 'source_result_id' in result for result in receipts)
+    assert Store(tmp_path/'data').tool_result_page(chat,source_id,max_chars=16000)['content']==original
+
+
+def test_worker_rereads_strand_files_and_reports_configured_model_filename(tmp_path):
+    class IdentityReader(ScriptedEngine):
+        systems=[]
+        def complete(self,messages,*args,**kwargs):
+            self.systems.append(messages[0]['content'])
+            return {'role':'assistant','content':'Read current context.'}
+    store=Store(tmp_path/'data');chat=store.create_chat('Fresh identity')
+    identity=store.strand.root/'identity/strand.md'
+    identity.write_text('Identity correction FIRST',encoding='utf-8')
+    engine=IdentityReader()
+    engine.config=type('Config',(),{'context_size':32768,'max_tokens':1024,'model_path':'/models/configured-model.gguf'})()
+    store.add_message(chat,'user','Read current identity')
+    ConversationWorker(store,chat,engine).run()
+    identity.write_text('Identity correction SECOND',encoding='utf-8')
+    store.add_message(chat,'user','Read the correction')
+    ConversationWorker(store,chat,engine).run()
+    assert 'Identity correction FIRST' in engine.systems[0]
+    assert 'Identity correction SECOND' in engine.systems[1]
+    assert 'Identity correction FIRST' not in engine.systems[1]
+    assert all('configured-model.gguf' in system for system in engine.systems)

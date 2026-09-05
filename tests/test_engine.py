@@ -68,6 +68,20 @@ class Handler(BaseHTTPRequestHandler):
         record_path.write_text(json.dumps(records))
         if self.path == "/apply-template":
             scenario = request["messages"][-1]["content"]
+            if scenario == "budget-drip":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.wfile.write(b'{"prompt":"')
+                for _ in range(30):
+                    self.wfile.write(b'x')
+                    self.wfile.flush()
+                    time.sleep(0.05)
+                self.wfile.write(b'"}')
+                self.wfile.flush()
+                return
             if scenario == "budget-unsupported":
                 self.send_error(404)
                 return
@@ -616,5 +630,20 @@ def test_completion_refuses_overflow_before_inference(fake_server, gguf_model, t
             engine.complete([{"role": "user", "content": "budget-overflow"}], None, Event(), lambda _: None)
         records = json.loads(fake_server.with_suffix(".requests.json").read_text())
         assert not any(r["path"] == "/v1/chat/completions" for r in records)
+    finally:
+        engine.stop()
+
+
+def test_budget_endpoint_has_wall_clock_deadline(fake_server, gguf_model, tmp_path, monkeypatch):
+    from threading import Event
+    import letracode.engine as module
+    monkeypatch.setattr(module, '_BUDGET_REQUEST_TIMEOUT', 0.15, raising=False)
+    engine = make_engine(fake_server, gguf_model, tmp_path / 'data')
+    try:
+        started=time.monotonic()
+        with pytest.raises(module.EngineError, match='budget.*deadline'):
+            engine.request_usage([{'role':'user','content':'budget-drip'}],None,Event())
+        assert time.monotonic()-started<1.2
+        assert not engine.running
     finally:
         engine.stop()

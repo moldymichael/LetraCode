@@ -32,6 +32,7 @@ from .budgeting import RequestUsage, fallback_usage
 _HOST = "127.0.0.1"
 _MODEL_LOAD_TIMEOUT = 180.0
 _REQUEST_TIMEOUT = 300.0
+_BUDGET_REQUEST_TIMEOUT = 5.0
 _STOP_TIMEOUT = 2.0
 _LOG_LIMIT = 1_048_576
 _LOG_TAIL_LIMIT = 32_768
@@ -380,7 +381,9 @@ class LocalEngine:
         if not self._operation_lock.acquire(blocking=False):
             raise EngineError("A local model completion is already in progress")
         try:
-            self._raise_if_cancelled(cancel)
+            if cancel.is_set():
+                raise Cancelled('Request counting was cancelled')
+            self._cancel_requested.clear()
             payload = self._completion_payload(messages, tools, thinking)
             self.start(cancel)
             return self._request_usage(payload, messages, tools, cancel, thinking)
@@ -432,8 +435,13 @@ class LocalEngine:
         payload = json.dumps(body, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
         if len(payload) > _MAX_REQUEST_BYTES:
             raise _BudgetUnavailable()
-        connection = http.client.HTTPConnection(_HOST, port, timeout=5)
+        connection = http.client.HTTPConnection(_HOST, port, timeout=_BUDGET_REQUEST_TIMEOUT)
         response = None
+        watcher_done, deadline_expired = threading.Event(), threading.Event()
+        deadline = time.monotonic() + _BUDGET_REQUEST_TIMEOUT
+        threading.Thread(target=self._watch_external_cancel,
+            args=(cancel, watcher_done, deadline, deadline_expired),
+            name='letracode-budget-cancel', daemon=True).start()
         with self._state_lock:
             self._active_connection = connection
         try:
@@ -457,10 +465,17 @@ class LocalEngine:
             if not isinstance(result, dict):
                 raise _BudgetUnavailable()
             return result
-        except (OSError, http.client.HTTPException) as exc:
+        except Cancelled:
+            if deadline_expired.is_set():
+                raise EngineError('Local model budget request timed out at its deadline') from None
+            raise
+        except (OSError, http.client.HTTPException, ValueError, AttributeError) as exc:
+            if deadline_expired.is_set():
+                raise EngineError('Local model budget request timed out at its deadline') from exc
             self._raise_if_cancelled(cancel)
             raise EngineError(f'Local model budget connection failed: {exc}') from exc
         finally:
+            watcher_done.set()
             with self._state_lock:
                 if self._active_connection is connection:
                     self._active_connection = None
