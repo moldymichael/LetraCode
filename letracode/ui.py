@@ -23,6 +23,19 @@ from .worker import ConversationWorker
 from .strand_ui import MemoryEditorState, StrandDialog
 
 
+def assistant_html(text, font):
+    """Render model prose, allowing ordinary links but never application actions."""
+    document = QTextDocument()
+    document.setDefaultFont(font)
+    document.setMarkdown(text, QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML)
+    body = re.search(r'<body[^>]*>(.*)</body>', document.toHtml(), re.S)
+    rendered = body.group(1) if body else html.escape(text)
+    # Qt emits normalized double-quoted hrefs; source HTML is already disabled.
+    # App-created receipt links are added separately after this boundary.
+    return re.sub(r'<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+        lambda match: match.group(2) if QUrl(html.unescape(match.group(1))).scheme().lower() == 'letracode' else match.group(0), rendered, flags=re.S)
+
+
 class SafeBrowser(QTextBrowser):
     def loadResource(self, kind, url):
         # Model text must never fetch images, local files, styles, or remote content.
@@ -331,7 +344,8 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage('Memory conflict · external file preserved; editor draft saved separately')
                 return False
             self.loading = True
-            self.context_editors['memory'].setPlainText(self.memory_state.text)
+            if self.context_editors['memory'].toPlainText() != self.memory_state.text:
+                self.context_editors['memory'].setPlainText(self.memory_state.text)
             self.loading = False
         return True
 
@@ -353,9 +367,13 @@ class MainWindow(QMainWindow):
         self.save_editors()
         dialog = StrandDialog(self.store, self.project_id, self)
         dialog.exec()
-        # A model or external editor may have changed a memory while our pane
-        # was idle. Its unchanged text is never written back over that change.
-        self.save_editors()
+        # The dialog can resolve this pane's saved conflict. Reopen the state
+        # instead of reviving a stale buffer after a deliberate resolution.
+        self.memory_state = MemoryEditorState(self.store, 'project' if self.project_id else 'global', self.project_id)
+        self.loading = True
+        self.context_editors['memory'].setPlainText(self.memory_state.text)
+        self.loading = False
+        self.context_hint.setText(str(self.memory_state.snapshot['path']))
 
     def new_chat(self, checked=False):
         if self.worker:
@@ -534,11 +552,7 @@ class MainWindow(QMainWindow):
             if role == 'user' or role == 'notice':
                 chunks.append('<p>'+html.escape(text).replace('\n','<br>')+'</p>')
             elif text:
-                document = QTextDocument()
-                document.setDefaultFont(self.transcript.font())
-                document.setMarkdown(text,QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML)
-                body = re.search(r'<body[^>]*>(.*)</body>',document.toHtml(),re.S)
-                chunks.append(body.group(1) if body else html.escape(text))
+                chunks.append(assistant_html(text, self.transcript.font()))
             elif message['status']=='streaming':
                 chunks.append('<p>Working locally…</p>')
         self.transcript.setHtml('\n'.join(chunks))

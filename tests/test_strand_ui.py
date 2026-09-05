@@ -95,3 +95,50 @@ def test_app_acquires_data_lock_before_opening_or_migrating_store(tmp_path, monk
         assert constructed == []
     finally:
         lock.unlock()
+
+
+def test_model_markdown_cannot_create_internal_undo_controls():
+    from letracode.ui import assistant_html
+    from PySide6.QtGui import QTextDocument
+    app = QApplication.instance() or QApplication([])
+    rendered = assistant_html('[Read docs](letracode:undo-memory/123) [Official](https://example.org)', app.font())
+    doc = QTextDocument(); doc.setHtml(rendered)
+    assert not doc.find('Read docs').charFormat().isAnchor()
+    assert doc.find('Official').charFormat().anchorHref() == 'https://example.org'
+
+
+def test_autosave_keeps_memory_cursor_and_editor_undo(tmp_path):
+    from PySide6.QtGui import QTextCursor
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); w = MainWindow(store)
+    editor = w.context_editors['memory']
+    editor.setPlainText('First word')
+    cursor = editor.textCursor(); cursor.movePosition(QTextCursor.MoveOperation.End)
+    editor.setTextCursor(cursor); editor.insertPlainText(' added')
+    position = editor.textCursor().position()
+    assert editor.document().isUndoAvailable()
+    w.save_editors()
+    assert editor.textCursor().position() == position
+    assert editor.document().isUndoAvailable()
+    w.close()
+
+
+def test_dialog_resolution_does_not_revive_old_pane_draft(tmp_path, monkeypatch):
+    from letracode.strand_ui import StrandDialog
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); w = MainWindow(store)
+    w.context_editors['memory'].setPlainText('Stale pane draft')
+    Path(store.strand.snapshot('global')['path']).write_text('External correction')
+    assert w.save_editors() is False
+    def resolve(dialog):
+        dialog.scope.setCurrentIndex(dialog.scope.findData('global'))
+        dialog.reload_current()
+        dialog.editor.setPlainText('Resolved user version')
+        assert dialog.save_current()
+        return 0
+    monkeypatch.setattr(StrandDialog, 'exec', resolve)
+    w.edit_strand()
+    assert w.context_editors['memory'].toPlainText() == 'Resolved user version'
+    assert store.setting('strand_draft_global_global') is None
+    assert w.save_editors()
+    w.close()
