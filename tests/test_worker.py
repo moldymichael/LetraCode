@@ -467,6 +467,7 @@ def test_runtime_count_accepts_intact_core_larger_than_retrieval_allowance(
     assert engine.measured
     assert all(instructions in messages[0]['content'] for messages in engine.measured)
     assert 'Optional memory marker' not in engine.generated[0][0]['content']
+    assert 'Optional memory and source excerpts omitted' in engine.generated[0][0]['content']
     assert '## Source inventory' not in engine.generated[0][0]['content']
     assert engine.generated[0][-1]['content']==prompt
     assert store.project(project)['instructions']==instructions

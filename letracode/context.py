@@ -174,8 +174,10 @@ def build_context(project: dict | None, roots: list[str], query: str, budget=160
     if len(output) >= budget:
         if len(output) > budget and not allow_core_overflow:
             raise ValueError('Strand identity/preferences or project core instructions exceed the context budget. Shorten these files; core instructions were not truncated.')
-        # No room for optional memory, evidence, inventory, or coverage notes.
-        # Preserve every core instruction for the worker's whole-request count.
+        # Preserve every core instruction. The worker counts this coverage
+        # marker as part of the request, beyond the optional retrieval seed.
+        if allow_core_overflow:
+            output += '\n[Optional memory and source excerpts omitted for this turn to preserve core instructions. Use read_memory or source tools when enabled if that evidence is needed.]\n'
         return output
     if strand is not None:
         # Instructions are reserved first. Memory is selected within the space
