@@ -432,3 +432,73 @@ def test_worker_rereads_strand_files_and_reports_configured_model_filename(tmp_p
     assert 'Identity correction SECOND' in engine.systems[1]
     assert 'Identity correction FIRST' not in engine.systems[1]
     assert all('configured-model.gguf' in system for system in engine.systems)
+
+
+@pytest.mark.parametrize('context_size,max_tokens,instruction_chars', [
+    (8192, 2048, 6580),
+    (32768, 3072, 22000),
+])
+def test_runtime_count_accepts_intact_core_larger_than_retrieval_allowance(
+    tmp_path, context_size, max_tokens, instruction_chars,
+):
+    from letracode.budgeting import RequestUsage
+    instructions='Essential instruction. ' + 'x' * instruction_chars
+    class FittingCore(ScriptedEngine):
+        measured=[]
+        generated=[]
+        def request_usage(self, messages, tools, cancel, thinking=False):
+            self.measured.append(copy.deepcopy(messages))
+            assert instructions in messages[0]['content']
+            # Synthetic runtime reports an exact count that fits this model.
+            return RequestUsage(2457 if context_size==8192 else 8000, max_tokens, 128, 'synthetic tokenizer')
+        def complete(self, messages, tools, *args, **kwargs):
+            self.generated.append(copy.deepcopy(messages))
+            return {'role':'assistant','content':'The intact instructions fit.'}
+    store=Store(tmp_path/'data');project=store.create_project('Large core')
+    store.update_project(project,instructions=instructions)
+    (store.strand.root/'memory/global.md').write_text('Optional memory marker',encoding='utf-8')
+    chat=store.create_chat('Token authority',project)
+    prompt='Keep every instruction and this exact request.'
+    store.add_message(chat,'user',prompt)
+    engine=FittingCore()
+    engine.config=type('Config',(),{'context_size':context_size,'max_tokens':max_tokens})()
+    ConversationWorker(store,chat,engine,use_tools=False).run()
+    assert len(engine.generated)==1
+    assert engine.measured
+    assert all(instructions in messages[0]['content'] for messages in engine.measured)
+    assert 'Optional memory marker' not in engine.generated[0][0]['content']
+    assert '## Source inventory' not in engine.generated[0][0]['content']
+    assert engine.generated[0][-1]['content']==prompt
+    assert store.project(project)['instructions']==instructions
+    assert store.messages(chat)[-1]['content']=='The intact instructions fit.'
+
+
+def test_runtime_count_pauses_truly_oversized_core_without_truncation(tmp_path):
+    from letracode.budgeting import RequestUsage
+    instructions='Keep all of this core. ' + 'z' * 22000
+    class OversizedCore(ScriptedEngine):
+        measured=[]
+        generated=[]
+        def request_usage(self, messages, tools, cancel, thinking=False):
+            self.measured.append(copy.deepcopy(messages))
+            assert instructions in messages[0]['content']
+            return RequestUsage(9000,2048,128,'synthetic tokenizer')
+        def complete(self,messages,*args,**kwargs):
+            self.generated.append(messages)
+            return {'role':'assistant','content':'Should not generate'}
+    store=Store(tmp_path/'data');project=store.create_project('Oversized core')
+    store.update_project(project,instructions=instructions)
+    chat=store.create_chat('Pause without truncation',project)
+    prompt='Keep this exact request. 漢字'
+    store.add_message(chat,'user',prompt)
+    engine=OversizedCore()
+    engine.config=type('Config',(),{'context_size':8192,'max_tokens':2048})()
+    ConversationWorker(store,chat,engine,use_tools=False).run()
+    assert engine.measured
+    assert not engine.generated
+    assert all(instructions in messages[0]['content'] for messages in engine.measured)
+    assert store.project(project)['instructions']==instructions
+    rows=store.messages(chat)
+    assert rows[0]['content']==prompt
+    assert rows[-1]['status']=='paused'
+    assert json.loads(rows[-1]['payload'])['checkpoint']['reason']=='context_limit'

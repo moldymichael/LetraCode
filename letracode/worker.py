@@ -268,7 +268,7 @@ class ConversationWorker(QThread):
                           f'Context: {context_size} tokens; maximum response: {reply_size} tokens. '
                           'Strand identity is editable application context; it does not change model weights.')
             system = build_context(project, roots if self.computer_enabled else [], query,
-                retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance)
+                retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance, allow_core_overflow=True)
             executor = ToolExecutor(roots, self.store.directory, self.ask, self.cancel_event,
                 self.web_enabled, self.computer_enabled, store=self.store, chat_id=self.chat_id)
             self.engine.start(self.cancel_event, self.status.emit)
@@ -284,7 +284,6 @@ class ConversationWorker(QThread):
 
             def packed_messages():
                 nonlocal system, retrieval_budget
-                low, high = 0, retrieval_budget
                 overflow = None
                 # The character allowance only seeds retrieval. Escaping, tools,
                 # template expansion and Unicode can require less evidence.
@@ -301,21 +300,13 @@ class ConversationWorker(QThread):
                         return messages
                     except ContextOverflowError as error:
                         overflow = error
-                    high = retrieval_budget
-                    candidate = None
-                    while low < high:
-                        allowance = (low + high) // 2
-                        try:
-                            candidate = build_context(project, roots if self.computer_enabled else [], query,
-                                allowance, self.cancel_event, strand=self.store.strand, provenance=provenance)
-                        except ValueError as error:
-                            if 'context budget' not in str(error):
-                                raise
-                            low = allowance + 1
-                            continue
-                        retrieval_budget = allowance
+                    if retrieval_budget == 0:
                         break
-                    if candidate is None or candidate == system:
+                    retrieval_budget //= 2
+                    candidate = build_context(project, roots if self.computer_enabled else [], query,
+                        retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance,
+                        allow_core_overflow=True)
+                    if candidate == system:
                         break
                     system = candidate
                 raise overflow

@@ -151,7 +151,13 @@ Teach programming with plain explanations of unfamiliar concepts, where a comman
 ''' 
 
 
-def build_context(project: dict | None, roots: list[str], query: str, budget=16000, cancel=None, *, strand=None, provenance='') -> str:
+def build_context(project: dict | None, roots: list[str], query: str, budget=16000, cancel=None, *, strand=None, provenance='', allow_core_overflow=False) -> str:
+    """Assemble intact core followed by optional, bounded retrieved context.
+
+    Standalone callers retain the explicit character limit. The worker sets
+    allow_core_overflow because its runtime tokenizer is the authority for
+    core instructions; budget then only controls optional retrieval space.
+    """
     output = SYSTEM
     if strand is not None:
         output += '\n## Editable Strand identity and working preferences\n' + strand.core()
@@ -162,11 +168,15 @@ def build_context(project: dict | None, roots: list[str], query: str, budget=160
             if key == 'memory' and strand is not None:
                 continue
             value = project.get(key, '')
-            if len(value) > 12000:
+            if len(value) > 12000 and not allow_core_overflow:
                 raise ValueError(f'{label} exceeds 12,000 characters. Shorten it or move reference material to a linked file.')
             output += f'\n## {label}\n{value}\n'
-    if len(output) > budget:
-        raise ValueError('Strand identity/preferences or project core instructions exceed the context budget. Shorten these files; core instructions were not truncated.')
+    if len(output) >= budget:
+        if len(output) > budget and not allow_core_overflow:
+            raise ValueError('Strand identity/preferences or project core instructions exceed the context budget. Shorten these files; core instructions were not truncated.')
+        # No room for optional memory, evidence, inventory, or coverage notes.
+        # Preserve every core instruction for the worker's whole-request count.
+        return output
     if strand is not None:
         # Instructions are reserved first. Memory is selected within the space
         # left over, with explicit partial coverage and a paging tool.
