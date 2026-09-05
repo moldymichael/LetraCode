@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.letracode.LetraCode</id>
+  <name>LetraCode</name>
+  <summary>Private local AI conversations with project context</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <description>
+    <p>LetraCode is a KDE-friendly chat application for a local llama.cpp model. It can use linked project files and asks before sensitive actions.</p>
+    <p>Inference stays on the computer. LetraCode has no cloud account, telemetry, or hosted inference service.</p>
+  </description>
+  <launchable type="desktop-id">io.letracode.LetraCode.desktop</launchable>
+  <provides>
+    <binary>letracode</binary>
+  </provides>
+  <content_rating type="oars-1.1" />
+  <releases>
+    <release version="0.1.1" date="2026-09-05" />
+    <release version="0.1.0" date="2026-09-05" />
+  </releases>
+</component>

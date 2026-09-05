@@ -1,0 +1,13 @@
+[Desktop Entry]
+Type=Application
+Name=LetraCode
+GenericName=Local AI Chat
+Comment=Chat privately with a local model and your project files
+Exec=letracode
+Icon=io.letracode.LetraCode
+Terminal=false
+Categories=Development;Utility;
+Keywords=AI;Chat;Local;LLM;Code;
+StartupNotify=true
+StartupWMClass=LetraCode
+X-LetraCode-Managed=true
