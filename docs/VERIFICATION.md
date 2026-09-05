@@ -1,4 +1,33 @@
-# LetraCode 0.1.1 — verification and limits
+# LetraCode — verification and limits
+
+## Strand M1a on Fedora — September 5, 2026
+
+Fresh results from `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`, based on `45092f1`. Final code verified at `9496958`; subsequent changes document these results only. The original checkout, installed app and live data were not updated.
+
+Environment: Fedora 44 KDE Plasma, `/usr/bin/python3` 3.14.7, system PySide6 6.11.2, pytest 8.4.2, SQLite 3.51.2; FTS5 available. No new dependencies or system changes.
+
+- Baseline: **78 passed in 5.80 s**.
+- Final: **132 passed in 7.40 s**, zero failures/skips, using the command below.
+- All 15 application Python files compiled successfully using Python's `compile()` with no bytecode writes. Shell syntax and `git diff --check` passed.
+- Independent review findings were corrected and regression-tested: protected native Undo controls, stable editor cursor/drafts, Retry save checks, bounded/no-follow memory reads, concurrent writes/migration, and token-authoritative core budgeting with explicit omitted-context coverage. Scoped final review reported no remaining findings.
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider
+```
+
+The tests use temporary files/databases and scripted HTTP/model peers. Installer checks redirect all install/update/uninstall destinations into temporary homes; they do not install into the user's account. These tests establish deterministic behavior, not model intelligence.
+
+**Real local inference:** existing GGUF metadata reports Qwen3.6-35B-A3B / qwen35moe / MOSTLY_Q4_K_M; installed llama.cpp reports `0.4.0-dev`, commit `4d91760`. Tested with the configured context 32768, 12 GPU layers, 8 threads, reply reserve 3072 and temperature 0.7, plus an isolated 8192 profile. Actual model checks passed global identity, scoped remember, external correction, conflicting projects, context-heavy continuations at both sizes, and saved-result tool retrieval with external tools disabled. Prompt counts matched the independent input-token endpoint. Actual cancellation stopped the owned engine in 2.40 s. The final core-budget regression also passed on the real model: all 7000 instruction characters were preserved, with 1794 prompt + 3072 reply + 128 safety tokens at context 8192; answer “Strand”, 10.42 s. Every test-owned engine was stopped. No training was attempted.
+
+The context-heavy fixtures contain synthetic file reads; the archived command-output fixture is synthetic and its command was never executed. Small real-model checks do not prove whole-book comprehension, teaching quality or reliable tool use in general.
+
+**Fedora interface:** offscreen Qt tests and inspected renders passed. The actual development entry point opened on Wayland with isolated `ui-demo` data and closed cleanly after capturing its own widget. The captured live widget inherited the desktop dark style and was inspected. Full interactive KDE/dialog/keyboard behavior still requires user review.
+
+Detailed configuration, observations, limitations, safe launch command and manual checklist: [Strand M1a review guide](STRAND-M1A-REVIEW.md). Logs and isolated fixtures are retained at `/home/miceoil/Projects/strand-m1a-review-PGYug9/`, including `automated-tests.log`, `real-model-results.json`, `final-model-results.json`, `core-budget-model-results.json`, `live-launch.log` and engine logs. M1b and M2 were not implemented.
+
+---
+
+## Historical LetraCode 0.1.1 verification (retained attribution)
 
 Verified on September 5, 2026 in an Ubuntu 24.04 x86_64 environment, using Python 3.12 and Qt/PySide6 6.11.2. The installed Fedora application uses Fedora's system Qt, not the development Qt wheel.
 
