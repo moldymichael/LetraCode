@@ -48,6 +48,57 @@ def repair_tool_history(turn):
     return result
 
 
+def compact_tool_results(turn, budget):
+    """Omit bulky tool bodies from request copies, oldest first. Never edit storage."""
+    packed = [dict(message) for message in turn]
+    size = len(json.dumps(packed, ensure_ascii=False))
+    newest = max((i for i, m in enumerate(packed) if m['role'] == 'tool'), default=-1)
+    for index, message in enumerate(packed):
+        if size <= budget:
+            break
+        if message['role'] != 'tool':
+            continue
+        try:
+            result = json.loads(message['content'])
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if not isinstance(result, dict) or 'denied' in result or 'error' in result:
+            continue
+        bulk = {key:result[key] for key in ('text','output','entries','results') if key in result}
+        if not bulk:
+            continue
+        # Keep source paths/ranges and action outcomes (exit code, timeout,
+        # cancellation, etc.). Assistant calls and working notes remain intact.
+        receipt = {key:value for key, value in result.items() if key not in bulk}
+        receipt.update(context_truncated=True, context_note=(
+            'Bulk fields omitted; full result is saved in chat history. Preview is partial evidence. '
+            'Reread needed file ranges; never rerun commands or writes to recover output.'))
+        old_size = len(json.dumps(message, ensure_ascii=False))
+
+        def replacement():
+            return dict(message, content=json.dumps(receipt, ensure_ascii=False))
+
+        if index == newest:
+            # If even the newest result cannot fit, retain as much of a clearly
+            # marked preview as possible. Measure the actual escaped JSON size.
+            preview = json.dumps(bulk, ensure_ascii=False)
+            low, high = 0, len(preview)
+            while low < high:
+                middle = (low + high + 1) // 2
+                receipt['context_preview'] = preview[:middle]
+                if size - old_size + len(json.dumps(replacement(), ensure_ascii=False)) <= budget:
+                    low = middle
+                else:
+                    high = middle - 1
+            receipt['context_preview'] = preview[:low]
+        candidate = replacement()
+        new_size = len(json.dumps(candidate, ensure_ascii=False))
+        if new_size < old_size:
+            packed[index] = candidate
+            size += new_size - old_size
+    return packed
+
+
 def conversation_messages(rows, system, budget):
     """Keep whole user turns so tool results never become orphaned."""
     turns, current = [], []
@@ -65,16 +116,22 @@ def conversation_messages(rows, system, budget):
         current.append(message)
     if current:
         turns.append(current)
-    selected, used = [], len(system)
+    system_message = {'role':'system','content':system}
+    selected, used = [], len(json.dumps([system_message], ensure_ascii=False))
+    compacted = False
     for turn in reversed(turns):
         turn = repair_tool_history(turn)
         size = len(json.dumps(turn, ensure_ascii=False))
         if used + size > budget:
-            if not selected:
+            if selected:
+                break
+            turn = compact_tool_results(turn, budget - used)
+            size = len(json.dumps(turn, ensure_ascii=False))
+            compacted = True
+            if used + size > budget:
                 raise ValueError('The latest conversation turn is too large for this context setting. Increase the context size in Model Setup or start a new chat with a shorter prompt.')
-            break
         selected.insert(0, turn); used += size
-    return [{'role':'system','content':system}] + [m for turn in selected for m in turn], len(selected) < len(turns)
+    return [system_message] + [m for turn in selected for m in turn], compacted or len(selected) < len(turns)
 
 
 class ConversationWorker(QThread):
@@ -127,7 +184,7 @@ class ConversationWorker(QThread):
             system = build_context(project, roots if self.computer_enabled else [], query, min(20000, int(total_budget * 0.65)), self.cancel_event)
             messages, trimmed = conversation_messages(rows, system, total_budget)
             if trimmed:
-                self.status.emit('Using recent turns; older messages remain saved.')
+                self.status.emit('Using bounded context; full conversation and tool results remain saved.')
             executor = ToolExecutor(roots, self.store.directory, self.ask, self.cancel_event, self.web_enabled, self.computer_enabled)
             tools = [s for s in TOOL_SCHEMAS if (s['function']['name'] in ('web_search','fetch_url') and self.web_enabled) or (s['function']['name'] not in ('web_search','fetch_url') and self.computer_enabled)] if self.use_tools else []
             self.engine.start(self.cancel_event, self.status.emit)
@@ -161,7 +218,6 @@ class ConversationWorker(QThread):
                 if not calls:
                     self.status.emit('Ready · saved on this computer')
                     return
-                messages.append(reply)
                 for call in calls:
                     function = call.get('function',{})
                     name = function.get('name','')
@@ -176,13 +232,15 @@ class ConversationWorker(QThread):
                     else:
                         result = executor.execute(name, args)
                     tool_message = {'role':'tool','tool_call_id':call.get('id',''), 'name':name,'content':result}
-                    messages.append(tool_message)
                     # Record complete tool outcomes, capped by each tool boundary.
                     title = f'{name}\n\nArguments:\n{json.dumps(args,ensure_ascii=False,indent=2)}\n\nResult:\n{result}'
                     self.store.add_message(self.chat_id,'tool',title,payload={'message':tool_message})
                     self.changed.emit()
-                if len(json.dumps(messages,ensure_ascii=False)) > total_budget:
-                    raise ValueError('The retrieved material filled the model context. Everything is saved. Start a new chat or increase context size in Model Setup.')
+                # Repack from full saved outcomes before the next model call.
+                # Drop older complete turns first, then compact the active turn.
+                messages, trimmed = conversation_messages(self.store.messages(self.chat_id), system, total_budget)
+                if trimmed:
+                    self.status.emit('Using bounded context; full conversation and tool results remain saved.')
             raise ValueError('Stopped after 10 action rounds. Review the results, then ask to continue if needed.')
         except Exception as error:
             cancelled = self.cancel_event.is_set() or isinstance(error, Cancelled)
