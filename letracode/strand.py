@@ -6,6 +6,7 @@ All paths are app-owned; no-follow directory descriptors prevent link redirectio
 from __future__ import annotations
 
 import hashlib
+import ctypes
 import fcntl
 import json
 import os
@@ -26,6 +27,19 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def rename_noreplace(src_fd, src, dst_fd, dst):
+    """Linux atomic move that NEVER replaces a name created by another writer."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    rename = getattr(libc, 'renameat2', None)
+    if rename is None:
+        raise OSError('Safe Strand saves require Linux renameat2 support')
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(src_fd, os.fsencode(src), dst_fd, os.fsencode(dst), 1):  # RENAME_NOREPLACE
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error), dst)
+
+
 @contextmanager
 def safe_directory(path: Path, create=False):
     """Open every ancestor without following symlinks, including the data root."""
@@ -38,6 +52,7 @@ def safe_directory(path: Path, create=False):
             if create:
                 try:
                     os.mkdir(name, 0o700, dir_fd=fd)
+                    os.fsync(fd)
                 except FileExistsError:
                     pass
             try:
@@ -78,39 +93,179 @@ def _read_at(fd, name, max_bytes=MAX_FILE_BYTES):
     return data
 
 
+def _write_new(fd, name, data):
+    # Publish control records only when complete: a killed process must not
+    # leave a partial final journal or completion marker that poisons recovery.
+    staging = '.strand-stage-' + uuid.uuid4().hex
+    try:
+        out_fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        with os.fdopen(out_fd, 'wb') as out:
+            out.write(data)
+            out.flush()
+            os.fsync(out.fileno())
+        rename_noreplace(fd, staging, fd, name)
+        os.fsync(fd)
+    finally:
+        try:
+            os.unlink(staging, dir_fd=fd)
+        except FileNotFoundError:
+            pass
+
+
+@contextmanager
+def _recovery_directory(path, create=False):
+    # A separate directory per target isolates a damaged project's recovery data.
+    recovery = path.parent / '.strand-recovery' / path.name
+    if not create:
+        with safe_directory(path.parent) as parent:
+            try:
+                os.stat('.strand-recovery', dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                yield None
+                return
+        with safe_directory(recovery.parent) as parent:
+            try:
+                os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            except FileNotFoundError:
+                yield None
+                return
+    with safe_directory(recovery, create=create) as fd:
+        lock = os.open('.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
+        try:
+            info = os.fstat(lock)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError('Unsafe Strand recovery lock')
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            yield fd
+        finally:
+            os.close(lock)
+
+
+def _finish_recovery(fd, ident, status, before_hash):
+    _write_new(fd, ident + '.done', json.dumps({'status': status, 'before_sha256': before_hash}).encode())
+
+
+def _check_recovery(path, parent, recovery, max_bytes):
+    """Recover interrupted moves; detect later edits through a displaced open FD.
+
+    Actual old inodes are retained, not copied then unlinked. A writer holding an
+    old descriptor can otherwise silently lose a save even after our return.
+    """
+    if recovery is None:
+        return
+    location = path.parent / '.strand-recovery' / path.name
+    for name in sorted(os.listdir(recovery)):
+        if not re.fullmatch(r'[a-f0-9]{32}\.json', name):
+            continue
+        ident = name[:-5]
+        record = json.loads(_read_at(recovery, name, 4096))
+        done = _read_at(recovery, ident + '.done', 4096)
+        try:
+            old = _read_at(recovery, ident + '.before', max_bytes)
+        except (OSError, ValueError) as error:
+            raise ValueError(f'Memory conflict: cannot verify preserved external file '
+                             f'{location / (ident + ".before")}: {error}') from error
+        if done is None:
+            # A crash may leave the name absent. Restore first; ensure() must
+            # never replace the missing file with an empty default in this case.
+            if old is not None:
+                try:
+                    rename_noreplace(recovery, ident + '.before', parent, path.name)
+                    os.fsync(parent)
+                    os.fsync(recovery)
+                    old = None
+                except FileExistsError:
+                    pass
+            proposal = _read_at(recovery, ident + '.proposed', max_bytes)
+            status = 'saved' if old is not None and proposal is None else 'aborted'
+            _finish_recovery(recovery, ident, status, record['before_sha256'])
+            done = _read_at(recovery, ident + '.done', 4096)
+        finished = json.loads(done)
+        if old is not None and digest(old) != finished['before_sha256']:
+            raise ValueError(f'Memory conflict: external edit preserved at {location / (ident + ".before")}. '
+                             f'Compare with {path}; reconcile both files before removing recovery record {location / name}.')
+        if finished['status'] == 'saved' and old is None:
+            raise ValueError(f'Memory conflict: saved recovery file is missing in {location}')
+
+
 def safe_read(path: Path, max_bytes=MAX_FILE_BYTES):
-    with safe_directory(path.parent) as fd:
+    with safe_directory(path.parent) as fd, _recovery_directory(path) as recovery:
+        _check_recovery(path, fd, recovery, max_bytes)
         return _read_at(fd, path.name, max_bytes)
 
 
+def recover_file(path: Path):
+    """Resolve interrupted saves before archiving ownership of a memory path."""
+    with safe_directory(path.parent) as fd, _recovery_directory(path) as recovery:
+        _check_recovery(path, fd, recovery, MAX_FILE_BYTES)
+
+
 def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_bytes=MAX_FILE_BYTES):
-    """Atomically replace only a matching regular file; None means create only."""
+    """Preserve the displaced inode, validate it, then publish without replacement.
+
+    Advisory locks cannot coordinate ordinary editors. Every move uses Linux
+    NOREPLACE, including restoration; a competing pathname is never overwritten.
+    The brief absent-name interval is recoverable from the durable journal.
+    """
     if len(data) > max_bytes:
         raise ValueError(f'File is too large (size limit {max_bytes} bytes): {path}')
-    with safe_directory(path.parent) as fd:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, create=True) as recovery:
+        _check_recovery(path, fd, recovery, max_bytes)
         original = _read_at(fd, path.name, max_bytes)
         current_hash = None if original is None else digest(original)
         if current_hash != expected_sha256:
             raise ValueError(f'File changed; reload to resolve the conflict: {path}')
-        temporary = '.strand-' + uuid.uuid4().hex
+        ident = uuid.uuid4().hex
+        temporary = ident + '.proposed'
+        previous = ident + '.before'
+        captured = False
+        published = False
         try:
-            out_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
-            with os.fdopen(out_fd, 'wb') as out:
-                out.write(data)
-                out.flush()
-                os.fsync(out.fileno())
+            _write_new(recovery, temporary, data)
             # Reopen the ancestor chain and compare directory identity before commit.
             with safe_directory(path.parent) as fresh:
                 a, b = os.fstat(fd), os.fstat(fresh)
                 if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
                     raise ValueError('Directory changed during write')
-            if _read_at(fd, path.name, max_bytes) != original:
-                raise ValueError(f'File changed; reload to resolve the conflict: {path}')
-            os.replace(temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
-            os.fsync(fd)
-        finally:
+            if original is not None:
+                _write_new(recovery, ident + '.json', json.dumps({'before_sha256': expected_sha256}).encode())
+                rename_noreplace(fd, path.name, recovery, previous)
+                captured = True
+                os.fsync(fd)
+                os.fsync(recovery)
+                if _read_at(recovery, previous, max_bytes) != original:
+                    raise ValueError(f'File changed; reload to resolve the conflict: {path}')
             try:
-                os.unlink(temporary, dir_fd=fd)
+                rename_noreplace(recovery, temporary, fd, path.name)
+            except FileExistsError as error:
+                raise ValueError(f'File changed; reload to resolve the conflict: {path}') from error
+            published = True
+            os.fsync(fd)
+            os.fsync(recovery)
+            if captured:
+                _finish_recovery(recovery, ident, 'saved', expected_sha256)
+                _check_recovery(path, fd, recovery, max_bytes)
+        except Exception as error:
+            # Restore only into an absent name, preserving any later external
+            # creation. Never delete a captured inode: editors may still own it.
+            if captured and not published:
+                try:
+                    rename_noreplace(recovery, previous, fd, path.name)
+                    os.fsync(fd)
+                    os.fsync(recovery)
+                except FileExistsError:
+                    location = path.parent / '.strand-recovery' / path.name / previous
+                    raise ValueError(f'File changed; conflict versions retained at {path} and {location}') from error
+                except OSError as restore_error:
+                    location = path.parent / '.strand-recovery' / path.name / previous
+                    raise OSError(f'Save failed; original is recoverable at {location}: {restore_error}') from error
+            raise
+        finally:
+            # Unpublished proposals are useful for crash/conflict recovery. Only
+            # create-only attempts have no journal and can discard their staging.
+            try:
+                if original is None:
+                    os.unlink(temporary, dir_fd=recovery)
             except FileNotFoundError:
                 pass
 
@@ -248,8 +403,11 @@ class StrandFiles:
             raise ValueError('Invalid receipt destination')
         record['path'] = str(path)
         if record['status'] == 'prepared':
-            current = self.snapshot(record['scope'], record.get('project_id'))['sha256']
-            record['status'] = 'saved' if current == record['after_sha256'] else 'unconfirmed'
+            try:
+                current = self.snapshot(record['scope'], record.get('project_id'))['sha256']
+                record['status'] = 'saved' if current == record['after_sha256'] else 'unconfirmed'
+            except (ValueError, OSError):
+                record['status'] = 'unconfirmed'
         return record
 
     def receipts(self, limit=50):
@@ -292,17 +450,29 @@ class StrandFiles:
         sources = [('global', None), ('learning', None)]
         if project_id is not None:
             sources.insert(1, ('project', project_id))
-        notes = [(scope, self.snapshot(scope, ident)['text']) for scope, ident in sources]
+        notes = []
+        unavailable = ''
+        for scope, ident in sources:
+            try:
+                notes.append((scope, self.snapshot(scope, ident)['text']))
+            except (ValueError, OSError):
+                if scope != 'project':
+                    raise
+                unavailable = '[Project memory unavailable; do not assume its contents.]\n'
+        unavailable = unavailable[:budget]
+        budget -= len(unavailable)
+        if budget == 0:
+            return unavailable
         notes = [(scope, content) for scope, content in notes if content.strip()]
         if not notes:
-            return ''
+            return unavailable
         full = '\n\n'.join(f'[{scope} memory]\n{content}' for scope, content in notes)
         if len(full) <= budget:
-            return full
+            return unavailable + full
         # Keep the coverage warning even for very small budgets.
         marker = '[Partial memory coverage; use read_memory for more.]\n'
         if budget <= len(marker):
-            return marker[:budget]
+            return unavailable + marker[:budget]
         terms = set(re.findall(r'\w+', query.lower()))
         excerpts = []
         allowance = max(0, (budget - len(marker) - 2 * len(notes)) // len(notes))
@@ -312,7 +482,7 @@ class StrandFiles:
             ranked = sorted(enumerate(blocks), key=lambda item: (-len(terms & set(re.findall(r'\w+', item[1].lower()))), item[0]))
             selected = '\n\n'.join(block for _, block in ranked)
             excerpts.append((heading + selected[:max(0, allowance - len(heading))])[:allowance])
-        return (marker + '\n\n'.join(excerpts))[:budget]
+        return unavailable + (marker + '\n\n'.join(excerpts))[:budget]
 
     def backup_entries(self):
         """Yield verified bytes, retaining ordinary future notes/manifests, excluding weights."""
@@ -324,8 +494,8 @@ class StrandFiles:
                     if stat.S_ISDIR(info.st_mode):
                         yield from walk(path)
                     elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                        if path.suffix.lower() != '.gguf' and name != '.write-lock' and not name.startswith('.strand-'):
-                            limit = MAX_RECEIPT_BYTES if path.parent == self.root / '.receipts' else MAX_FILE_BYTES
+                        if path.suffix.lower() != '.gguf' and name not in ('.write-lock', '.lock') and not name.startswith('.strand-'):
+                            limit = MAX_RECEIPT_BYTES if self.root / '.receipts' in path.parents else MAX_FILE_BYTES
                             data = safe_read(path, limit)
                             if data is None:
                                 raise ValueError('Strand file disappeared during backup')

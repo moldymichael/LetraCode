@@ -38,10 +38,12 @@ def schema(name, description, properties, required):
 
 STRING = {'type':'string'}
 MEMORY_SCOPE = {'type':'string','enum':['global','project','learning']}
+SAVED_READ_TOOLS = ('read_memory', 'read_tool_result', 'list_tool_results')
 TOOL_SCHEMAS = [
     schema('read_memory','Read ordinary Strand memory for this chat scope. Pages are partial; follow next_offset. Project means the active project, never another project.', {'scope':MEMORY_SCOPE,'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['scope']),
     schema('remember','Save a user-requested memory or proposed learning update. Use project for story/project facts, global for shared preferences, learning for correctable programming evidence. Shows destination and text for review unless learning has an explicit grant. No source/identity writes or training.', {'scope':MEMORY_SCOPE,'text':STRING}, ['scope','text']),
-    schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
+    schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt or list_tool_results and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
+    schema('list_tool_results','Discover saved tool results from this chat, including earlier paused or compacted turns, without rerunning actions. Metadata is partial; use read_tool_result for full saved output. Start after_id=0. For each next page keep through_id and set after_id=next_after_id. limit is 1–20, default 10.', {'after_id':{'type':'integer'},'through_id':{'type':'integer'},'limit':{'type':'integer'}}, []),
     schema('list_files','List a local folder (no recursive enumeration). Outside project links requires approval.', {'path':STRING}, ['path']),
     schema('read_file','Read a UTF-8, Markdown, source, PDF or DOCX file with numbered lines. Use start_line and max_lines for long files.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'}}, ['path']),
     schema('search_project','Search linked project text files for evidence. Returns diverse passages with paths and line numbers.', {'query':STRING}, ['query']),
@@ -96,7 +98,7 @@ class ToolExecutor:
             if name in ('web_search','fetch_url'):
                 if not self.web_enabled:
                     raise Denied('Internet access is turned off.')
-            elif name not in ('read_memory', 'read_tool_result') and not self.computer_enabled:
+            elif name not in SAVED_READ_TOOLS and not self.computer_enabled:
                 raise Denied('Computer tools are turned off.')
             result = getattr(self, '_' + name)(args)
             return json.dumps(result, ensure_ascii=False)
@@ -147,6 +149,57 @@ class ToolExecutor:
             raise ValueError('Saved result retrieval requires an active chat.')
         return self.store.tool_result_page(self.chat_id, args.get('result_id'),
             offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
+
+    def _list_tool_results(self, args):
+        if self.store is None or not self.chat_id:
+            raise ValueError('Saved result retrieval requires an active chat.')
+        after_id, limit = args.get('after_id', 0), args.get('limit', 10)
+        if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError('after_id must be nonnegative and limit must be 1–20.')
+        through_id = args.get('through_id')
+        if 'through_id' in args and (type(through_id) is not int or through_id < 0):
+            raise ValueError('through_id must be a nonnegative integer from the first page.')
+        if through_id is None:
+            through_id = self.store.rows(
+                "SELECT COALESCE(MAX(id), 0) AS id FROM messages WHERE chat_id=? AND role='tool'",
+                (self.chat_id,))[0]['id']
+        # The worker saves these pages too. Freeze the upper bound so a reader
+        # cannot chase newly appended catalog pages forever.
+        rows = self.store.rows(
+            "SELECT * FROM messages WHERE chat_id=? AND role='tool' AND id>? AND id<=? ORDER BY id LIMIT ?",
+            (self.chat_id, after_id, through_id, limit + 1))
+        results = []
+        for row in rows[:limit]:
+            message = json.loads(row['payload']).get('message', {})
+            content = message.get('content', row['content'])
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            item = {'result_id': row['id'], 'created': row['created'], 'status': row['status']}
+
+            def bounded(value):
+                if not isinstance(value, (str, int, float, bool, type(None))):
+                    value = json.dumps(value, ensure_ascii=False)
+                if isinstance(value, str) and len(value) > 240:
+                    item['metadata_truncated'] = True
+                    return value[:240]
+                return value
+
+            item.update(name=bounded(message.get('name', '')),
+                        tool_call_id=bounded(message.get('tool_call_id', '')),
+                        total_chars=len(content), preview=bounded(content))
+            try:
+                outcome = json.loads(content)
+            except (TypeError, json.JSONDecodeError):
+                outcome = None
+            if isinstance(outcome, dict):
+                item['outcome'] = {key: bounded(outcome[key]) for key in (
+                    'denied', 'error', 'executed', 'exit_code', 'timed_out', 'cancelled',
+                    'output_limit_reached', 'code') if key in outcome}
+                item['source'] = {key: bounded(outcome[key]) for key in (
+                    'path', 'url', 'query', 'result_id') if key in outcome}
+            results.append(item)
+        return {'results': results, 'through_id': through_id,
+                'next_after_id': results[-1]['result_id'] if len(rows) > limit else None}
 
     def _list_files(self, args):
         path = self._path(args)

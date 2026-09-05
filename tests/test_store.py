@@ -2,6 +2,9 @@ import json
 import sqlite3
 import zipfile
 import shutil
+import os
+import multiprocessing
+from pathlib import Path
 
 import pytest
 
@@ -234,3 +237,226 @@ def test_saved_tool_result_pages_preserve_full_text_and_deny_other_chats(tmp_pat
     with pytest.raises(ValueError):
         store.tool_result_page(other, ident)
     assert json.loads(store.messages(chat)[0]['payload'])['message']['content'] == content
+
+
+@pytest.mark.parametrize('unavailable', ['missing', 'malformed', 'oversized', 'permission'])
+def test_unavailable_project_memory_does_not_hide_other_projects_or_chats(tmp_path, monkeypatch, unavailable):
+    store = Store(tmp_path / 'data')
+    bad = store.create_project('Unavailable')
+    good = store.create_project('Available')
+    chat = store.create_chat('Unrelated global chat')
+    store.update_project(good, memory='Still accessible')
+    memory = store.strand.path('project', bad)
+    if unavailable == 'missing':
+        memory.unlink()
+    elif unavailable == 'malformed':
+        memory.write_bytes(b'Invalid UTF-8: \xff')
+    elif unavailable == 'oversized':
+        memory.write_bytes(b'x' * (2 * 1024 * 1024 + 1))
+    else:
+        real_snapshot = store.strand.snapshot
+
+        def denied(scope, project_id=None):
+            if scope == 'project' and project_id == bad:
+                raise PermissionError('Memory is not readable')
+            return real_snapshot(scope, project_id)
+
+        monkeypatch.setattr(store.strand, 'snapshot', denied)
+    projects = store.projects()
+    assert {project['id'] for project in projects} == {good, bad}
+    assert all('memory' not in project for project in projects)
+    assert store.project(bad)['memory'] == ''
+    assert store.project(bad)['memory_error']
+    assert store.project(good)['memory'] == 'Still accessible'
+    assert 'memory_error' not in store.project(good)
+    assert store.chat(chat)['title'] == 'Unrelated global chat'
+
+
+def test_deletion_archives_original_inode_raw_bytes_and_record_in_backup(tmp_path):
+    store = Store(tmp_path / 'data')
+    ident = store.create_project('Archived novel')
+    memory = store.strand.path('project', ident)
+    memory.write_bytes(b'An undecodable correction: \xff')
+    inode = memory.stat().st_ino
+    with memory.open('ab', buffering=0) as editor:
+        archive = store.delete_project(ident)
+        assert not memory.exists(), 'Deletion left authoritative project memory behind'
+        archive_path = Path(archive['path'])
+        assert archive_path.stat().st_ino == inode
+        editor.write(b'\nA late editor save')
+    assert archive_path.read_bytes() == b'An undecodable correction: \xff\nA late editor save'
+    assert store.project(ident) is None
+    record = json.loads(Path(archive['record_path']).read_text())
+    assert record['project_id'] == ident
+    assert record['title'] == 'Archived novel'
+    assert record['date']
+    assert record['status'] == 'deleted'
+    assert record['path'] == str(archive_path)
+    backup = tmp_path / 'backup.zip'
+    store.backup(backup)
+    with zipfile.ZipFile(backup) as exported:
+        relative = archive_path.relative_to(store.directory).as_posix()
+        assert exported.read(relative) == archive_path.read_bytes()
+
+
+def test_deletion_of_missing_memory_removes_project_without_creating_a_file(tmp_path):
+    store = Store(tmp_path / 'data')
+    ident = store.create_project('Missing')
+    memory = store.strand.path('project', ident)
+    memory.unlink()
+    assert store.delete_project(ident) is None
+    assert store.project(ident) is None
+    assert not memory.exists()
+
+
+@pytest.mark.parametrize('kind', ['symlink', 'hardlink', 'directory'])
+def test_deletion_refuses_unsafe_memory_targets_and_keeps_project(tmp_path, kind):
+    store = Store(tmp_path / 'data')
+    ident = store.create_project('Do not delete')
+    memory = store.strand.path('project', ident)
+    memory.unlink()
+    outside = tmp_path / 'outside.md'
+    outside.write_text('Keep original')
+    if kind == 'symlink':
+        memory.symlink_to(outside)
+    elif kind == 'hardlink':
+        os.link(outside, memory)
+    else:
+        memory.mkdir()
+    with pytest.raises(ValueError, match='Unsafe|linked'):
+        store.delete_project(ident)
+    assert any(row['id'] == ident for row in store.projects())
+    assert outside.read_text() == 'Keep original'
+
+
+def test_failed_database_deletion_restores_original_memory_without_overwrite(tmp_path):
+    store = Store(tmp_path / 'data')
+    ident = store.create_project('Still present')
+    memory = store.strand.path('project', ident)
+    memory.write_text('Preserve this note')
+    inode = memory.stat().st_ino
+    with store.connection() as db:
+        db.execute("CREATE TRIGGER prevent_delete BEFORE DELETE ON projects BEGIN SELECT RAISE(ABORT, 'Deletion refused'); END")
+    with pytest.raises(sqlite3.IntegrityError, match='Deletion refused'):
+        store.delete_project(ident)
+    assert store.project(ident)['memory'] == 'Preserve this note'
+    assert memory.stat().st_ino == inode
+    records = list((store.strand.root / '.deleted-projects' / ident).glob('*.json'))
+    assert len(records) == 1
+    assert json.loads(records[0].read_text())['status'] == 'restored'
+
+
+def test_deletion_conflict_preserves_new_memory_and_recoverable_original(tmp_path, monkeypatch):
+    import letracode.strand as strand_module
+
+    store = Store(tmp_path / 'data')
+    ident = store.create_project('Keep both edits')
+    memory = store.strand.path('project', ident)
+    memory.write_text('Original memory')
+    real_rename = strand_module.rename_noreplace
+
+    def editor_save_after_archive(source, source_name, destination, destination_name):
+        real_rename(source, source_name, destination, destination_name)
+        if source_name == memory.name:
+            memory.write_text('A concurrent new editor version')
+
+    monkeypatch.setattr(strand_module, 'rename_noreplace', editor_save_after_archive)
+    with pytest.raises(ValueError, match='preserved at'):
+        store.delete_project(ident)
+    assert store.project(ident)['memory'] == 'A concurrent new editor version'
+    archive_dir = store.strand.root / '.deleted-projects' / ident
+    retained = list(archive_dir.glob('*.md'))
+    assert len(retained) == 1
+    assert retained[0].read_text() == 'Original memory'
+    record = json.loads(next(archive_dir.glob('*.json')).read_text())
+    assert record['status'] == 'recovery_required'
+
+
+def test_oversized_project_memory_can_be_archived_without_decoding_or_truncation(tmp_path):
+    store = Store(tmp_path / 'data')
+    ident = store.create_project('Large archived memory')
+    memory = store.strand.path('project', ident)
+    content = b'x' * (2 * 1024 * 1024 + 1)
+    memory.write_bytes(content)
+    archived = store.delete_project(ident)
+    assert Path(archived['path']).read_bytes() == content
+    assert not memory.exists()
+
+
+def test_interrupted_project_deletion_retains_archive_and_unavailable_project(tmp_path):
+    import letracode.strand as strand_module
+
+    directory = tmp_path / 'data'
+    store = Store(directory)
+    ident = store.create_project('Interrupted deletion')
+    memory = store.strand.path('project', ident)
+    memory.write_text('Recover after interruption')
+
+    def crash_after_archive():
+        real_rename = strand_module.rename_noreplace
+
+        def stop_after_move(source, source_name, destination, destination_name):
+            real_rename(source, source_name, destination, destination_name)
+            if source_name == memory.name:
+                os.fsync(source)
+                os.fsync(destination)
+                os._exit(0)
+
+        strand_module.rename_noreplace = stop_after_move
+        store.delete_project(ident)
+        os._exit(2)
+
+    child = multiprocessing.get_context('fork').Process(target=crash_after_archive)
+    child.start()
+    child.join(3)
+    if child.is_alive():
+        child.terminate()
+        child.join()
+        pytest.fail('Deletion child did not reach its archive checkpoint')
+    assert child.exitcode == 0
+    restored = Store(directory)
+    assert restored.project(ident)['memory_error']
+    assert not memory.exists()
+    archive_dir = restored.strand.root / '.deleted-projects' / ident
+    record = json.loads(next(archive_dir.glob('*.json')).read_text())
+    assert record['status'] == 'prepared'
+    assert Path(record['path']).read_text() == 'Recover after interruption'
+
+
+@pytest.mark.parametrize('phase', ['capture', 'publish'])
+def test_deletion_resolves_interrupted_save_before_archiving_without_resurrection(tmp_path, monkeypatch, phase):
+    import letracode.strand as strand_module
+
+    class SimulatedCrash(BaseException):
+        pass
+
+    store = Store(tmp_path / 'data')
+    ident = store.create_project('Interrupted save then delete')
+    memory = store.strand.path('project', ident)
+    memory.write_text('Original memory')
+    snapshot = store.strand.snapshot('project', ident)
+    real_rename = strand_module.rename_noreplace
+
+    def interrupt_save(source, source_name, destination, destination_name):
+        real_rename(source, source_name, destination, destination_name)
+        captured = source_name == memory.name and destination_name.endswith('.before')
+        published = destination_name == memory.name and source_name.endswith('.proposed')
+        if (phase == 'capture' and captured) or (phase == 'publish' and published):
+            raise SimulatedCrash()
+
+    monkeypatch.setattr(strand_module, 'rename_noreplace', interrupt_save)
+    with pytest.raises(SimulatedCrash):
+        store.strand.replace('project', 'Proposed memory', snapshot['sha256'], ident)
+    monkeypatch.setattr(strand_module, 'rename_noreplace', real_rename)
+
+    archived = store.delete_project(ident)
+    assert not memory.exists()
+    # Prepared receipt inspection re-enters snapshot/recovery. It must not
+    # resurrect an authoritative file after database ownership was deleted.
+    reopened = Store(store.directory)
+    reopened.strand.receipts()
+    assert not memory.exists(), 'Receipt recovery resurrected deleted project memory'
+    assert reopened.project(ident) is None
+    assert archived is not None
+    expected = 'Original memory' if phase == 'capture' else 'Proposed memory'
+    assert Path(archived['path']).read_text() == expected

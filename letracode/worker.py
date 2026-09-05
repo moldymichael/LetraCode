@@ -11,7 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from .context import build_context
 from .budgeting import fallback_usage
 from .engine import Cancelled, ContextOverflowError
-from .tools import ApprovalRequest, TOOL_SCHEMAS, ToolExecutor
+from .tools import ApprovalRequest, SAVED_READ_TOOLS, TOOL_SCHEMAS, ToolExecutor
 
 
 class PendingApproval:
@@ -119,6 +119,12 @@ def compact_tool_results(turn, budget, *, prefix=None, measure=None):
     return packed
 
 
+def saved_result_references(rows):
+    """Keep a bounded hint; the chat's tool rows remain the durable catalog."""
+    saved = [row['id'] for row in rows if row['role'] == 'tool']
+    return {'saved_result_ids': saved[-20:], 'saved_result_count': len(saved)}
+
+
 def conversation_messages(rows, system, budget, *, measure=None):
     """Fit intact user turns against the whole formatted request, tools included.
 
@@ -147,8 +153,15 @@ def conversation_messages(rows, system, budget, *, measure=None):
     if current:
         turns.append(current)
     if checkpoint:
+        # Rebuild from all saved rows, including when replaying legacy notices.
+        # Carrying every old ID into each new checkpoint would itself overflow.
+        checkpoint = dict(checkpoint, **saved_result_references(rows))
         system += ('\n## Saved pause checkpoint\n' + json.dumps(checkpoint, ensure_ascii=False)
-                   + '\nPrior actions remain saved. Inspect saved results before proposing any retry; '
+                   + '\nThe IDs above are recent saved results across this chat. Use list_tool_results '
+                     'with after_id=0, then keep through_id and set after_id=next_after_id for further pages '
+                     'to discover older results; use '
+                     'read_tool_result with a result_id to retrieve the saved output. '
+                     'Prior actions remain saved. Inspect saved results before proposing any retry; '
                      'a new user turn does not require repeating completed or denied actions.\n')
     system_message = {'role': 'system', 'content': system}
     selected, compacted = [], False
@@ -208,9 +221,9 @@ class ConversationWorker(QThread):
     def pause(self, reason, detail, rounds=0):
         rows = self.store.messages(self.chat_id)
         user_id = next((row['id'] for row in reversed(rows) if row['role'] == 'user'), None)
-        saved = [row['id'] for row in rows if row['role'] == 'tool' and (user_id is None or row['id'] > user_id)]
         checkpoint = {'reason': reason, 'user_message_id': user_id, 'rounds': rounds,
-                      'saved_result_ids': saved, 'resume': 'Send a new user message to continue from saved evidence.'}
+                      **saved_result_references(rows),
+                      'resume': 'Send a new user message to continue from saved evidence.'}
         self.store.add_message(self.chat_id, 'notice',
             detail + ' All completed outcomes are saved. Send a new message to continue.',
             status='paused', payload={'checkpoint': checkpoint})
@@ -250,9 +263,9 @@ class ConversationWorker(QThread):
             if self.use_tools:
                 for definition in TOOL_SCHEMAS:
                     name = definition['function']['name']
-                    enabled = (name in ('read_memory', 'read_tool_result')
+                    enabled = (name in SAVED_READ_TOOLS
                         or (name in ('web_search', 'fetch_url') and self.web_enabled)
-                        or (name not in ('read_memory', 'read_tool_result', 'web_search', 'fetch_url') and self.computer_enabled))
+                        or (name not in (*SAVED_READ_TOOLS, 'web_search', 'fetch_url') and self.computer_enabled))
                     if enabled:
                         tools.append(definition)
             context_size = self.engine.config.context_size

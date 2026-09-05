@@ -325,6 +325,194 @@ def test_action_round_pause_resumes_from_saved_history_without_reexecution(tmp_p
     assert after[-1]['content']=='The previous actions are saved.'
 
 
+def test_repeated_pause_compaction_keeps_earlier_saved_references(tmp_path):
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Repeated pauses')
+    evidence_ids = []
+    for cycle in range(3):
+        store.add_message(chat, 'user', 'Continue using saved evidence.')
+        call = {'id': f'evidence_{cycle}', 'type': 'function', 'function': {
+            'name': 'read_file', 'arguments': '{}'}}
+        store.add_message(chat, 'assistant', '', payload={'message': {
+            'role': 'assistant', 'content': '', 'tool_calls': [call]}})
+        worker = ConversationWorker(store, chat, ScriptedEngine())
+        worker.save_tool_result(call, {}, json.dumps({'path': f'/synthetic/{cycle}', 'text': 'saved evidence'}))
+        evidence_ids.append(store.messages(chat)[-1]['id'])
+        store.add_message(chat, 'assistant', 'Previous working notes. ' * 300)
+        worker.pause('action_round_limit', 'Paused with saved evidence.', 10)
+        store = Store(tmp_path / 'data')
+        store.add_message(chat, 'user', 'Continue.')
+        messages, trimmed = conversation_messages(store.messages(chat), 'System', 2200)
+        assert trimmed
+        assert_paired_tools(messages)
+        assert len(json.dumps(messages, ensure_ascii=False)) <= 2200
+        # Every prior turn is now omitted. The current checkpoint is the only
+        # way to recover the small set of prior result references directly.
+        assert [message['role'] for message in messages] == ['system', 'user']
+        checkpoint = json.loads(messages[0]['content'].split('## Saved pause checkpoint\n')[1].split('\n')[0])
+        assert set(evidence_ids) <= set(checkpoint['saved_result_ids'])
+    assert checkpoint['saved_result_count'] == len(evidence_ids)
+
+
+def test_many_pauses_recover_old_result_from_bounded_catalog_after_reopen(tmp_path):
+    from letracode.tools import ToolExecutor
+
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Long saved history')
+    other = store.create_chat('Private unrelated history')
+    private_id = store.add_message(other, 'tool', 'UNRELATED SECRET', payload={'message': {
+        'role': 'tool', 'name': 'run_command', 'tool_call_id': 'private', 'content': 'UNRELATED SECRET'}})
+    original = json.dumps({'output': 'ARCHIVED-DELTA-41', 'exit_code': 7, 'timed_out': True})
+    expected = []
+    for cycle in range(24):
+        store.add_message(chat, 'user', 'Continue with prior evidence.')
+        name, outcome = ('run_command', original) if cycle == 0 else (
+            ('write_file', json.dumps({'denied': 'User denied this write. Do not retry.'})) if cycle == 1 else
+            ('read_file', json.dumps({'error': 'Missing original source.'})))
+        call = {'id': f'old_{cycle}', 'type': 'function', 'function': {'name': name, 'arguments': '{}'}}
+        store.add_message(chat, 'assistant', '', payload={'message': {
+            'role': 'assistant', 'content': '', 'tool_calls': [call]}})
+        worker = ConversationWorker(store, chat, ScriptedEngine())
+        worker.save_tool_result(call, {}, outcome)
+        expected.append(store.messages(chat)[-1]['id'])
+        store.add_message(chat, 'assistant', 'Earlier notes require compaction. ' * 500)
+        worker.pause('action_round_limit', 'Paused.', 10)
+    reopened = Store(tmp_path / 'data')
+    reopened.add_message(chat, 'user', 'Recover the earlier command output using only saved evidence.')
+    checkpoint = json.loads(reopened.messages(chat)[-2]['payload'])['checkpoint']
+    assert len(checkpoint['saved_result_ids']) < len(expected)
+    assert checkpoint['saved_result_count'] == len(expected)
+    before = reopened.messages(chat)
+    executor = ToolExecutor([], reopened.directory, lambda _: pytest.fail('Recovery must not request approval'),
+                            threading.Event(), False, False, store=reopened, chat_id=chat)
+    recovered = []
+    after_id = 0
+    while True:
+        page = json.loads(executor.execute('list_tool_results', {'after_id': after_id, 'limit': 7}))
+        assert 'error' not in page and 'denied' not in page
+        assert len(page['results']) <= 7
+        assert 'UNRELATED SECRET' not in json.dumps(page)
+        recovered.extend(page['results'])
+        after_id = page['next_after_id']
+        if after_id is None:
+            break
+    assert [item['result_id'] for item in recovered] == expected
+    assert private_id not in [item['result_id'] for item in recovered]
+    assert recovered[0]['outcome'] == {'exit_code': 7, 'timed_out': True}
+    assert recovered[1]['outcome']['denied'] == 'User denied this write. Do not retry.'
+    assert recovered[2]['outcome']['error'] == 'Missing original source.'
+    assert reopened.messages(chat) == before
+
+    class DiscoverSaved(ScriptedEngine):
+        requests = 0
+
+        def complete(self, messages, tools, *args, **kwargs):
+            self.requests += 1
+            assert_paired_tools(messages)
+            assert 'list_tool_results' in {tool['function']['name'] for tool in tools}
+            assert 'list_tool_results' in messages[0]['content']
+            if self.requests == 1:
+                assert len(messages) == 2  # Compaction discarded all old turns.
+                assert 'ARCHIVED-DELTA-41' not in json.dumps(messages)
+                name, arguments = 'list_tool_results', {'limit': 1}
+            elif self.requests == 2:
+                result_id = json.loads(messages[-1]['content'])['results'][0]['result_id']
+                name, arguments = 'read_tool_result', {'result_id': result_id}
+            else:
+                assert json.loads(messages[-1]['content'])['content'] == original
+                return {'role': 'assistant', 'content': 'Recovered ARCHIVED-DELTA-41; command exited 7.'}
+            return {'role': 'assistant', 'content': '', 'tool_calls': [{
+                'id': f'recover_{self.requests}', 'type': 'function', 'function': {
+                    'name': name, 'arguments': json.dumps(arguments)}}]}
+
+    engine = DiscoverSaved()
+    ConversationWorker(reopened, chat, engine, computer_enabled=False, web_enabled=False).run()
+    after = reopened.messages(chat)
+    assert after[-1]['content'] == 'Recovered ARCHIVED-DELTA-41; command exited 7.'
+    assert engine.requests == 3
+    assert [json.loads(row['payload'])['message']['name'] for row in after[len(before):] if row['role'] == 'tool'] == [
+        'list_tool_results', 'read_tool_result']
+    assert reopened.tool_result_page(chat, expected[0])['content'] == original
+
+
+def test_legacy_unbounded_checkpoint_fits_after_compaction(tmp_path):
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Legacy checkpoint')
+    # Old checkpoints may include every result in one large tool batch. Their
+    # obsolete inline index must not consume all future continuation budgets.
+    saved_ids = [store.add_message(chat, 'tool', 'Original bounded evidence') for _ in range(500)]
+    old_checkpoint = {'reason': 'action_round_limit', 'user_message_id': 1, 'rounds': 10,
+                      'saved_result_ids': saved_ids}
+    store.add_message(chat, 'notice', 'Legacy pause', status='paused', payload={'checkpoint': old_checkpoint})
+    store.add_message(chat, 'user', 'Continue.')
+    messages, _ = conversation_messages(store.messages(chat), 'System', 1800)
+    assert messages[-1]['content'] == 'Continue.'
+    assert len(json.dumps(messages)) <= 1800
+    checkpoint = json.loads(messages[0]['content'].split('## Saved pause checkpoint\n')[1].split('\n')[0])
+    assert checkpoint['saved_result_count'] == 500
+    assert checkpoint['saved_result_ids'][-1] == saved_ids[-1]
+
+
+def test_saved_result_catalog_bounds_metadata_and_rejects_invalid_pages(tmp_path):
+    from letracode.tools import ToolExecutor
+
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Catalog bounds')
+    content = json.dumps({'error': 'Failure detail. ' * 500, 'path': '/source/' + 'x' * 1000})
+    result_id = store.add_message(chat, 'tool', content, payload={'message': {
+        'role': 'tool', 'name': 'read_file', 'tool_call_id': 'saved', 'content': content}})
+    executor = ToolExecutor([], store.directory, lambda _: pytest.fail('Read-only catalog'),
+                            threading.Event(), False, False, store=store, chat_id=chat)
+    page = json.loads(executor.execute('list_tool_results', {'limit': 1}))
+    assert page['results'][0]['result_id'] == result_id
+    assert page['results'][0]['metadata_truncated'] is True
+    assert len(json.dumps(page)) < 1600
+    assert page['next_after_id'] is None
+    assert store.tool_result_page(chat, result_id, max_chars=16000)['content'] == content
+    for args in ({'after_id': -1}, {'after_id': True}, {'after_id': '0'}, {'limit': 0},
+                 {'limit': 21}, {'limit': False}, {'limit': 1.5}, {'chat_id': 'other'},
+                 {'through_id': -1}, {'through_id': True}, {'through_id': None}):
+        assert 'error' in json.loads(executor.execute('list_tool_results', args))
+    assert json.loads(executor.execute('list_tool_results', {'after_id': result_id})) == {
+        'results': [], 'through_id': result_id, 'next_after_id': None}
+
+
+def test_worker_catalog_pagination_does_not_chase_its_own_saved_pages(tmp_path):
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Stable evidence catalog')
+    expected = [store.add_message(chat, 'tool', str(index), payload={'message': {
+        'role': 'tool', 'name': 'read_file', 'tool_call_id': f'saved_{index}', 'content': str(index)}})
+        for index in range(3)]
+    store.add_message(chat, 'user', 'List all saved results one per page.')
+
+    class PageAll(ScriptedEngine):
+        found = []
+        requests = 0
+
+        def complete(self, messages, *args, **kwargs):
+            self.requests += 1
+            assert_paired_tools(messages)
+            arguments = {'limit': 1}
+            if messages[-1]['role'] == 'tool':
+                page = json.loads(messages[-1]['content'])
+                self.found.extend(item['result_id'] for item in page['results'])
+                if page['next_after_id'] is None:
+                    return {'role': 'assistant', 'content': 'Finished listing saved results.'}
+                arguments['after_id'] = page['next_after_id']
+                if 'through_id' in page:
+                    assert page['through_id'] == expected[-1]
+                    arguments['through_id'] = page['through_id']
+            return {'role': 'assistant', 'content': '', 'tool_calls': [{
+                'id': f'list_{self.requests}', 'type': 'function', 'function': {
+                    'name': 'list_tool_results', 'arguments': json.dumps(arguments)}}]}
+
+    engine = PageAll()
+    ConversationWorker(store, chat, engine, computer_enabled=False, web_enabled=False).run()
+    assert engine.found == expected
+    assert engine.requests == 4
+    assert store.messages(chat)[-1]['content'] == 'Finished listing saved results.'
+
+
 def test_compacted_receipts_reference_saved_result_without_protocol_metadata(tmp_path):
     store,chat,paths=linked_reading_chat(tmp_path,1)
     engine=ReadingEngine([paths],context_size=8192,max_tokens=1024)
@@ -364,7 +552,7 @@ def test_worker_exposes_saved_reads_when_computer_and_web_are_disabled(tmp_path)
     class Offline(ScriptedEngine):
         def complete(self,messages,tools,*args,**kwargs):
             names={tool['function']['name'] for tool in tools}
-            assert names=={'read_tool_result','read_memory'}
+            assert names=={'read_tool_result','read_memory','list_tool_results'}
             return {'role':'assistant','content':'Offline history available.'}
     store=Store(tmp_path/'data');chat=store.create_chat('Offline')
     store.add_message(chat,'user','Review saved evidence')

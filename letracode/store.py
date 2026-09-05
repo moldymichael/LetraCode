@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import stat
 import tempfile
 import uuid
 import zipfile
@@ -144,15 +145,17 @@ class Store:
         return ident
 
     def projects(self):
-        rows = self.rows('SELECT * FROM projects ORDER BY lower(title),created')
-        for row in rows:
-            row['memory'] = self.strand.snapshot('project', row['id'])['text']
-        return rows
+        # Navigation must remain usable when any individual memory file fails.
+        return self.rows('SELECT id,title,current_context,instructions,created FROM projects ORDER BY lower(title),created')
 
     def project(self, ident):
         rows = self.rows('SELECT * FROM projects WHERE id=?', (ident,))
         if rows:
-            rows[0]['memory'] = self.strand.snapshot('project', ident)['text']
+            try:
+                rows[0]['memory'] = self.strand.snapshot('project', ident)['text']
+            except (OSError, ValueError) as error:
+                rows[0]['memory'] = ''
+                rows[0]['memory_error'] = str(error)
         return rows[0] if rows else None
 
     def update_project(self, ident, **fields):
@@ -170,8 +173,103 @@ class Store:
             db.execute('UPDATE projects SET ' + ','.join(f'{k}=?' for k in fields) + ' WHERE id=?', (*fields.values(), ident))
 
     def delete_project(self, ident):
-        with self.connection() as db:
-            db.execute('DELETE FROM projects WHERE id=?', (ident,))
+        """Archive the actual memory inode before deleting database ownership.
+
+        A crash between the archive move and SQLite commit leaves the project
+        present with unavailable memory and a prepared recovery record. Never
+        recreate or overwrite that memory automatically.
+        """
+        from .strand import rename_noreplace
+
+        with self.strand._operation(), self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT id,title FROM projects WHERE id=?', (ident,)).fetchone()
+            if row is None:
+                return None
+            archive = self._prepare_project_archive(row)
+            moved = False
+            try:
+                if archive is not None:
+                    original, destination = Path(archive['original_path']), Path(archive['path'])
+                    with safe_directory(original.parent) as source, safe_directory(destination.parent) as target:
+                        rename_noreplace(source, original.name, target, destination.name)
+                        moved = True
+                        os.fsync(source)
+                        os.fsync(target)
+                        info = os.stat(destination.name, dir_fd=target, follow_symlinks=False)
+                        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                            raise ValueError('Unsafe linked project memory changed during deletion')
+                        try:
+                            os.stat(original.name, dir_fd=source, follow_symlinks=False)
+                        except FileNotFoundError:
+                            pass
+                        else:
+                            raise ValueError('Project memory changed during deletion')
+                db.execute('DELETE FROM projects WHERE id=?', (ident,))
+                db.commit()
+            except BaseException as error:
+                db.rollback()
+                if moved:
+                    try:
+                        with safe_directory(destination.parent) as source, safe_directory(original.parent) as target:
+                            rename_noreplace(source, destination.name, target, original.name)
+                            os.fsync(source)
+                            os.fsync(target)
+                    except (OSError, ValueError) as recovery_error:
+                        self._finish_project_archive(archive, 'recovery_required')
+                        raise ValueError(
+                            f'Project deletion failed. Memory is preserved at {destination}; '
+                            'the current memory path was not overwritten. Recover the archive before retrying.'
+                        ) from recovery_error
+                    self._finish_project_archive(archive, 'restored')
+                raise error
+            if archive is not None:
+                self._finish_project_archive(archive, 'deleted')
+            return archive
+
+    def _prepare_project_archive(self, project):
+        from .strand import recover_file
+
+        original = self.strand.path('project', project['id'])
+        try:
+            # Resolve any interrupted save before taking away database ownership;
+            # later receipt reads must not resurrect its old authoritative name.
+            # Recovery alone does not decode or size-limit the current raw file.
+            recover_file(original)
+            with safe_directory(original.parent) as directory:
+                try:
+                    info = os.stat(original.name, dir_fd=directory, follow_symlinks=False)
+                except FileNotFoundError:
+                    return None
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError('Unsafe linked project memory cannot be deleted')
+        except ValueError as error:
+            if isinstance(error.__cause__, FileNotFoundError):
+                return None
+            raise
+        directory = self.strand.root / '.deleted-projects' / project['id']
+        with safe_directory(directory, create=True):
+            pass
+        archive_id = uuid.uuid4().hex
+        record = {'project_id': project['id'], 'title': project['title'], 'date': now(),
+                  'path': str(directory / f'{archive_id}.md'), 'original_path': str(original),
+                  'record_path': str(directory / f'{archive_id}.json'), 'status': 'prepared'}
+        # This durable record exists before removing the authoritative name.
+        safe_write(Path(record['record_path']), json.dumps(record, ensure_ascii=False, indent=2).encode('utf-8'), None)
+        return record
+
+    def _finish_project_archive(self, record, status):
+        record['status'] = status
+        path = Path(record['record_path'])
+        try:
+            previous = safe_read(path)
+            if previous is None:
+                raise ValueError('Deletion recovery record is missing')
+            safe_write(path, json.dumps(record, ensure_ascii=False, indent=2).encode('utf-8'), digest(previous))
+        except (OSError, ValueError) as error:
+            # SQLite/file changes already completed. Keep the durable prepared
+            # record and report its location without pretending deletion failed.
+            record['warning'] = f'Recovery record could not be finalized: {error}. Inspect {path}.'
 
     def create_chat(self, title='New chat', project_id=None):
         ident = uuid.uuid4().hex

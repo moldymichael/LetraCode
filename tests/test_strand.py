@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 import pytest
 
 from letracode.store import Store
+import letracode.strand as strand_module
 
 
 def test_ordinary_files_are_authoritative_and_scoped(tmp_path):
@@ -109,14 +110,14 @@ def test_context_and_pages_are_bounded_and_signal_partial_coverage(tmp_path):
 def test_atomic_write_failure_leaves_original_content(tmp_path, monkeypatch):
     strand = Store(tmp_path / 'data').strand
     original = strand.snapshot('global')
-    real_replace = os.replace
+    real_move = strand_module.rename_noreplace
 
-    def fail_target(src, dst, *args, **kwargs):
-        if str(dst).endswith('global.md'):
+    def fail_target(src_fd, src, dst_fd, dst):
+        if str(dst).endswith('global.md') and str(src).endswith('.proposed'):
             raise OSError('Simulated disk failure')
-        return real_replace(src, dst, *args, **kwargs)
+        return real_move(src_fd, src, dst_fd, dst)
 
-    monkeypatch.setattr(os, 'replace', fail_target)
+    monkeypatch.setattr(strand_module, 'rename_noreplace', fail_target)
     with pytest.raises(OSError, match='disk failure'):
         strand.replace('global', 'New content', original['sha256'])
     assert strand.snapshot('global')['text'] == original['text']
@@ -189,17 +190,17 @@ def test_separate_instances_cannot_both_save_against_the_same_snapshot(tmp_path,
     second = Store(tmp_path / 'data').strand
     before = first.snapshot('global')
     barrier = threading.Barrier(2)
-    original_replace = os.replace
+    original_move = strand_module.rename_noreplace
 
-    def race(src, dst, *args, **kwargs):
-        if str(dst) == 'global.md':
+    def race(src_fd, src, dst_fd, dst):
+        if str(src) == 'global.md':
             try:
                 barrier.wait(timeout=0.25)
             except threading.BrokenBarrierError:
                 pass
-        return original_replace(src, dst, *args, **kwargs)
+        return original_move(src_fd, src, dst_fd, dst)
 
-    monkeypatch.setattr(os, 'replace', race)
+    monkeypatch.setattr(strand_module, 'rename_noreplace', race)
 
     def save(strand, content):
         try:
@@ -213,3 +214,247 @@ def test_separate_instances_cannot_both_save_against_the_same_snapshot(tmp_path,
         one = executor.submit(save, first, 'First change')
         two = executor.submit(save, second, 'Second change')
         assert sorted([one.result(timeout=3), two.result(timeout=3)]) == ['conflict', 'saved']
+
+
+@pytest.mark.parametrize('editor', ['in_place', 'atomic_replace'])
+@pytest.mark.parametrize('operation', ['save', 'undo'])
+def test_external_edit_at_commit_boundary_is_preserved(tmp_path, monkeypatch, editor, operation):
+    strand = Store(tmp_path / 'data').strand
+    before = strand.snapshot('global')
+    receipt = strand.replace('global', 'First save', before['sha256'])
+    before = strand.snapshot('global')
+    target = strand.path('global')
+    real_replace = os.replace
+    real_move = getattr(strand_module, 'rename_noreplace', None)
+    fired = False
+
+    def edit():
+        nonlocal fired
+        if fired:
+            return
+        fired = True
+        if editor == 'in_place':
+            target.write_text('External edit at the final commit boundary')
+        else:
+            replacement = target.with_name('editor.tmp')
+            replacement.write_text('External edit at the final commit boundary')
+            real_replace(replacement, target)
+
+    def old_commit(src, dst, *args, **kwargs):
+        if dst == target.name:
+            edit()
+        return real_replace(src, dst, *args, **kwargs)
+
+    def guarded_commit(src_fd, src, dst_fd, dst):
+        if src == target.name:
+            edit()
+        return real_move(src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(os, 'replace', old_commit)
+    if real_move:
+        monkeypatch.setattr(strand_module, 'rename_noreplace', guarded_commit)
+    with pytest.raises(ValueError, match='changed|conflict'):
+        if operation == 'save':
+            strand.replace('global', 'Strand proposed overwrite', before['sha256'])
+        else:
+            strand.undo(receipt['id'])
+    assert fired
+    assert target.read_text() == 'External edit at the final commit boundary'
+    assert strand.snapshot('global')['text'] == target.read_text()
+
+
+def test_create_only_save_cannot_replace_racing_external_file(tmp_path, monkeypatch):
+    target = tmp_path / 'new.md'
+    real_replace = os.replace
+    real_move = getattr(strand_module, 'rename_noreplace', None)
+
+    def old_commit(src, dst, *args, **kwargs):
+        target.write_text('External create')
+        return real_replace(src, dst, *args, **kwargs)
+
+    def guarded_commit(src_fd, src, dst_fd, dst):
+        target.write_text('External create')
+        return real_move(src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(os, 'replace', old_commit)
+    if real_move:
+        monkeypatch.setattr(strand_module, 'rename_noreplace', guarded_commit)
+    with pytest.raises(ValueError, match='changed|conflict'):
+        strand_module.safe_write(target, b'Proposed create', None)
+    assert target.read_text() == 'External create'
+
+
+def test_late_write_through_old_editor_descriptor_is_recoverable_and_reported(tmp_path):
+    directory = tmp_path / 'data'
+    strand = Store(directory).strand
+    project = Store(directory).create_project('Editor race')
+    before = strand.snapshot('project', project)
+    with strand.path('project', project).open('r+b') as editor:
+        strand.replace('project', 'Proposed save', before['sha256'], project)
+        editor.write(b'Late external edit through an already open file')
+        editor.flush()
+        os.fsync(editor.fileno())
+    for files in (strand, Store(directory).strand):
+        with pytest.raises(ValueError, match='external edit|conflict'):
+            files.snapshot('project', project)
+    recovered = [p for p in strand.root.rglob('*.before')
+                 if p.read_bytes() == b'Late external edit through an already open file']
+    assert len(recovered) == 1
+
+
+def test_unavailable_project_context_is_explicit_and_does_not_hide_global_memory(tmp_path):
+    store = Store(tmp_path / 'data')
+    bad = store.create_project('Missing memory')
+    good = store.create_project('Working memory')
+    store.strand.path('project', bad).unlink()
+    store.strand.path('global').write_text('Global preference remains usable')
+    context = store.strand.context(bad, '', 2000)
+    assert 'project memory unavailable' in context.lower()
+    assert 'Global preference remains usable' in context
+    assert 'unavailable' not in store.strand.context(good, '', 2000)
+    for budget in (1, 20, 55, 60, 100):
+        assert len(store.strand.context(bad, '', budget)) <= budget
+
+
+@pytest.mark.parametrize('stage', ['capture', 'publish'])
+def test_process_crash_during_save_recovers_without_creating_empty_memory(tmp_path, stage):
+    directory = tmp_path / 'data'
+    strand = Store(directory).strand
+    target = strand.path('global')
+    target.write_text('Original before interruption')
+    before = strand.snapshot('global')
+
+    def crash_during_move():
+        real_move = strand_module.rename_noreplace
+
+        def move(src_fd, src, dst_fd, dst):
+            real_move(src_fd, src, dst_fd, dst)
+            if (stage == 'capture' and src == target.name or
+                    stage == 'publish' and dst == target.name and src.endswith('.proposed')):
+                os.fsync(src_fd)
+                os.fsync(dst_fd)
+                os._exit(0)
+
+        strand_module.rename_noreplace = move
+        strand.replace('global', 'Saved before interruption', before['sha256'])
+        os._exit(2)
+
+    child = multiprocessing.get_context('fork').Process(target=crash_during_move)
+    child.start()
+    child.join(5)
+    if child.is_alive():
+        child.terminate()
+        child.join()
+        pytest.fail('Save child did not reach the requested interruption')
+    assert child.exitcode == 0
+    again = Store(directory).strand
+    expected = 'Original before interruption' if stage == 'capture' else 'Saved before interruption'
+    assert again.snapshot('global')['text'] == expected
+    assert again.receipts()[0]['status'] == ('unconfirmed' if stage == 'capture' else 'saved')
+    if stage == 'publish':
+        again.undo(again.receipts()[0]['id'])
+        assert again.snapshot('global')['text'] == 'Original before interruption'
+
+
+def test_new_external_path_between_capture_and_publish_is_never_replaced(tmp_path, monkeypatch):
+    strand = Store(tmp_path / 'data').strand
+    target = strand.path('global')
+    before = strand.snapshot('global')
+    real_move = strand_module.rename_noreplace
+
+    def recreate(src_fd, src, dst_fd, dst):
+        if dst == target.name and src.endswith('.proposed'):
+            target.write_text('External file created during save')
+        return real_move(src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(strand_module, 'rename_noreplace', recreate)
+    with pytest.raises(ValueError, match='conflict'):
+        strand.replace('global', 'Proposed save', before['sha256'])
+    assert target.read_text() == 'External file created during save'
+    assert strand.snapshot('global')['text'] == target.read_text()
+    assert any(p.read_bytes() == b'' for p in strand.root.rglob('*.before'))
+
+
+def test_rollback_preserves_both_external_versions_when_editor_saves_again(tmp_path, monkeypatch):
+    strand = Store(tmp_path / 'data').strand
+    target = strand.path('global')
+    before = strand.snapshot('global')
+    real_move = strand_module.rename_noreplace
+
+    def racing_edits(src_fd, src, dst_fd, dst):
+        if src == target.name:
+            target.write_text('First external edit')
+        if dst == target.name and src.endswith('.before'):
+            target.write_text('Second external edit during rollback')
+        return real_move(src_fd, src, dst_fd, dst)
+
+    monkeypatch.setattr(strand_module, 'rename_noreplace', racing_edits)
+    with pytest.raises(ValueError, match='conflict versions retained'):
+        strand.replace('global', 'Proposed overwrite', before['sha256'])
+    assert target.read_text() == 'Second external edit during rollback'
+    assert any(p.read_bytes() == b'First external edit' for p in strand.root.rglob('*.before'))
+
+
+def test_recovery_inodes_and_journals_survive_backup_restore(tmp_path):
+    import zipfile
+
+    store = Store(tmp_path / 'data')
+    before = store.strand.snapshot('global')
+    receipt = store.strand.replace('global', 'Saved content', before['sha256'])
+    backup = tmp_path / 'backup.zip'
+    store.backup(backup)
+    with zipfile.ZipFile(backup) as archive:
+        assert any(name.endswith('.before') for name in archive.namelist())
+        assert any(name.endswith('.done') for name in archive.namelist())
+        archive.extractall(tmp_path / 'restored')
+    again = Store(tmp_path / 'restored').strand
+    assert again.snapshot('global')['text'] == 'Saved content'
+    again.undo(receipt['id'])
+    assert again.snapshot('global')['text'] == ''
+
+
+@pytest.mark.parametrize('record', ['journal', 'done'])
+def test_crash_halfway_through_recovery_record_write_does_not_break_startup(tmp_path, record):
+    directory = tmp_path / 'data'
+    strand = Store(directory).strand
+    before = strand.snapshot('global')
+
+    def crash_during_record():
+        real_fdopen = os.fdopen
+
+        class InterruptedFile:
+            def __init__(self, stream):
+                self.stream = stream
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                self.stream.close()
+
+            def __getattr__(self, name):
+                return getattr(self.stream, name)
+
+            def write(self, data):
+                prefix = b'{"before_sha256"' if record == 'journal' else b'{"status": "saved"'
+                if data.startswith(prefix):
+                    self.stream.write(data[:1])
+                    self.stream.flush()
+                    os.fsync(self.stream.fileno())
+                    os._exit(0)
+                return self.stream.write(data)
+
+        os.fdopen = lambda *args, **kwargs: InterruptedFile(real_fdopen(*args, **kwargs))
+        strand.replace('global', 'Published despite interruption', before['sha256'])
+        os._exit(2)
+
+    child = multiprocessing.get_context('fork').Process(target=crash_during_record)
+    child.start()
+    child.join(5)
+    if child.is_alive():
+        child.terminate()
+        child.join()
+        pytest.fail('Child did not reach the record write')
+    assert child.exitcode == 0
+    again = Store(directory).strand
+    assert again.snapshot('global')['text'] == ('' if record == 'journal' else 'Published despite interruption')

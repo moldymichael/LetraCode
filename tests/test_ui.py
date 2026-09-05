@@ -133,3 +133,97 @@ def test_deleting_chat_preserves_unbound_welcome_draft(tmp_path,monkeypatch):
     assert store.chat(c) is None
     assert w.composer.toPlainText()=='GLOBAL DRAFT TO KEEP'
     w.close()
+
+
+def test_blocked_project_deletion_keeps_selection_context_and_draft(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); project = store.create_project('Keep this project')
+    chat = store.create_chat('Keep this chat', project)
+    w = MainWindow(store); w.show_selection(None, project); w.refresh_tree()
+    w.composer.setPlainText('Keep this unsent draft')
+    w.context_editors['memory'].setPlainText('Keep this memory')
+    monkeypatch.setattr(QMessageBox, 'question', lambda *args:QMessageBox.StandardButton.Yes)
+    warnings = []
+    monkeypatch.setattr(QMessageBox, 'warning', lambda parent, title, message:warnings.append(message))
+    def blocked(ident):
+        raise ValueError('Memory changed before it could be archived; reload first')
+    monkeypatch.setattr(store, 'delete_project', blocked)
+
+    w.delete_selected()
+
+    assert w.project_id == project
+    assert w.selection_ready
+    assert w.memory_state.project_id == project
+    assert w.composer.toPlainText() == 'Keep this unsent draft'
+    assert w.context_editors['memory'].toPlainText() == 'Keep this memory'
+    assert store.project(project) is not None and store.chat(chat) is not None
+    assert store.setting('unbound_draft_' + project) == 'Keep this unsent draft'
+    assert warnings and 'Memory changed' in warnings[0]
+    w.close()
+
+
+def test_project_deletion_explains_archive_and_shows_recovery_location(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); project = store.create_project('Delete this project')
+    w = MainWindow(store); w.show_selection(None, project); w.refresh_tree()
+    w.context_editors['memory'].setPlainText('Archive this memory')
+    confirmations = []
+    def confirm(parent, title, message, *args):
+        confirmations.append(message)
+        return QMessageBox.StandardButton.Yes
+    monkeypatch.setattr(QMessageBox, 'question', confirm)
+
+    w.delete_selected()
+
+    assert 'archiv' in confirmations[0].lower()
+    assert store.project(project) is None
+    assert w.project_id is None and w.chat_id is None
+    archived = list((store.directory / 'strand' / '.deleted-projects' / project).glob('*.md'))
+    assert len(archived) == 1
+    assert str(archived[0]) in w.statusBar().currentMessage()
+    w.close()
+
+
+def test_project_deletion_surfaces_archive_record_warning_after_success(tmp_path, monkeypatch):
+    import json
+    import letracode.store as store_module
+    from PySide6.QtWidgets import QMessageBox
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); project = store.create_project('Delete this project')
+    w = MainWindow(store); w.show_selection(None, project); w.refresh_tree()
+    monkeypatch.setattr(QMessageBox, 'question', lambda *args:QMessageBox.StandardButton.Yes)
+    warnings = []
+    monkeypatch.setattr(QMessageBox, 'warning', lambda parent, title, message:warnings.append(message))
+    safe_write = store_module.safe_write
+    def fail_final_record(path, data, *args, **kwargs):
+        if '.deleted-projects' in path.parts and path.suffix == '.json' and json.loads(data)['status'] == 'deleted':
+            raise OSError('Recovery record write blocked')
+        return safe_write(path, data, *args, **kwargs)
+    monkeypatch.setattr(store_module, 'safe_write', fail_final_record)
+
+    w.delete_selected()
+
+    assert store.project(project) is None
+    assert w.project_id is None
+    assert warnings and 'Recovery record write blocked' in warnings[0]
+    archive = next((store.directory / 'strand' / '.deleted-projects' / project).glob('*.md'))
+    assert str(archive) in w.statusBar().currentMessage()
+    w.close()
+
+
+def test_project_deletion_reports_when_missing_memory_could_not_be_archived(tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data'); project = store.create_project('Delete this project')
+    w = MainWindow(store); w.show_selection(None, project); w.refresh_tree()
+    store.strand.path('project', project).unlink()
+    monkeypatch.setattr(QMessageBox, 'question', lambda *args:QMessageBox.StandardButton.Yes)
+
+    w.delete_selected()
+
+    assert store.project(project) is None
+    assert 'not archived' in w.statusBar().currentMessage().lower()
+    assert not store.strand.path('project', project).exists()
+    w.close()

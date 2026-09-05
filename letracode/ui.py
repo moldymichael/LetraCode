@@ -6,6 +6,7 @@ import html
 import json
 import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
@@ -309,9 +310,10 @@ class MainWindow(QMainWindow):
             edit.setEnabled(project is not None or key == 'memory')
         self.memory_state = MemoryEditorState(self.store, 'project' if project else 'global', project_id)
         self.context_editors['memory'].setPlainText(self.memory_state.text)
+        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
         self.links_button.setEnabled(project is not None)
         self.open_project_button.setEnabled(project is not None)
-        self.context_hint.setText(('Project memory' if project else 'Global memory') + ' · edits save automatically.\n' + str(self.memory_state.snapshot['path']))
+        self.context_hint.setText(self.memory_state.error or (('Project memory' if project else 'Global memory') + ' · edits save automatically.\n' + str(self.memory_state.snapshot['path'])))
         self.refresh_links()
         self.loading = False
         self.selection_ready = True
@@ -339,9 +341,10 @@ class MainWindow(QMainWindow):
             self.store.update_project(self.project_id,**{key:edit.toPlainText() for key,edit in self.context_editors.items() if key != 'memory'})
         if self.memory_state:
             ok = self.memory_state.save(self.context_editors['memory'].toPlainText())
+            self.context_editors['memory'].setReadOnly(not self.memory_state.available)
             if not ok:
                 self.context_hint.setText(self.memory_state.error)
-                self.statusBar().showMessage('Memory conflict · external file preserved; editor draft saved separately')
+                self.statusBar().showMessage('Memory conflict · external file preserved; editor draft saved separately' if self.memory_state.available else 'Memory unavailable · repair the file, then Reload memory file')
                 return False
             self.loading = True
             if self.context_editors['memory'].toPlainText() != self.memory_state.text:
@@ -352,14 +355,12 @@ class MainWindow(QMainWindow):
     def reload_memory(self):
         if not self.memory_state or self.worker:
             return
-        try:
-            self.memory_state.reload()
-            self.loading = True
-            self.context_editors['memory'].setPlainText(self.memory_state.text)
-            self.loading = False
-            self.context_hint.setText('Reloaded memory from ' + str(self.memory_state.snapshot['path']))
-        except (OSError, ValueError, RuntimeError) as error:
-            self.context_hint.setText(str(error))
+        ok = self.memory_state.reload(self.context_editors['memory'].toPlainText())
+        self.loading = True
+        self.context_editors['memory'].setPlainText(self.memory_state.text)
+        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
+        self.loading = False
+        self.context_hint.setText('Reloaded memory from ' + str(self.memory_state.snapshot['path']) if ok else self.memory_state.error)
 
     def edit_strand(self):
         if self.worker:
@@ -372,8 +373,9 @@ class MainWindow(QMainWindow):
         self.memory_state = MemoryEditorState(self.store, 'project' if self.project_id else 'global', self.project_id)
         self.loading = True
         self.context_editors['memory'].setPlainText(self.memory_state.text)
+        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
         self.loading = False
-        self.context_hint.setText(str(self.memory_state.snapshot['path']))
+        self.context_hint.setText(self.memory_state.error or str(self.memory_state.snapshot['path']))
 
     def new_chat(self, checked=False):
         if self.worker:
@@ -431,16 +433,27 @@ class MainWindow(QMainWindow):
         kind,ident = item.data(0,Qt.ItemDataRole.UserRole)
         if kind == 'global':
             return
-        message = 'Delete this project and all its chats and context? Linked files will stay where they are.' if kind=='project' else 'Delete this chat and its messages?'
+        message = 'Delete this project and all its chats and context? Its memory file, if present, will be archived in Strand for recovery. Linked files will stay where they are.' if kind=='project' else 'Delete this chat and its messages?'
         if QMessageBox.question(self,'Delete '+kind+'?',message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         self.save_editors()
+        archive = None
+        try:
+            if kind == 'project': archive = self.store.delete_project(ident)
+            else: self.store.delete_chat(ident)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            QMessageBox.warning(self,'Unable to delete '+kind,str(error))
+            return
         self.chat_id = None; self.project_id = None
         self.selection_ready = False
         self.memory_state = None
-        if kind == 'project': self.store.delete_project(ident)
-        else: self.store.delete_chat(ident)
         self.show_selection(None,None); self.refresh_tree()
+        if archive:
+            self.statusBar().showMessage('Project deleted · memory archived at ' + str(archive['path']))
+            if archive.get('warning'):
+                QMessageBox.warning(self,'Project deleted · recovery record warning',archive['warning'])
+        elif kind == 'project':
+            self.statusBar().showMessage('Project deleted · no memory file was present; memory was not archived')
 
     def manage_links(self):
         if self.project_id and not self.worker:
@@ -476,9 +489,14 @@ class MainWindow(QMainWindow):
             self.model_setup()
             if not self.engine_config.model_path or not self.engine_config.executable:
                 return
+        # Save the unbound draft and resolve memory conflicts before selecting
+        # a new chat, whose composer would otherwise start empty.
+        if self.save_editors() is False:
+            return
         if not self.chat_id:
             scope = self.project_id or 'global'
             c = self.store.create_chat('New chat',self.project_id)
+            self.store.set_draft(c,self.composer.toPlainText())
             self.select_chat(c)
             self.store.set_setting('unbound_draft_' + scope,'')
         if self.save_editors() is False:

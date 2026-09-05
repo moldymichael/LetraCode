@@ -2,12 +2,21 @@
 
 September 5, 2026. This is a development branch for review, not an installed update.
 
+## Stabilization status (current)
+
+The newer review reproduced five P2 defects after the earlier 132-test verification. This stabilization started from clean commit `886ff66` on the same branch and corrects all five: commit-time external memory edits, unsent first-message loss, startup failure from one unavailable project memory, orphaned memory after project deletion, and missing evidence references after repeated pauses.
+
+Fresh results: **183 automated tests passed**, including **122 focused storage/UI/tool/continuation tests**; all 27 Python files compiled, shell syntax and whitespace checks passed. One real-Qwen continuation discovered and retrieved the oldest saved result after 25 seeded pauses and context compaction, without rerunning the original action. The owned engine stopped. Exact commands, failed-then-passing regression evidence and limitations appear in [VERIFICATION.md](VERIFICATION.md). The 132-pass figures below are preserved as history.
+
+The fixed Strand root and default review for model-proposed memory saves remain appropriate for M1a. No installed application, live database, real writing files or working model was changed. No M1b work began. This is ready for independent re-review; interactive desktop checks remain below.
+
 ## Where the work lives
 
 - Review checkout: `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`.
 - Starting commit: `45092f1b1ed2f3a6f3361864f7d8587a87fd82c6` (the context-overflow fix was already present).
+- Stabilization base: `886ff6632969ba141cfe867faa5039df15cb747e`; stabilization is a separate commit on the same M1a branch.
 - Original checkout remains `/home/miceoil/Projects/LetraCode`, branch `fix/bound-tool-result-context`, at that same commit. Its untracked `letracode/__pycache__/` and `tests/__pycache__/` were preserved.
-- Isolated review data and logs: `/home/miceoil/Projects/strand-m1a-review-PGYug9/`.
+- Current isolated data/logs: this checkout's `.stabilization/` and `stabilization-test-data/`. Earlier historical evidence remains at `/home/miceoil/Projects/strand-m1a-review-PGYug9/`; it was not changed during stabilization.
 - No installation, live database migration, model replacement, model download, training, push, or merge into the original branch was performed. The live database still reports schema version 1; its context/GPU settings remain 32768/12.
 
 ## What M1a changes
@@ -31,11 +40,21 @@ A project chat receives global memory, its own project memory and the programmin
 
 Memory editor saves check the file version before replacement. Conflicting editor text is retained separately in SQLite so closing the window does not lose it. Reload uses the external file; copy any local draft you want to keep before reloading. The same check applies to Send and Retry. Native internal action links are removed from model-written Markdown, so a model cannot disguise an Undo button as a documentation link.
 
+At commit time the actual original file is moved into a recovery directory, its bytes are checked, and the new file is published only if the active name is still absent. Every move uses Linux's no-replacement operation, including rollback. An ordinary editor's intervening save wins or produces an explicit conflict with preserved versions. This avoids relying on an advisory lock that other editors can ignore. The [Linux rename documentation](https://man7.org/linux/man-pages/man2/rename.2.html) specifies the no-replacement behavior and that open descriptors survive renames; [fsync documentation](https://man7.org/linux/man-pages/man2/fsync.2.html) explains why directory entries also need syncing.
+
+Recovery records and retained original files live in `<memory-file-parent>/.strand-recovery/<filename>/`, are included in backups, and allow interrupted saves to recover before an empty default could be created. An editor may still write through an already-open descriptor after a save returns. Its edits remain in the retained original and cause an explicit conflict on the next read/reopen. To resolve that rare case: close external editors, copy both versions to a safe place, reconcile the active file with the `.before` file named by the error, then move the named `.json` recovery record out of that recovery directory and Reload. Retain the copies until satisfied. Recovery history grows with saves; no automatic cleanup or merge UI is included. The active pathname can be briefly absent during a save; interruption and racing recreation are regression-tested. Physical power-loss behavior was not tested.
+
+A missing, inaccessible, malformed or oversized project memory now disables only its memory editor and sending from that affected scope until repaired. The error shows the path; an unsuccessful Reload keeps its draft. Other projects, existing conversations and editable project fields remain usable. Context explicitly marks unavailable memory rather than treating it as authoritative empty text.
+
+Deleting a project now explains and archives its memory under `strand/.deleted-projects/<project-id>/`, with title, date, original path and operation status. The original inode is preserved, including malformed bytes and late writes from open editors. Database failures restore into an absent path only; concurrent versions are retained with a recovery message. Interrupted deletion can leave the project present with unavailable memory and a prepared archive record; recover from the path in that record before retrying. Pending save journals are resolved before deletion so later receipt inspection cannot recreate orphaned memory. Linked source files remain untouched. An archive over the supported 2 MiB size is preserved, but backup explicitly refuses it rather than silently dropping it.
+
 The database migration is versioned and backs up version 1 before moving legacy project memory into files. The old editable database memory column is cleared only after successful migration. Migration/recovery, Undo and ZIP restoration are tested on disposable fixtures. Backups include Strand files, receipts and previous versions. Linked originals and model weights remain separate. A copied database retains linked paths: follow its `RESTORE.txt` and remove/retarget links before opening a test restoration.
 
 Request accounting includes enabled tool definitions, the actual chat template, the current request, core instructions and reserved response tokens. This runtime supports `/apply-template` plus `/tokenize`; unsupported builds use an explicitly labeled conservative estimate. Optional retrieved text and saved-result previews can shrink; core instructions and the current request are never silently cut. A request that still cannot fit pauses with its evidence saved.
 
 Oversized action batches execute nothing and save an outcome for every call. The model gets one bounded correction opportunity when context permits. Repeated oversized batches, true context exhaustion and the ten-round action limit save a pause checkpoint. A new user message can continue from saved results. `read_tool_result` reads pages from the current chat's saved outcomes instead of rerunning commands. “Complete saved result” means the full bounded tool response; this does not remove existing source-file/read/search limits.
+
+Repeated checkpoints retain the latest 20 result IDs across the chat and its total result count. `list_tool_results` discovers older IDs in bounded pages, scoped to the current chat; keep its `through_id` while following `next_after_id` so pagination finishes even as the app saves the catalog responses themselves. This discovery works with Computer/Web off when Actions is on. Full result bodies remain in SQLite and are retrieved with `read_tool_result`.
 
 ## Deliberate engineering choices
 
@@ -46,7 +65,7 @@ Oversized action batches execute nothing and save an outcome for every call. The
 - Added locking before migration, bounded/no-follow file access and conflict-safe editor drafts because the actual persistence paths needed them.
 - Preserved LetraCode application branding and existing navigation. Separate Chat/Fine-Tuning areas, reply/export relabeling, indexed source discovery, sustained reading jobs and VS Code navigation belong to M1b. Training/adoption/rollback belong to M2.
 
-## Verification evidence
+## Historical M1a verification evidence (before stabilization)
 
 Environment: Fedora Linux 44 KDE Plasma, system `/usr/bin/python3` 3.14.7, PySide6 6.11.2, pytest 8.4.2, SQLite 3.51.2 with FTS5. The checkout's interpreter and system Qt were used; no virtual environment or system packages were changed.
 
@@ -92,20 +111,20 @@ Offscreen Qt behavior tests passed. The main window and Strand settings dialog w
 
 This verifies display launch and captured rendering. It does not certify every interactive KDE/dialog/keyboard flow; the short checklist below remains for user review. The `code` CLI was unavailable in this session; no editor installation or VS Code integration was attempted.
 
-## Safe review launch
+## Safe review launch (fresh stabilization fixture)
 
 In Konsole, run these two lines together:
 
 ```bash
 cd /home/miceoil/Projects/LetraCode-strand-m1a
-python3 -m letracode --data-dir /home/miceoil/Projects/strand-m1a-review-PGYug9/ui-demo
+python3 -m letracode --data-dir /home/miceoil/Projects/LetraCode-strand-m1a/.stabilization/review-data
 ```
 
-This launches development source with synthetic review data. It already has two synthetic projects and an Undo receipt, Internet is off, and the model configuration points to the existing working GGUF. Model weights load only when you send a request. Avoid simultaneously loading the everyday model in another app while testing; the GPU has little spare memory at this setting.
+This launches development source with two fresh synthetic projects, an unsent first-message draft in Stabilization Draft A, and memory Undo receipts. Computer/Internet are off; Actions is on. The isolated configuration points to the existing GGUF at context 8192/12 GPU layers. Model weights load only when you send a request. Avoid simultaneously loading the everyday model in another app while testing. Fixture IDs/paths are in `.stabilization/review-fixture.json`; no real source files are linked.
 
 1. Open **Strand identity & memory…**. Inspect identity, working preferences, global memory and the learning record. Leave the learning grant off unless you want to test it.
-2. In the synthetic Draft A chat, try `Remember this in this project: the bridge is closed.` Review the text/path, approve, and use the receipt's **Undo this save**.
-3. Edit that project's memory using the ordinary file shown in the pane, then send a new question. Confirm the correction is used and Draft B remains separate. To test a conflict, make an unsaved pane edit too; the file should remain intact and the pane should explain its retained draft.
+2. Select **Stabilization Draft A**, which initially has no chat. Make a pane memory edit, then externally edit the ordinary memory file shown there. Send the existing composer draft. Confirm the conflict preserves the external file and unsent message through reopening. Copy the pane draft before using Reload.
+3. On this synthetic project only, temporarily rename its memory file. Reopen: Draft B and existing conversations should remain accessible; Draft A should show unavailable memory. Restore the file and Reload. Test project deletion after creating another disposable project: confirmation should explain archiving and completion should identify the recovery path.
 4. Check scrolling, dialogs, keyboard input, Stop during a reply, and reopening the test app. **Close the test window** to unload its own engine; **Stop** cancels the current turn. Do not use the installed launcher for this review.
 
 M1a stops here for review. The next bounded task, if requested, is M1b source discovery and sustained reading. Installation/live-data migration require a separate request.

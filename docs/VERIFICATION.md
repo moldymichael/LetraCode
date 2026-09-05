@@ -1,8 +1,59 @@
 # LetraCode — verification and limits
 
-## Strand M1a on Fedora — September 5, 2026
+## Strand M1a stabilization — September 5, 2026 (current)
 
-Fresh results from `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`, based on `45092f1`. Final code verified at `9496958`; subsequent changes only remove trailing whitespace and document these results. The original checkout, installed app and live data were not updated.
+Started from a clean `codex/strand-m1a` checkout at `886ff6632969ba141cfe867faa5039df15cb747e`. The original context-overflow fix remains present. The baseline suite passed again: **132 passed in 7.73 s**. A newer independent review nevertheless reproduced five P2 bugs; the earlier 132-pass results below are historical evidence, not proof that those bugs were absent.
+
+| Finding | Reproduced failure and regression coverage | Stabilized behavior |
+|---|---|---|
+| Commit-time external edit loss | Six initial regressions failed: in-place/atomic editor saves at the final boundary for Save/Undo, create race, and late writes through an open descriptor. | Capture and retain the actual original file, check its bytes, then publish using Linux `RENAME_NOREPLACE`. Never replace a competing name, even during rollback. Later edits to a retained original surface a conflict on read/reopen. |
+| Unsent first message lost | Global/project first sends emptied the composer on conflict. Also tested memory disappearing after chat creation. | Save checks precede chat creation; transfer the draft durably before selecting the new chat. Failed Save/Reload preserves drafts through reopening. |
+| One unavailable project blocks startup | Missing, unreadable, malformed and oversized memory failed project access; Qt startup/reopen cases reproduced failures. | Project lists use metadata only. Affected memory has an explicit unavailable state, path and Reload control; unrelated projects/chats remain usable. Bounded context marks unavailable project memory explicitly. |
+| Deleted project leaves memory | Existing deletion left the active memory path behind. | Archive the original inode and recovery record before deleting database ownership. Test raw malformed/oversized bytes, missing/unsafe paths, late descriptor writes, DB rollback, concurrent recreation, crash recovery and backup inclusion. Resolve pending saves first so receipt inspection cannot resurrect deleted memory. |
+| Earlier evidence references disappear | Three-cycle pause regression lost the first ID on cycle two; oversized legacy checkpoint overflowed a short continuation. Catalog pagination initially chased its own saved output. | Keep 20 recent chat-wide IDs and a count. `list_tool_results` discovers older results with bounded, chat-scoped pages and a stable upper cursor. `read_tool_result` retrieves their original bounded bodies. Test 24 pauses/reopen/compaction, 500 saved legacy results, scope/bounds and pagination completion. |
+
+Additional save regressions kill a disposable child process immediately after capture/publication and halfway through journal/completion-record writes. Recovery control records are published atomically; newly created directories are synced before capture. Backup/restore retains journals and old inodes and still supports Undo. All five reproductions and the integration regressions now pass.
+
+Fresh commands, run from `/home/miceoil/Projects/LetraCode-strand-m1a`:
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_strand.py tests/test_store.py tests/test_strand_ui.py tests/test_ui.py tests/test_worker.py tests/test_tools.py --basetemp=stabilization-test-data/targeted
+# 122 passed in 36.12 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/full
+# 183 passed in 42.29 s; zero failures/skips
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 27 Python files without writing bytecode
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+git diff --check
+# Both exit 0
+```
+
+The temporary-data parent `stabilization-test-data/` and evidence directory `.stabilization/` are ignored and inside the worktree. Create the parent with `mkdir -p stabilization-test-data` before reproducing in a fresh checkout. An initial full run used hidden `.stabilization/pytest-full`: two source-reading tests correctly hit sensitive-path restrictions, and a worker waited for approval; that run was interrupted after 159 passes/two failures. Moving **test data** to a visible directory fixed the setup. No application permission rule was weakened. Its log is retained as `.stabilization/full-tests.log`; the successful logs are `full-tests-final.log` and `targeted-tests-final.log`.
+
+**Fresh real-Qwen check:** one actual Worker continuation after 25 **seeded** pause cycles, reopening and compaction. The oldest result ID was absent from the 20 recent checkpoint references, its marker absent from the initial prompt, and older turns omitted. With Computer/Web disabled, Qwen called `list_tool_results`, then `read_tool_result`, and correctly reported `ZETA-73` and saved exit code `7`. The original synthetic command was never executed or rerun; its saved row remained unchanged. Actual request totals were 4692, 4912 and 5268 tokens out of 8192, including 3072 reply and 128 safety tokens. Load 3.41 s; continuation 41.50 s. The owned engine stopped and no `llama-server` process remained.
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 .stabilization/qwen-saved-recovery/probe.py > .stabilization/qwen-saved-recovery/probe.log 2>&1
+# exit 0; results.json: passed=true, engine_stopped=true
+```
+
+This uses the same existing Qwen3.6 GGUF/llama.cpp paths documented below, with an isolated 8192 context, 12 GPU layers, eight threads and temperature 0.7. The probe script, `results.json`, log and engine log remain in `.stabilization/qwen-saved-recovery/`. Subsequent fixes touched file recovery only; the verified worker/tool continuation code did not change. This is a small real-model recovery check, not evidence of general model reliability or 25 autonomous model runs.
+
+**Limits and manual checks:** offscreen Qt tests cover the changed draft, startup, Reload and deletion flows. Interactive KDE keyboard/dialog behavior and reconciliation with the user's preferred external editor still need manual review. Crash tests interrupt processes; no physical power-loss, filesystem corruption or disk-full experiment was performed. Linux/filesystem `renameat2(RENAME_NOREPLACE)` support is required; unsupported operations fail without an overwrite fallback. A save briefly removes the active pathname while retaining its original inode and journal. An editor holding that inode can write later: the data is preserved and the conflict is detected at the next read/reopen, requiring manual reconciliation. Recovery history is retained and grows with saves; no automatic pruning was added. An archived external file beyond the existing 2 MiB limit remains intact, but backup explicitly refuses that unsupported file rather than truncating or omitting it.
+
+Both documented M1a departures were retained: `<data-dir>/strand` keeps isolation/restore straightforward; default review for model memory saves, except the explicit learning-file grant, keeps scope/authorization unambiguous. No evidence linked either choice to these defects. No installation, live-data migration, source-note edit, model replacement, training, push, merge or M1b work occurred. A fresh synthetic manual-review fixture and launch instructions are in [STRAND-M1A-REVIEW.md](STRAND-M1A-REVIEW.md).
+
+## Historical Strand M1a verification on Fedora — September 5, 2026
+
+Historical results from `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`, based on `45092f1`. At that stage, code was verified at `9496958`; changes through `886ff66` only removed trailing whitespace and documented those results. The five defects described above were discovered afterward. The original checkout, installed app and live data were not updated.
 
 Environment: Fedora 44 KDE Plasma, `/usr/bin/python3` 3.14.7, system PySide6 6.11.2, pytest 8.4.2, SQLite 3.51.2; FTS5 available. No new dependencies or system changes.
 
