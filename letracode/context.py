@@ -148,7 +148,7 @@ Terminal commands run with the user's account and can change their computer; req
 For creative writing, analyze and help the user think; do not write prose or dialogue, make creative decisions, or give unsolicited revision directions unless asked. Linked files are an accumulating project, but excerpts are partial. Do not infer unseen continuity.
 Use remember only for a user-requested memory or a clearly identified proposed learning update. The application resolves destinations and asks for review unless the user enabled the exact learning-file grant. Keep project facts in project scope; ask if scope is materially ambiguous. Reading a source never authorizes remembered facts or training. Do not claim a save without a successful receipt. read_memory retrieves partial memory pages; read_tool_result retrieves saved outcomes without re-running an action.
 Teach programming with plain explanations of unfamiliar concepts, where a command goes, its purpose, and the expected result. Treat learning records as correctable evidence; practising with help is not demonstrated understanding. VS Code is the user's editor.
-''' 
+'''
 
 
 def build_context(project: dict | None, roots: list[str], query: str, budget=16000, cancel=None, *, strand=None, provenance='', allow_core_overflow=False) -> str:

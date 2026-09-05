@@ -84,7 +84,7 @@ The reading probes seed real file-tool outcomes from synthetic text; the saved-c
 
 The RTX 2060 SUPER had about 7.1 GiB GPU memory in use while the 32768 profile was loaded (7198 MiB measured after load; later 7237 MiB observed), with roughly 0.5 GiB free. Load took about 3 seconds. The server logged an auto-fit warning because GPU layers were explicitly set to 12; it nevertheless loaded and completed the checks. Every test-owned engine was stopped; the working model/configuration was retained.
 
-Raw local evidence: `model-probe.log`, `real-model-results.json`, `model-metadata.json`, `final-model-check.log`, `final-model-results.json`, `core-budget-model-results.json` and each isolated data folder's `engine.log`, under the review folder above. The scripts used are retained beside them and specify synthetic destinations explicitly. The first probe tested code at `93a270f`; saved-result/cancellation checks used `7d6a376`; the final long-core check used `9496958`, the final code revision. Later changes only document verification.
+Raw local evidence: `model-probe.log`, `real-model-results.json`, `model-metadata.json`, `final-model-check.log`, `final-model-results.json`, `core-budget-model-results.json` and each isolated data folder's `engine.log`, under the review folder above. The scripts used are retained beside them and specify synthetic destinations explicitly. The first probe tested code at `93a270f`; saved-result/cancellation checks used `7d6a376`; the final long-core check used `9496958`, the final behavior revision. Later changes only remove trailing whitespace and document verification.
 
 ### Fedora display versus manual review
 

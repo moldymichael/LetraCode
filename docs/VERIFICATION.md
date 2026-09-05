@@ -2,7 +2,7 @@
 
 ## Strand M1a on Fedora — September 5, 2026
 
-Fresh results from `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`, based on `45092f1`. Final code verified at `9496958`; subsequent changes document these results only. The original checkout, installed app and live data were not updated.
+Fresh results from `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`, based on `45092f1`. Final code verified at `9496958`; subsequent changes only remove trailing whitespace and document these results. The original checkout, installed app and live data were not updated.
 
 Environment: Fedora 44 KDE Plasma, `/usr/bin/python3` 3.14.7, system PySide6 6.11.2, pytest 8.4.2, SQLite 3.51.2; FTS5 available. No new dependencies or system changes.
 
