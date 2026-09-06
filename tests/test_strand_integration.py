@@ -1,4 +1,5 @@
 """M1a context and permission integration using disposable ordinary files."""
+import hashlib
 import json
 import threading
 
@@ -80,7 +81,7 @@ def test_learning_grant_does_not_authorize_other_memories_or_sources(tmp_path):
     assert 'error' not in learning and 'denied' not in learning
     assert 'denied' in json.loads(tool.execute('remember', {'scope':'global','text':'An inferred preference'}))
     target = tmp_path / 'source.txt'; target.write_text('Original')
-    assert 'denied' in json.loads(tool.execute('write_file', {'path':str(target),'content':'Changed'}))
+    assert 'denied' in json.loads(tool.execute('write_file', {'path':str(target),'content':'Changed','expected_sha256':hashlib.sha256(b'Original').hexdigest()}))
     assert target.read_text() == 'Original'
     store.set_setting('strand_learning_grant', False)
     assert 'denied' in json.loads(tool.execute('remember', {'scope':'learning','text':'Unreviewed inference'}))

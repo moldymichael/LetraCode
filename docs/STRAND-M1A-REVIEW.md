@@ -2,6 +2,8 @@
 
 September 5, 2026. This is a development branch for review, not an installed update.
 
+M1a at `cdfdf9d` has since received independent technical acceptance; broader manual KDE checks were deferred. The subsequent, separately developed source-editing milestone is documented in [Supervised coding proof](SUPERVISED-CODING-PROOF.md). Its prerequisite changes and real-model evidence are separate from the historical M1a results below.
+
 ## Undo lifecycle stabilization (current)
 
 This focused pass starts from clean `932996ce27554647ea29471cc7af93bc5a47f0ae` on `codex/strand-m1a`. The 197-test baseline passed again, but new reproductions confirmed the same-second ordering defect and connected Undo safety/interface problems. The results below from earlier passes remain historical evidence.

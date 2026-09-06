@@ -1,5 +1,36 @@
 # LetraCode — verification and limits
 
+## Supervised coding prerequisites (current development branch)
+
+Worktree: `/home/miceoil/Projects/LetraCode-strand-development`, branch `codex/strand-development-loop`, based on accepted M1a `cdfdf9d19d9e19149d168a0b4942564de10e0f54`. The M1a checkout remains unchanged. The user independently accepted M1a and deferred broader manual KDE checks; this pass addresses the specific source-editing prerequisites, not a new broad M1a review.
+
+Fresh baseline: **220 passed in 86.52 s**. New source, tool and worker tests cover safe publication, versioned small edits, evidence freshness, actual command failures/correction, cancellation and retrieval. The initial source API tests failed because the API was absent; a separate disposable probe against the accepted implementation reproduced actual external-byte loss in all three final-publication races (in-place, atomic replacement and create). Tools established **27 failing cases** before implementation and another **3** for incomplete newline/BOM previews. Worker context tests established **3** stale-source failures and the real coding-loop regression first failed for the missing source hash. Source review then established failing cases for post-publication attribution, untrusted recovery records, unsolicited lock creation and unresponsive busy locks.
+
+Scoped fresh results: source/Strand/document/tools **120 passed in 16.14 s**; worker/coding-loop/tools **68 passed in 40.46 s**. The final command-cancellation synchronization check passed in **0.68 s**. Full verification: **280 passed in 85.19 s**, including all 220 accepted M1a cases and 60 new cases.
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/coding-proof/full
+# 280 passed in 85.19 s; zero failures/skips
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 30 Python files without writing bytecode
+for script in install.sh uninstall.sh packaging/build-rpm.sh; do bash -n "$script" || exit; done
+git diff --check
+# Both exit 0
+```
+
+The shell check deliberately parses each script separately. The historical multi-argument `bash -n install.sh uninstall.sh packaging/build-rpm.sh` below only parsed the first script; the others were positional arguments. This pass corrects the verification command without rewriting historical attribution.
+
+No existing permission was broadened. Source reads fail closed on unfinished adjacent recovery records because repository contents cannot authorize restoration; current authorized rollback and app-owned memory recovery remain separate. Source metadata and locks do not cause writes during inspection, and a busy source recovery lock produces an immediate error. Large/unsafe source files remain explicitly unsupported. Details and remaining recovery limitations: [supervised coding proof](SUPERVISED-CODING-PROOF.md).
+
+Logs and observer scripts are retained under `.stabilization/coding-proof/`; disposable fixtures are under `stabilization-test-data/coding-proof*`. The observer uses native individual approval dialogs and cannot approve a write or command. It rejects a fourth source implementation attempt, enforcing the initial attempt plus two corrections. The real local-model acceptance result is recorded separately in the proof document; prerequisite tests do not establish that Strand can yet complete the coding task.
+
 ## Strand M1a Undo lifecycle stabilization (current)
 
 Started from clean `codex/strand-m1a` at `932996ce27554647ea29471cc7af93bc5a47f0ae`, preserving the original checkout and all earlier evidence. Fresh baseline: **197 passed in 54.37 s**. The earlier report correctly identified tied timestamps and random receipt IDs, but its “safe conflict” observation did not cover repeated identical content or interrupted receipts. This pass reproduced those cases and the connected interface behavior before fixing them.

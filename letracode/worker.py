@@ -280,8 +280,6 @@ class ConversationWorker(QThread):
             provenance = (f'Local model file: {Path(model_path).name if model_path else "not configured"}. '
                           f'Context: {context_size} tokens; maximum response: {reply_size} tokens. '
                           'Strand identity is editable application context; it does not change model weights.')
-            system = build_context(project, roots if self.computer_enabled else [], query,
-                retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance, allow_core_overflow=True)
             executor = ToolExecutor(roots, self.store.directory, self.ask, self.cancel_event,
                 self.web_enabled, self.computer_enabled, store=self.store, chat_id=self.chat_id)
             self.engine.start(self.cancel_event, self.status.emit)
@@ -296,7 +294,12 @@ class ConversationWorker(QThread):
                 return last_usage.total_tokens
 
             def packed_messages():
-                nonlocal system, retrieval_budget
+                nonlocal retrieval_budget
+                # Commands can mutate files even when they fail, and ordinary
+                # editors can change sources between read-only tool rounds.
+                system = build_context(project, roots if self.computer_enabled else [], query,
+                    retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance,
+                    allow_core_overflow=True)
                 overflow = None
                 # The character allowance only seeds retrieval. Escaping, tools,
                 # template expansion and Unicode can require less evidence.

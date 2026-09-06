@@ -66,7 +66,7 @@ def safe_directory(path: Path, create=False):
         os.close(fd)
 
 
-def _read_at(fd, name, max_bytes=MAX_FILE_BYTES):
+def _read_at(fd, name, max_bytes=MAX_FILE_BYTES, *, with_stat=False):
     try:
         info = os.stat(name, dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -88,12 +88,12 @@ def _read_at(fd, name, max_bytes=MAX_FILE_BYTES):
         if len(data) > max_bytes:
             raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
         after = os.fstat(incoming.fileno())
-        if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, opened.st_mode) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_mode):
             raise ValueError(f'File changed while reading: {name}')
-    return data
+    return (data, opened) if with_stat else data
 
 
-def _write_new(fd, name, data):
+def _write_new(fd, name, data, *, mode=None):
     # Publish control records only when complete: a killed process must not
     # leave a partial final journal or completion marker that poisons recovery.
     staging = '.strand-stage-' + uuid.uuid4().hex
@@ -102,6 +102,8 @@ def _write_new(fd, name, data):
         with os.fdopen(out_fd, 'wb') as out:
             out.write(data)
             out.flush()
+            if mode is not None:
+                os.fchmod(out.fileno(), mode)
             os.fsync(out.fileno())
         rename_noreplace(fd, staging, fd, name)
         os.fsync(fd)
@@ -113,13 +115,15 @@ def _write_new(fd, name, data):
 
 
 @contextmanager
-def _recovery_directory(path, create=False):
+def _recovery_directory(path, create=False, *, namespace='.strand-recovery'):
     # A separate directory per target isolates a damaged project's recovery data.
-    recovery = path.parent / '.strand-recovery' / path.name
+    if namespace not in ('.strand-recovery', '.letracode-recovery'):
+        raise ValueError('Invalid recovery namespace')
+    recovery = path.parent / namespace / path.name
     if not create:
         with safe_directory(path.parent) as parent:
             try:
-                os.stat('.strand-recovery', dir_fd=parent, follow_symlinks=False)
+                os.stat(namespace, dir_fd=parent, follow_symlinks=False)
             except FileNotFoundError:
                 yield None
                 return
@@ -130,12 +134,24 @@ def _recovery_directory(path, create=False):
                 yield None
                 return
     with safe_directory(recovery, create=create) as fd:
-        lock = os.open('.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=fd)
+        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+        if create or namespace == '.strand-recovery':
+            flags |= os.O_CREAT
+        try:
+            lock = os.open('.lock', flags, 0o600, dir_fd=fd)
+        except FileNotFoundError:
+            # Reading untrusted source recovery metadata does not authorize
+            # creating even its control files in the linked repository.
+            raise ValueError(f'Source recovery requires explicit reconciliation: missing lock in {recovery}') from None
         try:
             info = os.fstat(lock)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError('Unsafe Strand recovery lock')
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            try:
+                operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if namespace == '.letracode-recovery' else 0)
+                fcntl.flock(lock, operation)
+            except BlockingIOError:
+                raise ValueError(f'Source recovery is busy; retry after the other operation finishes: {recovery}') from None
             yield fd
         finally:
             os.close(lock)
@@ -145,7 +161,7 @@ def _finish_recovery(fd, ident, status, before_hash):
     _write_new(fd, ident + '.done', json.dumps({'status': status, 'before_sha256': before_hash}).encode())
 
 
-def _check_recovery(path, parent, recovery, max_bytes):
+def _check_recovery(path, parent, recovery, max_bytes, *, namespace='.strand-recovery'):
     """Recover interrupted moves; detect later edits through a displaced open FD.
 
     Actual old inodes are retained, not copied then unlinked. A writer holding an
@@ -153,7 +169,8 @@ def _check_recovery(path, parent, recovery, max_bytes):
     """
     if recovery is None:
         return
-    location = path.parent / '.strand-recovery' / path.name
+    location = path.parent / namespace / path.name
+    kind = 'Memory' if namespace == '.strand-recovery' else 'Source file'
     for name in sorted(os.listdir(recovery)):
         if not re.fullmatch(r'[a-f0-9]{32}\.json', name):
             continue
@@ -163,9 +180,15 @@ def _check_recovery(path, parent, recovery, max_bytes):
         try:
             old = _read_at(recovery, ident + '.before', max_bytes)
         except (OSError, ValueError) as error:
-            raise ValueError(f'Memory conflict: cannot verify preserved external file '
+            raise ValueError(f'{kind} conflict: cannot verify preserved external file '
                              f'{location / (ident + ".before")}: {error}') from error
         if done is None:
+            if namespace == '.letracode-recovery':
+                # Linked repositories are untrusted data. A plausible adjacent
+                # journal is not authority to create or replace a source file.
+                raise ValueError(f'Source recovery requires explicit reconciliation: inspect {path}, '
+                                 f'{location / (ident + ".before")} and {location / (ident + ".proposed")}. '
+                                 f'Keep recoverable versions before removing recovery record {location / name}.')
             # A crash may leave the name absent. Restore first; ensure() must
             # never replace the missing file with an empty default in this case.
             if old is not None:
@@ -182,10 +205,10 @@ def _check_recovery(path, parent, recovery, max_bytes):
             done = _read_at(recovery, ident + '.done', 4096)
         finished = json.loads(done)
         if old is not None and digest(old) != finished['before_sha256']:
-            raise ValueError(f'Memory conflict: external edit preserved at {location / (ident + ".before")}. '
+            raise ValueError(f'{kind} conflict: external edit preserved at {location / (ident + ".before")}. '
                              f'Compare with {path}; reconcile both files before removing recovery record {location / name}.')
         if finished['status'] == 'saved' and old is None:
-            raise ValueError(f'Memory conflict: saved recovery file is missing in {location}')
+            raise ValueError(f'{kind} conflict: saved recovery file is missing in {location}')
 
 
 def safe_read(path: Path, max_bytes=MAX_FILE_BYTES):
@@ -194,13 +217,21 @@ def safe_read(path: Path, max_bytes=MAX_FILE_BYTES):
         return _read_at(fd, path.name, max_bytes)
 
 
+def safe_snapshot(path: Path, max_bytes=MAX_FILE_BYTES, *, namespace='.strand-recovery'):
+    """Read bytes and metadata from one descriptor after checking recovery."""
+    with safe_directory(path.parent) as fd, _recovery_directory(path, namespace=namespace) as recovery:
+        _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
+        return _read_at(fd, path.name, max_bytes, with_stat=True)
+
+
 def recover_file(path: Path):
     """Resolve interrupted saves before archiving ownership of a memory path."""
     with safe_directory(path.parent) as fd, _recovery_directory(path) as recovery:
         _check_recovery(path, fd, recovery, MAX_FILE_BYTES)
 
 
-def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_bytes=MAX_FILE_BYTES, transaction_id=None):
+def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_bytes=MAX_FILE_BYTES,
+               transaction_id=None, namespace='.strand-recovery', mode=None, cancel=None):
     """Preserve the displaced inode, validate it, then publish without replacement.
 
     Advisory locks cannot coordinate ordinary editors. Every move uses Linux
@@ -211,19 +242,31 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
         raise ValueError(f'File is too large (size limit {max_bytes} bytes): {path}')
     if transaction_id is not None and (not isinstance(transaction_id, str) or not re.fullmatch(r'[a-f0-9]{32}', transaction_id)):
         raise ValueError('Invalid write transaction ID')
-    with safe_directory(path.parent) as fd, _recovery_directory(path, create=True) as recovery:
-        _check_recovery(path, fd, recovery, max_bytes)
-        original = _read_at(fd, path.name, max_bytes)
+    if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o7777):
+        raise ValueError('Invalid file mode')
+
+    def check_cancel():
+        if cancel is not None and cancel.is_set():
+            raise InterruptedError('Cancelled before saving.')
+
+    check_cancel()
+    with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace) as recovery:
+        _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
+        observed = _read_at(fd, path.name, max_bytes, with_stat=True)
+        original = None if observed is None else observed[0]
         current_hash = None if original is None else digest(original)
         if current_hash != expected_sha256:
             raise ValueError(f'File changed; reload to resolve the conflict: {path}')
+        if mode is not None and observed is not None and stat.S_IMODE(observed[1].st_mode) != mode:
+            raise ValueError(f'File mode changed; reload to resolve the conflict: {path}')
         ident = transaction_id or uuid.uuid4().hex
         temporary = ident + '.proposed'
         previous = ident + '.before'
         captured = False
         published = False
         try:
-            _write_new(recovery, temporary, data)
+            _write_new(recovery, temporary, data, mode=mode)
+            check_cancel()
             # Reopen the ancestor chain and compare directory identity before commit.
             with safe_directory(path.parent) as fresh:
                 a, b = os.fstat(fd), os.fstat(fresh)
@@ -235,8 +278,11 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
                 captured = True
                 os.fsync(fd)
                 os.fsync(recovery)
-                if _read_at(recovery, previous, max_bytes) != original:
+                captured_snapshot = _read_at(recovery, previous, max_bytes, with_stat=True)
+                if (captured_snapshot is None or captured_snapshot[0] != original or
+                        (mode is not None and stat.S_IMODE(captured_snapshot[1].st_mode) != mode)):
                     raise ValueError(f'File changed; reload to resolve the conflict: {path}')
+            check_cancel()
             try:
                 rename_noreplace(recovery, temporary, fd, path.name)
             except FileExistsError as error:
@@ -246,7 +292,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
             os.fsync(recovery)
             if captured:
                 _finish_recovery(recovery, ident, 'saved', expected_sha256)
-                _check_recovery(path, fd, recovery, max_bytes)
+                _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
         except Exception as error:
             # Restore only into an absent name, preserving any later external
             # creation. Never delete a captured inode: editors may still own it.
@@ -255,11 +301,16 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
                     rename_noreplace(recovery, previous, fd, path.name)
                     os.fsync(fd)
                     os.fsync(recovery)
+                    if namespace == '.letracode-recovery':
+                        # This process owns this attempted save and has just
+                        # restored the captured inode. Future source reads must
+                        # not infer completion from an untrusted adjacent file.
+                        _finish_recovery(recovery, ident, 'aborted', expected_sha256)
                 except FileExistsError:
-                    location = path.parent / '.strand-recovery' / path.name / previous
+                    location = path.parent / namespace / path.name / previous
                     raise ValueError(f'File changed; conflict versions retained at {path} and {location}') from error
                 except OSError as restore_error:
-                    location = path.parent / '.strand-recovery' / path.name / previous
+                    location = path.parent / namespace / path.name / previous
                     raise OSError(f'Save failed; original is recoverable at {location}: {restore_error}') from error
             raise
         finally:

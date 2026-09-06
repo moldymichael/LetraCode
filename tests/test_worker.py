@@ -24,7 +24,7 @@ class ScriptedEngine:
             assert 'denied' in messages[-1]['content'].lower()
             on_delta('The action was denied. No file was changed.')
             return {'role':'assistant','content':'The action was denied. No file was changed.'}
-        return {'role':'assistant','content':'','tool_calls':[{'id':'call_1','type':'function','function':{'name':'write_file','arguments':'{"path":"/tmp/letracode-never-write-test","content":"bad"}'}}]}
+        return {'role':'assistant','content':'','tool_calls':[{'id':'call_1','type':'function','function':{'name':'write_file','arguments':'{"path":"/tmp/letracode-never-write-test","content":"bad","expected_sha256":null}'}}]}
     def cancel(self):
         pass
 
@@ -74,7 +74,7 @@ def test_excess_tool_requests_are_all_saved_as_not_executed_and_pause(tmp_path):
             assert_paired_tools(messages)
             return {'role':'assistant','content':'Many actions','tool_calls':[
                 {'id':f'{self.requests}_{i}','type':'function','function':{
-                    'name':'write_file','arguments':json.dumps({'path':str(tmp_path / 'never.txt'), 'content':'bad'})}}
+                    'name':'write_file','arguments':json.dumps({'path':str(tmp_path / 'never.txt'), 'content':'bad', 'expected_sha256':None})}}
                 for i in range(9)]}
     store=Store(tmp_path/'data'); chat=store.create_chat('Limits')
     store.add_message(chat,'user','Do work')
@@ -620,6 +620,66 @@ def test_worker_rereads_strand_files_and_reports_configured_model_filename(tmp_p
     assert 'Identity correction SECOND' in engine.systems[1]
     assert 'Identity correction FIRST' not in engine.systems[1]
     assert all('configured-model.gguf' in system for system in engine.systems)
+
+
+@pytest.mark.parametrize('mutation', ['write_file', 'external_edit', 'failed_command'])
+def test_worker_refreshes_source_context_before_each_model_request(tmp_path, mutation):
+    import hashlib
+    import shlex
+    import sys
+
+    folder = tmp_path / 'project'; folder.mkdir()
+    source = folder / 'marker.py'
+    before = 'SOURCE_VERSION = "BEFORE_CHANGE"\n'
+    after = 'SOURCE_VERSION = "AFTER_CHANGE"\n'
+    source.write_text(before)
+    store = Store(tmp_path / 'data')
+    project = store.create_project('Fresh source')
+    instructions = 'Inspect SOURCE_VERSION. Preserve this objective and its acceptance checks.'
+    store.update_project(project, instructions=instructions)
+    store.link(project, folder)
+    chat = store.create_chat('Refresh every round', project)
+    store.add_message(chat, 'user', 'Inspect SOURCE_VERSION in marker.py, then report the current value.')
+
+    class MutatingEngine(ScriptedEngine):
+        config = type('Config', (), {'context_size': 32768, 'max_tokens': 1024})()
+
+        def __init__(self):
+            self.requests = []
+
+        def complete(self, messages, *args, **kwargs):
+            self.requests.append(copy.deepcopy(messages))
+            assert_paired_tools(messages)
+            assert instructions in messages[0]['content']
+            if len(self.requests) == 1:
+                assert before.strip() in messages[0]['content']
+                if mutation == 'write_file':
+                    name, args = 'write_file', {'path': str(source), 'content': after,
+                                                'expected_sha256': hashlib.sha256(before.encode()).hexdigest()}
+                elif mutation == 'external_edit':
+                    # An ordinary editor changes the source between requests;
+                    # the following tool only reads it.
+                    source.write_text(after)
+                    name, args = 'read_file', {'path': str(source)}
+                else:
+                    script = f'from pathlib import Path; Path({str(source)!r}).write_text({after!r}); raise SystemExit(7)'
+                    name, args = 'run_command', {'command': f'{shlex.quote(sys.executable)} -c {shlex.quote(script)}',
+                                                'cwd': str(folder), 'timeout': 5}
+                return {'role': 'assistant', 'content': '', 'tool_calls': [{
+                    'id': 'change', 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}]}
+            if mutation == 'failed_command':
+                assert json.loads(messages[-1]['content'])['exit_code'] == 7
+            assert before.strip() not in messages[0]['content']
+            assert after.strip() in messages[0]['content']
+            return {'role': 'assistant', 'content': 'Current source: AFTER_CHANGE.'}
+
+    engine = MutatingEngine()
+    worker = ConversationWorker(store, chat, engine, web_enabled=False)
+    worker.approval_needed.connect(lambda pending: pending.decide(True))
+    worker.run()
+    assert len(engine.requests) == 2
+    assert store.messages(chat)[-1]['content'] == 'Current source: AFTER_CHANGE.'
+    assert source.read_text() == after
 
 
 @pytest.mark.parametrize('context_size,max_tokens,instruction_chars', [

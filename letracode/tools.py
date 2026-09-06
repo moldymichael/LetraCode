@@ -2,20 +2,18 @@
 from __future__ import annotations
 
 import difflib
-import hashlib
 import json
 import os
 import selectors
 import signal
-import stat
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import source_files
 from .context import ProjectFiles, read_text, readable_without_approval, sensitive
 from .web import fetch_public, search_results, search_url, validate_url
 
@@ -45,9 +43,10 @@ TOOL_SCHEMAS = [
     schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt or list_tool_results and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
     schema('list_tool_results','Discover saved tool results from this chat, including earlier paused or compacted turns, without rerunning actions. Metadata is partial; use read_tool_result for full saved output. Start after_id=0. For each next page keep through_id and set after_id=next_after_id. limit is 1–20, default 10.', {'after_id':{'type':'integer'},'through_id':{'type':'integer'},'limit':{'type':'integer'}}, []),
     schema('list_files','List a local folder (no recursive enumeration). Outside project links requires approval.', {'path':STRING}, ['path']),
-    schema('read_file','Read a UTF-8, Markdown, source, PDF or DOCX file with numbered lines. Use start_line and max_lines for long files.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'}}, ['path']),
+    schema('read_file','Read numbered file lines. UTF-8 source returns its whole-file sha256 for guarded edits; PDF/DOCX are read-only. Use start_line and max_lines for long files.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'}}, ['path']),
     schema('search_project','Search linked project text files for evidence. Returns diverse passages with paths and line numbers.', {'query':STRING}, ['query']),
-    schema('write_file','Create or replace a UTF-8 text file. User must approve the exact diff; old contents are backed up.', {'path':STRING,'content':STRING}, ['path','content']),
+    schema('write_file','Create or replace UTF-8 text with an approved diff and backup. expected_sha256 must match read_file for an existing file; null means create only if absent. Prefer edit_file for a small change.', {'path':STRING,'content':STRING,'expected_sha256':{'type':['string','null']}}, ['path','content','expected_sha256']),
+    schema('edit_file','Replace exactly one nonempty old_text fragment in UTF-8 source; new_text may be empty. Supply the latest whole-file sha256 from read_file or an edit result. Rejects stale or ambiguous edits. Requires diff approval and backs up old bytes.', {'path':STRING,'expected_sha256':STRING,'old_text':STRING,'new_text':STRING}, ['path','expected_sha256','old_text','new_text']),
     schema('run_command','Ask user to approve a shell command. Runs unsandboxed with their account; timeout and output cap apply. Never bypass a denied action.', {'command':STRING,'cwd':STRING,'timeout':{'type':'integer'},'reason':STRING}, ['command','cwd']),
     schema('web_search','Search the public internet. User approves the exact query. Do not send private project text or secrets.', {'query':STRING}, ['query']),
     schema('fetch_url','Retrieve a public HTTP/HTTPS text page for research. User approves the full URL; cite the returned URL.', {'url':STRING}, ['url']),
@@ -219,10 +218,18 @@ class ToolExecutor:
         start, maximum = args.get('start_line',1), args.get('max_lines',180)
         if type(start) is not int or type(maximum) is not int or start < 1 or not 1 <= maximum <= 400:
             raise ValueError('start_line must be positive and max_lines must be 1–400.')
-        lines = read_text(path).splitlines()
+        path = path.resolve()
+        editable = path.suffix.lower() not in {'.pdf', '.docx'}
+        if editable:
+            snapshot = source_files.snapshot(path)
+            contents, digest = snapshot['text'], snapshot['sha256']
+        else:
+            contents, digest = read_text(path), None
+        lines = contents.splitlines()
         end = min(len(lines), start + maximum - 1)
         text = '\n'.join(f'{i+1}: {lines[i]}' for i in range(start-1, end))
-        return {'path':str(path.resolve()),'start_line':start,'total_lines':len(lines),'text':text[:16000],'truncated':end<len(lines) or len(text)>16000}
+        return {'path':str(path),'start_line':start,'total_lines':len(lines),'text':text[:16000],
+                'truncated':end<len(lines) or len(text)>16000,'sha256':digest,'editable':editable}
 
     def _search_project(self, args):
         query = self._str(args, 'query', 500)
@@ -230,31 +237,55 @@ class ToolExecutor:
         return {'results':hits, 'scope':'Linked files; bounded text search, not an exhaustive analysis.'}
 
     def _write_file(self, args):
-        original = self._path(args)
         content = self._str(args, 'content', 200000)
-        if original.is_symlink():
-            raise ValueError('Writing through a symlink is blocked; select the real path explicitly.')
-        path = original.resolve()
-        if not path.parent.is_dir():
-            raise ValueError('Parent folder does not exist. Create it yourself or approve a separate command.')
-        before = None
-        mode = 0o600
-        if path.exists():
-            if not path.is_file() or path.stat().st_nlink > 1:
-                raise ValueError('Can only replace ordinary files with a single hard link.')
-            before = read_text(path)
-            mode = stat.S_IMODE(path.stat().st_mode)
-        old_bytes = path.read_bytes() if before is not None else None
-        digest = hashlib.sha256(old_bytes).digest() if old_bytes is not None else None
-        diff = '\n'.join(difflib.unified_diff((before or '').splitlines(), content.splitlines(), fromfile=str(path), tofile=str(path), lineterm=''))
+        path, snapshot = self._source_snapshot(args, allow_missing=True)
+        return self._save_source(path, snapshot, content)
+
+    def _edit_file(self, args):
+        old_text, new_text = args.get('old_text'), args.get('new_text')
+        for key, value in (('old_text', old_text), ('new_text', new_text)):
+            if not isinstance(value, str) or '\x00' in value or len(value) > 200000:
+                raise ValueError(f'{key} must be text, at most 200,000 characters, without NUL bytes.')
+        if not old_text:
+            raise ValueError('old_text must be nonempty and occur exactly once.')
+        path, snapshot = self._source_snapshot(args, allow_missing=False)
+        before = snapshot['text']
+        index = before.find(old_text)
+        if index < 0 or before.find(old_text, index + 1) >= 0:
+            raise ValueError('old_text must occur exactly once. Read a larger unique fragment from the current file.')
+        content = before[:index] + new_text + before[index + len(old_text):]
+        return self._save_source(path, snapshot, content)
+
+    def _source_snapshot(self, args, *, allow_missing):
+        if 'expected_sha256' not in args:
+            raise ValueError('expected_sha256 is required: use the hash from read_file, or null only to create a new file.')
+        expected = args['expected_sha256']
+        if expected is not None and (not isinstance(expected, str) or len(expected) != 64
+                or any(char not in '0123456789abcdef' for char in expected)):
+            raise ValueError('expected_sha256 must be a lowercase SHA-256 hash from read_file, or null for a new file.')
+        if expected is None and not allow_missing:
+            raise ValueError('expected_sha256 must be the current hash from read_file for edit_file.')
+        path = self._path(args)
+        if path.suffix.lower() in {'.pdf', '.docx'}:
+            raise ValueError('PDF and DOCX documents are read-only through source tools. Edit an explicit UTF-8 export instead.')
+        snapshot = source_files.snapshot(path, allow_missing=allow_missing)
+        if snapshot['sha256'] != expected:
+            raise ValueError('expected_sha256 does not match: file changed or exists unexpectedly. Read the current file before editing.')
+        return path, snapshot
+
+    def _save_source(self, path, snapshot, content):
+        before, old_bytes = snapshot['text'], snapshot['raw']
         if before == content:
-            return {'path':str(path),'unchanged':True}
-        self._ask(ApprovalRequest('Approve this file edit?', f'Path: {path}\n\n{diff}', 'write', 'The complete diff is shown below. Existing contents will be backed up locally.'))
-        if original.is_symlink() or original.resolve() != path:
-            raise ValueError('Path changed while awaiting approval. No edit was made.')
-        current = path.read_bytes() if path.exists() else None
-        if (hashlib.sha256(current).digest() if current is not None else None) != digest:
-            raise ValueError('File changed while awaiting approval. No edit was made; read the latest version first.')
+            return {'path':str(path), 'unchanged':True, 'sha256':snapshot['sha256']}
+        preview = []
+        for line in difflib.unified_diff((before or '').splitlines(keepends=True),
+                content.splitlines(keepends=True), fromfile=str(path), tofile=str(path)):
+            preview.append(line.replace('\\', '\\\\').replace('\r', '\\r').replace('\ufeff', '\\uFEFF'))
+            if not line.endswith('\n'):
+                preview.append('\n\\ No newline at end of file\n')
+        diff = ''.join(preview)
+        self._ask(ApprovalRequest('Approve this file edit?', f'Path: {path}\n\n{diff}', 'write',
+            'The complete diff is shown below. Preview escapes backslashes, carriage returns (\\r) and BOM (\\uFEFF). Existing contents will be backed up locally.'))
         backup = None
         if old_bytes is not None:
             backup_dir = self.data_dir / 'file-backups'
@@ -263,17 +294,13 @@ class ToolExecutor:
             fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd,'wb') as file:
                 file.write(old_bytes); file.flush(); os.fsync(file.fileno())
-        fd, temporary = tempfile.mkstemp(prefix='.letracode-', dir=path.parent)
         try:
-            with os.fdopen(fd,'wb') as file:
-                file.write(content.encode('utf-8')); file.flush(); os.fsync(file.fileno())
-            os.chmod(temporary, mode)
-            if self.cancel.is_set():
-                raise Denied('Cancelled before saving.')
-            os.replace(temporary, path)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
-        return {'path':str(path),'written_characters':len(content),'backup':str(backup) if backup else None}
+            saved = source_files.publish(path, content.encode('utf-8'), snapshot['sha256'],
+                mode=snapshot['mode'], cancel=self.cancel)
+        except InterruptedError as error:
+            raise Denied(str(error)) from error
+        return {'path':saved['path'],'written_characters':len(content),'backup':str(backup) if backup else None,
+                'sha256':saved['sha256']}
 
     def _run_command(self, args):
         command = self._str(args, 'command', 12000)
@@ -328,7 +355,9 @@ class ToolExecutor:
                 pass
             proc.wait(timeout=2)
             proc.stdout.close()
-        return {'output':b''.join(output).decode('utf-8',errors='replace')[:64000], 'exit_code':proc.returncode,'timed_out':timed_out,'cancelled':self.cancel.is_set(),'output_limit_reached':capped}
+        return {'command':command,'cwd':str(cwd),'timeout':timeout,'executed':True,
+                'output':b''.join(output).decode('utf-8',errors='replace')[:64000], 'exit_code':proc.returncode,
+                'timed_out':timed_out,'cancelled':self.cancel.is_set(),'output_limit_reached':capped}
 
     def _web_approval(self, url, query=None):
         validate_url(url)

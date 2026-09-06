@@ -8,6 +8,7 @@ import threading
 from pathlib import Path
 
 from .documents import read_docx
+from .source_files import snapshot as source_snapshot
 
 MAX_FILE = 2 * 1024 * 1024
 MAX_DOCUMENT = 20 * 1024 * 1024
@@ -38,7 +39,12 @@ def readable_without_approval(path: Path, roots: list[str]) -> bool:
 
 
 def read_text(path: Path) -> str:
-    path = path.expanduser().resolve(strict=True)
+    # Resolve approved read-only links as before, without requiring the final
+    # name: interrupted saves must report their retained recovery paths.
+    path = path.expanduser().resolve()
+    if path.suffix.lower() not in {'.pdf', '.docx'}:
+        text = source_snapshot(path)['text']
+        return text[1:] if text.startswith('\ufeff') else text
     size = path.stat().st_size
     if not stat.S_ISREG(path.stat().st_mode):
         raise ValueError('Only regular files can be read (no devices, sockets or pipes).')
@@ -61,20 +67,6 @@ def read_text(path: Path) -> str:
                     break
             return '\n\n'.join(parts)[:MAX_FILE]
         return read_docx(path, text_limit=MAX_FILE, document_limit=MAX_DOCUMENT)
-    if size > MAX_FILE:
-        raise ValueError('File exceeds the 2 MiB text limit. Select a smaller file or use an approved terminal command.')
-    # O_NONBLOCK avoids hanging on a path swapped for a FIFO between stat and open.
-    fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
-    with os.fdopen(fd, 'rb') as file:
-        if not stat.S_ISREG(os.fstat(file.fileno()).st_mode):
-            raise ValueError('Only regular files can be read.')
-        raw = file.read(MAX_FILE + 1)
-    if len(raw) > MAX_FILE or b'\x00' in raw:
-        raise ValueError('Not a supported text file (or file exceeds limit).')
-    try:
-        return raw.decode('utf-8-sig')
-    except UnicodeDecodeError:
-        raise ValueError('This file is not UTF-8 text. Convert it or link a text export.') from None
 
 
 class ProjectFiles:
