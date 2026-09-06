@@ -1,4 +1,5 @@
 import hashlib
+import json
 import os
 import multiprocessing
 import threading
@@ -8,6 +9,225 @@ import pytest
 
 from letracode.store import Store
 import letracode.strand as strand_module
+
+
+@pytest.fixture
+def same_clock_reverse_ids(monkeypatch):
+    from datetime import datetime
+    from itertools import count
+    from types import SimpleNamespace
+    clock = datetime(2026, 9, 5, tzinfo=strand_module.timezone.utc)
+    monkeypatch.setattr(strand_module, 'datetime', SimpleNamespace(now=lambda zone: clock))
+    identifiers = count(2**128 - 1, -1)
+    monkeypatch.setattr(strand_module.uuid, 'uuid4', lambda: SimpleNamespace(hex=f'{next(identifiers):032x}'))
+
+
+def test_receipt_order_uses_durable_sequence_across_reopen_and_clock_rollback(tmp_path, same_clock_reverse_ids, monkeypatch):
+    from datetime import datetime
+    from types import SimpleNamespace
+    directory = tmp_path / 'data'
+    strand = Store(directory).strand
+    first = strand.replace('global', 'First', strand.snapshot('global')['sha256'])
+    second = strand.replace('global', 'Second', strand.snapshot('global')['sha256'])
+    assert first['date'] == second['date'] and first['id'] > second['id']
+    again = Store(directory).strand
+    assert [r['id'] for r in again.receipts(scope='global')] == [second['id'], first['id']]
+    monkeypatch.setattr(strand_module, 'datetime', SimpleNamespace(now=lambda zone: datetime(2000, 1, 1, tzinfo=zone)))
+    third = again.replace('global', 'Third', again.snapshot('global')['sha256'])
+    assert third['sequence'] > second['sequence'] > first['sequence']
+    assert again.receipts(1, scope='global')[0]['id'] == third['id']
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_tied_receipts_resolve_current_file_chain_and_undo_after_reopen(tmp_path, same_clock_reverse_ids, legacy):
+    store = Store(tmp_path / 'data')
+    first = store.strand.replace('global', 'First', store.strand.snapshot('global')['sha256'])
+    second = store.strand.replace('global', 'Second', store.strand.snapshot('global')['sha256'])
+    if legacy:
+        for receipt in (first, second):
+            path = store.strand.root / '.receipts' / (receipt['id'] + '.json')
+            record = json.loads(path.read_text())
+            record.pop('sequence', None); record.pop('write_id', None)
+            path.write_text(json.dumps(record))
+    strand = Store(store.directory).strand
+    rows = strand.receipts(scope='global')
+    if legacy:
+        # Old ordinary saves have no durable ordering evidence. Their apparent
+        # hash chain cannot rule out external interleaving, so require an anchor.
+        assert not any(row['is_latest'] for row in rows)
+        with pytest.raises(ValueError, match='ambiguous'):
+            strand.undo(second['id'])
+        anchor = strand.replace('global', 'Confirmed revision', strand.snapshot('global')['sha256'])
+        strand.undo(anchor['id'])
+        assert strand.snapshot('global')['text'] == 'Second'
+        return
+    assert rows[0]['id'] == second['id'] and rows[0]['is_latest']
+    assert not rows[0]['undo_error']
+    undo = strand.undo(second['id'])
+    assert strand.snapshot('global')['text'] == 'First'
+    assert strand.receipts(1, scope='global')[0]['id'] == undo['id']
+    strand.undo(undo['id'])  # Undo of an Undo deliberately restores the saved change.
+    assert strand.snapshot('global')['text'] == 'Second'
+
+
+def test_stale_receipt_cannot_undo_across_newer_changes_with_identical_final_content(tmp_path):
+    strand = Store(tmp_path / 'data').strand
+    stale = strand.replace('global', 'B', strand.snapshot('global')['sha256'])
+    strand.replace('global', 'C', strand.snapshot('global')['sha256'])
+    latest = strand.replace('global', 'B', strand.snapshot('global')['sha256'])
+    with pytest.raises(ValueError, match='later|latest|stale'):
+        strand.undo(stale['id'])
+    assert strand.snapshot('global')['text'] == 'B'
+    strand.undo(latest['id'])
+    assert strand.snapshot('global')['text'] == 'C'
+
+
+def test_failed_prepared_receipt_does_not_claim_matching_external_edit(tmp_path, monkeypatch):
+    strand = Store(tmp_path / 'data').strand
+    original = strand.snapshot('global')
+    write = strand_module.safe_write
+
+    def fail_memory(path, data, expected, **kwargs):
+        if path == strand.path('global'):
+            raise OSError('Failed before writing authoritative memory')
+        return write(path, data, expected, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(strand_module, 'safe_write', fail_memory)
+        with pytest.raises(OSError, match='before writing'):
+            strand.replace('global', 'External coincidentally matches proposal', original['sha256'])
+    strand.path('global').write_text('External coincidentally matches proposal')
+    failed = strand.receipts()[0]
+    assert failed['status'] == 'unconfirmed'
+    with pytest.raises(ValueError, match='Unconfirmed'):
+        strand.undo(failed['id'])
+    assert strand.snapshot('global')['text'] == 'External coincidentally matches proposal'
+    later = strand.replace('global', 'Later accepted save', strand.snapshot('global')['sha256'])
+    assert later['sequence'] > failed['sequence']
+    strand.undo(later['id'])
+    assert strand.receipt(failed['id'])['status'] == 'unconfirmed'
+
+
+def test_sequences_are_unique_across_store_instances_and_survive_restoration(tmp_path, same_clock_reverse_ids):
+    import zipfile
+    first = Store(tmp_path / 'data')
+    second = Store(first.directory)
+    barrier = threading.Barrier(2)
+
+    def save(store, scope):
+        before = store.strand.snapshot(scope)
+        barrier.wait(timeout=3)
+        return store.strand.replace(scope, scope + ' saved text', before['sha256'])
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        one = workers.submit(save, first, 'global')
+        two = workers.submit(save, second, 'preferences')
+        receipts = [one.result(timeout=5), two.result(timeout=5)]
+    assert sorted(row['sequence'] for row in receipts) == [1, 2]
+    archive_path = tmp_path / 'backup.zip'
+    first.backup(archive_path)
+    with zipfile.ZipFile(archive_path) as archive:
+        archive.extractall(tmp_path / 'restore')
+    restored = Store(tmp_path / 'restore').strand
+    before = restored.snapshot('global')
+    next_save = restored.replace('global', 'After restoration', before['sha256'])
+    assert next_save['sequence'] == 3
+    restored.undo(next_save['id'])
+    assert restored.snapshot('global')['text'] == 'global saved text'
+
+
+def test_legacy_prepared_receipt_without_transaction_proof_stays_unconfirmed(tmp_path):
+    strand = Store(tmp_path / 'data').strand
+    saved = strand.replace('global', 'Proposed bytes', strand.snapshot('global')['sha256'])
+    path = strand.root / '.receipts' / (saved['id'] + '.json')
+    record = json.loads(path.read_text())
+    record.pop('sequence'); record.pop('write_id')
+    record['status'] = 'prepared'
+    path.write_text(json.dumps(record))
+    assert strand.receipt(saved['id'])['status'] == 'unconfirmed'
+    with pytest.raises(ValueError, match='Unconfirmed'):
+        strand.undo(saved['id'])
+    assert strand.snapshot('global')['text'] == 'Proposed bytes'
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+def test_unresolved_later_writes_block_older_undo_until_a_new_confirmed_save(tmp_path, legacy):
+    strand = Store(tmp_path / 'data').strand
+    saved = []
+    for content in ('B', 'C', 'B'):
+        saved.append(strand.replace('global', content, strand.snapshot('global')['sha256']))
+    for index, receipt in enumerate(saved):
+        path = strand.root / '.receipts' / (receipt['id'] + '.json')
+        record = json.loads(path.read_text())
+        if legacy:
+            record.pop('sequence')
+        record.pop('write_id')
+        if index:
+            # Simulate legacy finalization interruptions or missing write proof.
+            record['status'] = 'prepared'
+        path.write_text(json.dumps(record))
+    rows = strand.receipts(scope='global')
+    assert not any(row['is_latest'] for row in rows)
+    with pytest.raises(ValueError, match='ambiguous|unconfirmed|uncertain'):
+        strand.undo(saved[0]['id'])
+    assert strand.snapshot('global')['text'] == 'B'
+    fresh = strand.replace('global', 'Confirmed new revision', strand.snapshot('global')['sha256'])
+    assert strand.receipts(1, scope='global')[0]['id'] == fresh['id']
+    strand.undo(fresh['id'])
+    assert strand.snapshot('global')['text'] == 'B'
+
+
+def test_legacy_explicit_undo_chain_establishes_order_after_reopen(tmp_path, same_clock_reverse_ids):
+    strand = Store(tmp_path / 'data').strand
+    first = strand.replace('global', 'B', strand.snapshot('global')['sha256'])
+    undone = strand.undo(first['id'])
+    for receipt in (first, undone):
+        path = strand.root / '.receipts' / (receipt['id'] + '.json')
+        record = json.loads(path.read_text())
+        record.pop('sequence'); record.pop('write_id')
+        path.write_text(json.dumps(record))
+    strand = Store(tmp_path / 'data').strand
+    assert strand.receipts(1, scope='global')[0]['id'] == undone['id']
+    strand.undo(undone['id'])
+    assert strand.snapshot('global')['text'] == 'B'
+
+
+def test_legacy_content_matches_cannot_invent_chronology_across_external_edits(tmp_path, same_clock_reverse_ids):
+    strand = Store(tmp_path / 'data').strand
+    strand.path('global').write_text('B')
+    first = strand.replace('global', 'A', strand.snapshot('global')['sha256'])
+    restored = strand.undo(first['id'])
+    strand.path('global').write_text('C')
+    latest = strand.replace('global', 'B', strand.snapshot('global')['sha256'])
+    for receipt in (first, restored, latest):
+        path = strand.root / '.receipts' / (receipt['id'] + '.json')
+        record = json.loads(path.read_text())
+        record.pop('sequence'); record.pop('write_id')
+        path.write_text(json.dumps(record))
+    strand = Store(tmp_path / 'data').strand
+    assert not any(row['is_latest'] for row in strand.receipts(scope='global'))
+    with pytest.raises(ValueError, match='ambiguous'):
+        strand.undo(restored['id'])
+    assert strand.snapshot('global')['text'] == 'B'
+
+
+def test_ambiguous_legacy_cycle_keeps_history_but_refuses_to_guess_undo(tmp_path, same_clock_reverse_ids):
+    store = Store(tmp_path / 'data')
+    saved = []
+    for text in ('B', '', 'B'):
+        receipt = store.strand.replace('global', text, store.strand.snapshot('global')['sha256'])
+        path = store.strand.root / '.receipts' / (receipt['id'] + '.json')
+        record = json.loads(path.read_text())
+        record.pop('sequence', None); record.pop('write_id', None)
+        path.write_text(json.dumps(record))
+        saved.append(receipt)
+    strand = Store(store.directory).strand
+    rows = strand.receipts(scope='global')
+    assert len(rows) == 3
+    assert all(row['order_uncertain'] and not row['is_latest'] for row in rows)
+    with pytest.raises(ValueError, match='ambiguous|Ambiguous|uncertain'):
+        strand.undo(saved[-1]['id'])
+    assert strand.snapshot('global')['text'] == 'B'
 
 
 def test_ordinary_files_are_authoritative_and_scoped(tmp_path):

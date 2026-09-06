@@ -200,7 +200,7 @@ def recover_file(path: Path):
         _check_recovery(path, fd, recovery, MAX_FILE_BYTES)
 
 
-def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_bytes=MAX_FILE_BYTES):
+def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_bytes=MAX_FILE_BYTES, transaction_id=None):
     """Preserve the displaced inode, validate it, then publish without replacement.
 
     Advisory locks cannot coordinate ordinary editors. Every move uses Linux
@@ -209,13 +209,15 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
     """
     if len(data) > max_bytes:
         raise ValueError(f'File is too large (size limit {max_bytes} bytes): {path}')
+    if transaction_id is not None and (not isinstance(transaction_id, str) or not re.fullmatch(r'[a-f0-9]{32}', transaction_id)):
+        raise ValueError('Invalid write transaction ID')
     with safe_directory(path.parent) as fd, _recovery_directory(path, create=True) as recovery:
         _check_recovery(path, fd, recovery, max_bytes)
         original = _read_at(fd, path.name, max_bytes)
         current_hash = None if original is None else digest(original)
         if current_hash != expected_sha256:
             raise ValueError(f'File changed; reload to resolve the conflict: {path}')
-        ident = uuid.uuid4().hex
+        ident = transaction_id or uuid.uuid4().hex
         temporary = ident + '.proposed'
         previous = ident + '.before'
         captured = False
@@ -374,20 +376,24 @@ class StrandFiles:
                    'project_id': project_id, 'origin': origin, 'path': str(path),
                    'relative_path': path.relative_to(self.root).as_posix(),
                    'saved_text': saved_text, 'before_sha256': before['sha256'],
-                   'after_sha256': digest(text.encode('utf-8')), 'status': 'prepared'}
+                   'after_sha256': digest(text.encode('utf-8')), 'status': 'prepared',
+                   # The root operation lock serializes allocation across Store
+                   # instances. Prepared failures also reserve their sequence.
+                   'sequence': max((row.get('sequence', 0) for row in self._receipt_records()), default=0) + 1,
+                   'write_id': ident}
         if undo_of:
             receipt['undo_of'] = undo_of
         safe_write(backup, before['text'].encode('utf-8'), None)
         prepared = json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8')
         safe_write(receipt_path, prepared, None, max_bytes=MAX_RECEIPT_BYTES)
-        safe_write(path, text.encode('utf-8'), expected_sha256)
+        safe_write(path, text.encode('utf-8'), expected_sha256, transaction_id=ident)
         receipt['status'] = 'saved'
         try:
             safe_write(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8'),
                        digest(prepared), max_bytes=MAX_RECEIPT_BYTES)
         except OSError:
             # The prepared receipt is durable before the file changes. It can be
-            # recovered by comparing the committed hash after a disk failure.
+            # recovered from its matching write journal after a disk failure.
             return self.receipt(ident)
         return receipt
 
@@ -402,13 +408,105 @@ class StrandFiles:
         if record['id'] != receipt_id or record['relative_path'] != path.relative_to(self.root).as_posix():
             raise ValueError('Invalid receipt destination')
         record['path'] = str(path)
+        if 'sequence' in record and (type(record['sequence']) is not int or record['sequence'] < 1):
+            raise ValueError('Invalid receipt sequence')
         if record['status'] == 'prepared':
+            record['status'] = 'unconfirmed'
             try:
-                current = self.snapshot(record['scope'], record.get('project_id'))['sha256']
-                record['status'] = 'saved' if current == record['after_sha256'] else 'unconfirmed'
+                # Matching bytes alone could be an external edit made after a
+                # failed save. Only this receipt's actual write journal proves
+                # publication. Older prepared receipts lack that proof.
+                if record.get('write_id') == receipt_id:
+                    recover_file(path)
+                    journal = path.parent / '.strand-recovery' / path.name / (receipt_id + '.done')
+                    raw_done = safe_read(journal, 4096)
+                    if raw_done is not None:
+                        done = json.loads(raw_done)
+                        if done.get('status') == 'saved' and done.get('before_sha256') == record['before_sha256']:
+                            record['status'] = 'saved'
             except (ValueError, OSError):
-                record['status'] = 'unconfirmed'
+                pass
         return record
+
+    def _receipt_records(self):
+        with safe_directory(self.root / '.receipts') as fd:
+            ids = [name[:-5] for name in os.listdir(fd) if re.fullmatch(r'[a-f0-9]{32}\.json', name)]
+        return [self.receipt(ident) for ident in ids]
+
+    @staticmethod
+    def _legacy_order(records):
+        """Only explicit Undo dependencies prove order in legacy history.
+
+        Matching before/after hashes cannot establish chronology: an external
+        edit can bridge unrelated saves. Dates and UUIDs are presentation only.
+        """
+        by_id = {row['id']: row for row in records}
+        successors = {ident: set() for ident in by_id}
+        for row in records:
+            if row.get('undo_of') in by_id:
+                successors[row['undo_of']].add(row['id'])
+        remaining, ordered = set(by_id), []
+        while remaining:
+            tips = [ident for ident in remaining if not successors[ident] & remaining]
+            if len(tips) != 1:
+                break
+            tip = tips[0]
+            if not ordered:
+                connected = {tip}
+                while True:
+                    previous = connected | {ident for ident in remaining if successors[ident] & connected}
+                    if previous == connected:
+                        break
+                    connected = previous
+                if connected != remaining:
+                    break
+            ordered.append(by_id[tip]); remaining.remove(tip)
+        uncertain = [row for row in records if row['id'] in remaining]
+        # Stable presentation only; uncertain entries never grant Undo authority.
+        uncertain.sort(key=lambda row: (row['date'], row['id']), reverse=True)
+        return ordered + uncertain, ordered[0]['id'] if ordered else None, remaining
+
+    def _undo_history(self, records):
+        groups = {}
+        for row in records:
+            groups.setdefault(row['relative_path'], []).append(row)
+        for group in groups.values():
+            saved = [row for row in group if row['status'] == 'saved']
+            sequenced = sorted((row for row in saved if 'sequence' in row), key=lambda row: row['sequence'], reverse=True)
+            legacy, legacy_head, uncertain = self._legacy_order([row for row in saved if 'sequence' not in row])
+            head = sequenced[0]['id'] if sequenced else legacy_head
+            if len(sequenced) > 1 and sequenced[0]['sequence'] == sequenced[1]['sequence']:
+                head = None
+            # An interrupted later write may have published even though its
+            # receipt cannot prove completion. It must not expose an older save
+            # as the head. A newer confirmed sequence establishes a new anchor.
+            if any(row['status'] != 'saved' and
+                   (not sequenced or row.get('sequence', 0) >= sequenced[0]['sequence'])
+                   for row in group):
+                head = None
+            current, error = None, ''
+            try:
+                source = group[0]
+                current = self.snapshot(source['scope'], source.get('project_id'))['sha256']
+            except (ValueError, OSError) as unavailable:
+                error = str(unavailable)
+            rank = {row['id']: len(legacy) - index for index, row in enumerate(legacy)}
+            for row in group:
+                row['is_latest'] = row['id'] == head
+                row['order_uncertain'] = row['id'] in uncertain or (head is None and bool(saved))
+                row['_legacy_rank'] = rank.get(row['id'], 0)
+                if row['status'] != 'saved':
+                    row['undo_error'] = 'Unconfirmed write cannot be undone'
+                elif head is None:
+                    row['undo_error'] = 'Undo order is ambiguous in this history; no latest change can be established safely.'
+                elif row['id'] != head:
+                    row['undo_error'] = 'A later saved change exists; select the latest change for this file.'
+                else:
+                    row['undo_error'] = error or ('' if current == row['after_sha256'] else 'File changed; reload to resolve the conflict')
+        records.sort(key=lambda row: (row['is_latest'], row.get('sequence', 0), row['_legacy_rank'], row['date'], row['id']), reverse=True)
+        for row in records:
+            row.pop('_legacy_rank')
+        return records
 
     def receipts(self, limit=50, *, scope=None, project_id=None):
         if not isinstance(limit, int) or limit < 1 or limit > 1000:
@@ -420,18 +518,21 @@ class StrandFiles:
             if not isinstance(scope, str):
                 raise ValueError('Invalid memory scope')
             self.path(scope, project_id)
-        with safe_directory(self.root / '.receipts') as fd:
-            ids = [name[:-5] for name in os.listdir(fd) if re.fullmatch(r'[a-f0-9]{32}\.json', name)]
-        records = [self.receipt(ident) for ident in ids]
+        records = self._receipt_records()
         if scope is not None:
             records = [row for row in records if row['scope'] == scope and row.get('project_id') == project_id]
-        return sorted(records, key=lambda row: (row['date'], row['id']), reverse=True)[:limit]
+        return self._undo_history(records)[:limit]
 
     def undo(self, receipt_id):
         with self._operation():
             record = self.receipt(receipt_id)
             if record['status'] != 'saved':
                 raise ValueError('Unconfirmed write cannot be undone')
+            history = self._undo_history([row for row in self._receipt_records()
+                if row['relative_path'] == record['relative_path']])
+            selected = next(row for row in history if row['id'] == receipt_id)
+            if selected['undo_error']:
+                raise ValueError(selected['undo_error'])
             backup = safe_read(self.root / '.history' / f'{receipt_id}.md')
             if backup is None or digest(backup) != record['before_sha256']:
                 raise ValueError('Undo backup is missing or changed')

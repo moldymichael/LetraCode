@@ -1,6 +1,58 @@
 # LetraCode — verification and limits
 
-## Second Strand M1a stabilization — three remaining P2 findings (current)
+## Strand M1a Undo lifecycle stabilization (current)
+
+Started from clean `codex/strand-m1a` at `932996ce27554647ea29471cc7af93bc5a47f0ae`, preserving the original checkout and all earlier evidence. Fresh baseline: **197 passed in 54.37 s**. The earlier report correctly identified tied timestamps and random receipt IDs, but its “safe conflict” observation did not cover repeated identical content or interrupted receipts. This pass reproduced those cases and the connected interface behavior before fixing them.
+
+| Root cause | Change and regression coverage |
+|---|---|
+| Whole-second dates plus random IDs are not save order. | Persist a positive increasing sequence in every new receipt, allocated under the existing root operation lock and including prepared attempts. Tests freeze all dates, deliberately reverse UUID order, reopen stores and dialogs, move the clock backward, allocate from concurrent Store instances, and restore from ZIP. No timestamp or UUID decides new-save chronology. |
+| A matching after-hash could authorize an older receipt after B → C → B. | Compute the latest confirmed change for each file and enforce eligibility again inside backend Undo before the existing backup/hash/protected-write checks. Stale receipts remain visible but fail explicitly; the latest save can be undone correctly. Scope filtering still precedes the limit. Existing 51-unrelated-save coverage and new tied-clock project/global isolation cases exercise the actual Undo button. |
+| A prepared receipt was treated as saved solely because current bytes matched its proposal. | Link each new receipt to its exact safe-write transaction and require its completion record and original hash to confirm an interrupted finalization. A failed attempt followed by an external matching edit stays unconfirmed. An unresolved later write blocks an older receipt until a newer confirmed sequence exists. Existing killed-process/journal/backup recovery tests remain in the suite. |
+| Legacy records lack durable chronology; hash transitions can falsely connect external edits. | Use only explicit `undo_of` dependencies to establish a legacy head (or a sole finalized receipt). Ambiguous ordinary histories, cycles, disconnected saves and unresolved later writes remain visible without a default and refuse Undo. Tests include a falsely connected Undo/external-edit sequence, explicit legacy Undo chains, and a fresh confirmed save restoring availability. No guessed timestamp/hash ordering is written back into old records. |
+| Undo autosaved pending drafts, changed selection on failure, left Reload history stale, or hid a failed reload behind success. Conversation Undo also saved unrelated editors. | Keep the draft separately and require explicit Save/Reload before Undo. Preserve the selected receipt on failure and show the legitimate conflict. Refresh after Reload and keep unavailable-file diagnostics. Only refresh the affected conversation memory pane, retaining native current-chat receipt authorization. Real offscreen Qt controls cover tied defaults, repeated save/Undo, close/reopen, external edits, dirty drafts, stale selection, unavailable files, ambiguous/unconfirmed history and unrelated scopes. |
+
+Regression evidence: the first backend red run produced **6 failures** at the original behavior; the first UI ordering/selection/reload run produced **3 failures**, with **5 more** draft/legacy/link failures and **1** stale-Reload failure in later red runs. During implementation review, additional tests reproduced **2** unresolved-later-write failures and **1** false legacy chronology failure before those paths were corrected. These runs are recorded separately rather than presented as one baseline suite. The conservative legacy rule deliberately changes the initial simple hash-chain expectation: content transitions cannot prove chronology after unrecorded external edits. The final tests exercise both refusal and recovery through a fresh confirmed save.
+
+Fresh commands and results, from `/home/miceoil/Projects/LetraCode-strand-m1a`:
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/undo-lifecycle/baseline
+# 197 passed in 54.37 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_strand.py --basetemp=stabilization-test-data/undo-lifecycle/backend-final
+# 49 passed in 12.09 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_strand.py tests/test_strand_ui.py tests/test_ui.py --basetemp=stabilization-test-data/undo-lifecycle/focused
+# 95 passed in 31.80 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/undo-lifecycle/full
+# 220 passed in 76.10 s; zero failures/skips; 23 new cases, earlier coverage retained
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 27 Python files without writing bytecode
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+git diff --check
+# Both exit 0
+```
+
+Logs are retained under `.stabilization/undo-lifecycle/`, including `baseline.log`, `backend-red.log`, `backend-green.log`, `unresolved-red.log`, `legacy-red.log`, `backend-final.log`, `ui-red.log`, `ui-additional-red.log`, `ui-reload-red.log`, `ui-green.log`, `focused.log` and `full.log`. Disposable fixtures are under `stabilization-test-data/undo-lifecycle*`. Scoped backend review also checked no-op save order, explicit legacy Undo-of-Undo reopening, external-gap refusal and mismatched completion proof with synthetic fixtures in `stabilization-test-data/undo-lifecycle-review/`. A separate scoped UI read-through and run passed all 46 UI tests with disposable fixtures. These internal checks are not a substitute for the requested independent review.
+
+**Real-model testing:** none in this pass. Receipt order, filesystem authorization and Qt selection do not depend on inference. The Qwen observations below retain their historical attribution.
+
+**Remaining limits/manual review:** interactive KDE keyboard/dialog behavior and the user's preferred external editor still need a manual check. The automated suite uses actual Qt widgets offscreen, real disposable files/SQLite databases, and process-interruption fixtures; no physical power-loss or storage-failure experiment was performed. New history orders recorded saves, not arbitrary external filesystem activity. A completely unrecorded external change that returns to identical bytes cannot generally be distinguished by a content hash; existing retained-inode checks still protect the write races they cover. Ambiguous legacy history cannot have its missing chronology reconstructed safely and needs deliberate recovery from retained files/receipts, or a fresh confirmed Save for subsequent Undo operations. That Save does not retroactively make uncertain old receipts eligible. Undo of an Undo is redo of that selected change; this pass does not add a cascading undo stack, automatic history pruning, or recovery UI. Existing size/filesystem/recovery limits remain.
+
+The installed app, live database, real writing and working model were not modified. No dependency installation, model run, push, merge, M1b or training was performed. The fix is a separate local commit on `codex/strand-m1a`, stopping for independent review.
+
+## Historical second Strand M1a stabilization — three remaining P2 findings (`932996c`)
+
+The ordering limitation reported in this historical section was addressed by the later Undo lifecycle pass above.
 
 Started from clean `codex/strand-m1a` at `cc7b48db0434bd86ba35b4c5c35dfbd5f9c62e04`. Fresh baseline: **183 passed in 43.68 s**. The latest independent review confirmed the previous five scenarios were resolved and identified these three older defects; it found no confirmed regression introduced by `cc7b48d`. The earlier 132- and 183-test results below retain their original attribution.
 

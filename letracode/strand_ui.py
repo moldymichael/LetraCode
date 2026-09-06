@@ -140,22 +140,47 @@ class StrandDialog(QDialog):
         self.editor.setReadOnly(not self.state.available)
         self.save_button.setEnabled(self.state.available)
         self.message.setText('Reloaded the current file. The previous editor draft was discarded.' if ok else self.state.error)
+        self.refresh_receipts()
+        return ok
 
-    def refresh_receipts(self):
+    def refresh_receipts(self, selected_id=None):
         self.history.clear()
-        for receipt in self.store.strand.receipts(scope=self.state.scope, project_id=self.state.project_id):
-            self.history.addItem(f"{receipt['date']} · {receipt['origin']} · {receipt['status']}", receipt['id'])
+        receipts = self.store.strand.receipts(scope=self.state.scope, project_id=self.state.project_id)
+        latest = None
+        for receipt in receipts:
+            order = f"#{receipt['sequence']}" if receipt.get('sequence') is not None else f"Legacy {receipt['id'][-8:]}"
+            origin = f"Undo of {receipt['undo_of'][-8:]}" if receipt.get('undo_of') else receipt['origin']
+            self.history.addItem(f"{order} · {receipt['date']} · {origin} · {receipt['status']}", receipt['id'])
+            if receipt.get('is_latest'):
+                latest = receipt
+        chosen = selected_id if selected_id is not None else latest['id'] if latest else None
+        self.history.setCurrentIndex(self.history.findData(chosen) if chosen else -1)
+        if self.state.error:
+            self.message.setText(self.state.error)
+        elif receipts and latest is None:
+            self.message.setText('History order is uncertain. No change is selected for Undo.' if any(row.get('order_uncertain') for row in receipts)
+                                 else 'No confirmed latest saved change is available for Undo.')
+        elif latest and latest.get('undo_error'):
+            self.message.setText(latest['undo_error'])
 
     def undo_selected(self):
         ident = self.history.currentData()
         if not ident:
             return
-        if not self.save_current():
+        if not self.state.available:
+            self.message.setText(self.state.error)
+            return
+        text = self.editor.toPlainText()
+        if text != self.state.snapshot['text']:
+            self.state.keep_draft(text)
+            self.message.setText('Your editor draft is kept separately. Save or Reload file before undoing a saved change.')
             return
         try:
             self.store.strand.undo(ident)
-            self.reload_current(); self.refresh_receipts(); self.message.setText('Change undone. The previous file contents were restored.')
+            if self.reload_current():
+                self.message.setText('Change undone. The previous file contents were restored.')
         except (OSError, ValueError, RuntimeError) as error:
+            self.refresh_receipts(selected_id=ident)
             self.message.setText(str(error))
 
     def reject(self):

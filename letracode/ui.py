@@ -645,9 +645,19 @@ class MainWindow(QMainWindow):
             if not allowed or self.worker:
                 return
             try:
+                receipt = self.store.strand.receipt(ident)
+                affected = self.memory_state and (receipt['scope'], receipt.get('project_id')) == (self.memory_state.scope, self.memory_state.project_id)
+                if affected:
+                    text = self.context_editors['memory'].toPlainText()
+                    if text != self.memory_state.snapshot['text']:
+                        self.memory_state.keep_draft(text)
+                        self.context_hint.setText('Your editor draft is kept separately. Save or Reload memory file before undoing a saved change.')
+                        return
                 self.store.strand.undo(ident)
                 self.store.add_message(self.chat_id, 'notice', 'Memory save undone. Previous file contents restored.')
-                self.save_editors(); self.render_chat()
+                if affected:
+                    self.reload_memory()
+                self.render_chat()
             except (OSError, ValueError, RuntimeError) as error:
                 QMessageBox.warning(self, 'Memory could not be undone', str(error))
             return

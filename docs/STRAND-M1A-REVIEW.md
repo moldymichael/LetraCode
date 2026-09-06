@@ -2,7 +2,19 @@
 
 September 5, 2026. This is a development branch for review, not an installed update.
 
-## Stabilization status (current)
+## Undo lifecycle stabilization (current)
+
+This focused pass starts from clean `932996ce27554647ea29471cc7af93bc5a47f0ae` on `codex/strand-m1a`. The 197-test baseline passed again, but new reproductions confirmed the same-second ordering defect and connected Undo safety/interface problems. The results below from earlier passes remain historical evidence.
+
+New saved-change receipts now carry a persisted increasing sequence, allocated under the existing shared write lock. The selected file's latest confirmed change is selected independently of clock precision, clock rollback or random receipt IDs. Filtering still happens before the scope limit, so unrelated saves do not hide project history. Undo verifies this latest-change rule in the backend as well as in the menu: an older receipt cannot restore over a later save merely because the file's bytes happen to match again.
+
+Prepared receipts now require their own durable write-completion record before they can authorize Undo. An unresolved later write blocks selection of an older change. Older receipts without sequences remain visible, but only a sole receipt or an explicit chain of Undo references can prove their order. Matching content hashes cannot prove chronology across external edits. Ambiguous legacy history has no automatic selection and refuses Undo; a fresh confirmed Save establishes an ordered point for subsequent changes. Existing receipts and previous contents are retained for deliberate recovery.
+
+Clicking Undo now keeps an unsaved editor draft separately and asks for Save or Reload first. Failed Undo preserves the selected receipt and its conflict message. Reload refreshes history; an unavailable-file error after Undo stays visible. A conversation's Undo link no longer saves unrelated editor drafts. Each new menu entry displays its sequence, and an Undo receipt is identified as “Undo of …”. Undoing that new receipt restores the change again; this remains a selected-change operation, not a cascading undo stack.
+
+Fresh results: **220 automated tests passed**, including **23 new cases** and all prior M1a regression coverage; the focused storage/UI suite passed **95 tests**. All 27 Python files compiled, shell syntax and whitespace checks passed. No real-model run was needed because the changed behavior is entirely in storage and Qt controls. Exact commands, regression failures before repair and fresh results are in [VERIFICATION.md](VERIFICATION.md). This pass is a separate local commit for independent review. No installed app, live data, writing files, dependency or working model was changed; no push, merge, M1b or training was performed.
+
+## Historical second stabilization (`932996c`)
 
 The second stabilization pass starts from clean `cc7b48d` on `codex/strand-m1a` and fixes the three remaining findings: migration rollback losing external corrections, context packing stopping before reaching a fitting allowance, and unrelated saves hiding a project's Undo history. The latest independent review confirmed the previous five scenarios were resolved; these three defects predate `cc7b48d`, with no confirmed regression attributed to that commit.
 
@@ -23,10 +35,11 @@ The fixed Strand root and default review for model-proposed memory saves remain 
 - Review checkout: `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`.
 - Starting commit: `45092f1b1ed2f3a6f3361864f7d8587a87fd82c6` (the context-overflow fix was already present).
 - First stabilization base: `886ff6632969ba141cfe867faa5039df15cb747e`; resulting commit `cc7b48d`.
-- Second stabilization base: `cc7b48db0434bd86ba35b4c5c35dfbd5f9c62e04`; this pass is another separate commit on the same M1a branch.
-- Original checkout remains `/home/miceoil/Projects/LetraCode`, branch `fix/bound-tool-result-context`, at that same commit. Its untracked `letracode/__pycache__/` and `tests/__pycache__/` were preserved.
-- Current isolated logs: `.stabilization/pass2/`; test data: `stabilization-test-data/pass2*`. Earlier `.stabilization/` evidence and `/home/miceoil/Projects/strand-m1a-review-PGYug9/` are retained.
-- No installation, live database migration, model replacement, model download, training, push, or merge into the original branch was performed. The live database still reports schema version 1; its context/GPU settings remain 32768/12.
+- Second stabilization base: `cc7b48db0434bd86ba35b4c5c35dfbd5f9c62e04`; resulting commit `932996c`.
+- Undo lifecycle stabilization base: `932996ce27554647ea29471cc7af93bc5a47f0ae`; a separate commit on the same branch.
+- Original checkout remains `/home/miceoil/Projects/LetraCode`, branch `fix/bound-tool-result-context`, at `45092f1`. Its untracked `letracode/__pycache__/` and `tests/__pycache__/` were preserved.
+- Current isolated logs: `.stabilization/undo-lifecycle/`; test data: `stabilization-test-data/undo-lifecycle*`. Previous pass logs/data remain in `.stabilization/pass2/` and `stabilization-test-data/pass2*`. Earlier `.stabilization/` evidence and `/home/miceoil/Projects/strand-m1a-review-PGYug9/` are retained.
+- No installation, live database migration, model replacement, model download, training, push, or merge into the original branch was performed. The earlier read-only live-data check reported schema version 1 and context/GPU settings 32768/12; this Undo pass did not reopen live data.
 
 ## What M1a changes
 
@@ -47,7 +60,7 @@ A project chat receives global memory, its own project memory and the programmin
 
 `remember` appends an entry with an ID, date, origin and scope. The app chooses the destination from the active chat rather than accepting a model-supplied path or project ID. By default, a dialog shows the scope, destination, text and append preview for approval. Saved text/location and Undo appear in the conversation. The user can optionally grant automatic appends to **only** `learning/programming.md`; that grant permits no source edits, identity changes, commands, other memories or training.
 
-The Undo menu now selects up to 50 receipts **for the chosen scope/project**, so global activity or another project cannot hide that project's entries. Entries sort by timestamp and receipt ID; same-second ordering has the remaining limitation noted above. Older receipts remain on disk. Scope validation and the existing conflict check still apply to Undo; choosing a history entry does not grant model write permission.
+The Undo menu now selects up to 50 receipts **for the chosen scope/project**, so global activity or another project cannot hide that project's entries. New receipts sort by their durable save sequence, with the latest confirmed change selected. Dates and IDs are only presentation details for uncertain legacy entries. Older receipts remain on disk. Only the latest established change can be undone; later saves, changed contents or uncertain history produce an explicit refusal. Scope validation and existing write-conflict protections still apply; choosing a history entry does not grant model write permission.
 
 Memory editor saves check the file version before replacement. Conflicting editor text is retained separately in SQLite so closing the window does not lose it. Reload uses the external file; copy any local draft you want to keep before reloading. The same check applies to Send and Retry. Native internal action links are removed from model-written Markdown, so a model cannot disguise an Undo button as a documentation link.
 
@@ -126,7 +139,24 @@ Offscreen Qt behavior tests passed. The main window and Strand settings dialog w
 
 This verifies display launch and captured rendering. It does not certify every interactive KDE/dialog/keyboard flow; the short checklist below remains for user review. The `code` CLI was unavailable in this session; no editor installation or VS Code integration was attempted.
 
-## Safe review launch (fresh stabilization fixture)
+## Safe Undo review launch (fresh disposable fixture)
+
+Run these two lines together in Konsole:
+
+```bash
+cd /home/miceoil/Projects/LetraCode-strand-m1a
+python3 -m letracode --data-dir /home/miceoil/Projects/LetraCode-strand-m1a/stabilization-test-data/undo-lifecycle/manual-review
+```
+
+This fixture has one synthetic project with two tied-timestamp saves followed by 51 unrelated global saves. No model is configured or needed, no real sources are linked, and Computer/Internet/Actions are off. Fixture details and the seed script are in `.stabilization/undo-lifecycle/`.
+
+1. Open **Settings → Strand identity & memory…**, then **This project’s memory**. Receipt **#2** should be selected; Undo should restore **First synthetic save**. Global memory should stay at **Unrelated global save 51**.
+2. Make an editor draft and click Undo. It should keep the draft separately and request Save or Reload. Save explicitly, then Undo; close and reopen to check the selected receipt and restored contents. An entry labeled **Undo of …** represents a new change; undoing it restores the change again.
+3. Edit only this fixture's memory file externally, using the path displayed in the dialog. With no pending editor draft, Undo should report a conflict and preserve that correction. Check keyboard selection, messages, and reopening in KDE. Reload discards the separate draft only after successfully reading the file, so copy any draft you want to retain first.
+
+Close the development window when finished. The prior fixture below is retained for historical review; this fresh fixture is for the remaining interactive Undo checks.
+
+## Historical first-stabilization review fixture (retained)
 
 In Konsole, run these two lines together:
 
