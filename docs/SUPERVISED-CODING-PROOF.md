@@ -1,5 +1,10 @@
 # Strand supervised coding proof
 
+Historical milestone record. Its original results and limits are preserved below.
+For the current reliability branch, see [Current implementation state](CURRENT-STATE.md)
+and [Reliability verification](RELIABILITY-VERIFICATION.md).
+
+
 This milestone builds on accepted M1a commit `cdfdf9d19d9e19149d168a0b4942564de10e0f54`. Prerequisite work lives in `/home/miceoil/Projects/LetraCode-strand-development`, branch `codex/strand-development-loop`. The accepted M1a checkout and the original LetraCode checkout are preserved.
 
 ## Purpose and boundaries

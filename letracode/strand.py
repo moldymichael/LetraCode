@@ -14,13 +14,67 @@ import re
 import stat
 import threading
 import uuid
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 MAX_FILE_BYTES = 2 * 1024 * 1024
 # JSON escaping can expand a supported memory file by up to six times.
 MAX_RECEIPT_BYTES = 16 * 1024 * 1024
+BACKUP_CHUNK_BYTES = 128 * 1024
+
+
+def backup_tree(root):
+    """Yield (relative name, open binary stream) for opaque retained files.
+
+    Consume each stream before advancing. Descriptors stay anchored to checked
+    directories; final identity and mutation checks run when iteration resumes.
+    This copies recovery evidence without parsing it or replaying recovery.
+    Callers serialize cooperating writers and publish only after exhaustion.
+    """
+    def identity(info):
+        return info.st_dev, info.st_ino
+
+    def version(info):
+        return (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_nlink)
+
+    def walk(directory, prefix=''):
+        before = os.fstat(directory)
+        for name in sorted(os.listdir(directory)):
+            relative = prefix + name
+            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            if stat.S_ISDIR(info.st_mode):
+                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                try:
+                    if identity(os.fstat(child)) != identity(info):
+                        raise ValueError(f'Directory changed during backup: {relative}')
+                    yield from walk(child, relative + '/')
+                    if identity(os.stat(name, dir_fd=directory, follow_symlinks=False)) != identity(info):
+                        raise ValueError(f'Directory changed during backup: {relative}')
+                finally:
+                    os.close(child)
+            elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
+                if Path(name).suffix.lower() == '.gguf' or name in ('.write-lock', '.lock') or name.startswith('.strand-'):
+                    continue
+                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                with os.fdopen(fd, 'rb') as incoming:
+                    opened = os.fstat(incoming.fileno())
+                    if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
+                            or identity(opened) != identity(info) or version(opened) != version(info)):
+                        raise ValueError(f'File changed while opening backup: {relative}')
+                    yield relative, incoming
+                    after = os.fstat(incoming.fileno())
+                    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if (version(after) != version(opened) or identity(named) != identity(opened)
+                            or version(named) != version(opened)):
+                        raise ValueError(f'File changed while reading backup: {relative}')
+            else:
+                raise ValueError(f'Unsafe linked file in backup: {root / relative}')
+        if version(os.fstat(directory)) != version(before):
+            raise ValueError(f'Directory changed during backup: {root / prefix}')
+
+    with safe_directory(root) as directory:
+        yield from walk(directory)
 
 
 def digest(data: bytes) -> str:
@@ -451,16 +505,34 @@ class StrandFiles:
     def receipt(self, receipt_id):
         if not isinstance(receipt_id, str) or not re.fullmatch(r'[a-f0-9]{32}', receipt_id):
             raise ValueError('Invalid receipt ID')
-        raw = safe_read(self.root / '.receipts' / f'{receipt_id}.json', MAX_RECEIPT_BYTES)
-        if raw is None:
-            raise ValueError('Receipt not found')
-        record = json.loads(raw)
-        path = self.path(record['scope'], record.get('project_id'))
-        if record['id'] != receipt_id or record['relative_path'] != path.relative_to(self.root).as_posix():
-            raise ValueError('Invalid receipt destination')
-        record['path'] = str(path)
-        if 'sequence' in record and (type(record['sequence']) is not int or record['sequence'] < 1):
-            raise ValueError('Invalid receipt sequence')
+        receipt_path = self.root / '.receipts' / f'{receipt_id}.json'
+        try:
+            raw = safe_read(receipt_path, MAX_RECEIPT_BYTES)
+            if raw is None:
+                raise ValueError('Receipt not found')
+            record = json.loads(raw)
+            if not isinstance(record, dict):
+                raise ValueError('Receipt must be an object')
+            for key in ('scope', 'id', 'relative_path', 'date', 'origin', 'saved_text'):
+                if not isinstance(record.get(key), str):
+                    raise ValueError(f'Invalid or missing receipt {key}')
+            path = self.path(record['scope'], record.get('project_id'))
+            if record['id'] != receipt_id or record['relative_path'] != path.relative_to(self.root).as_posix():
+                raise ValueError('Invalid receipt destination')
+            if record.get('status') not in ('prepared', 'saved'):
+                raise ValueError('Invalid receipt status')
+            for key in ('before_sha256', 'after_sha256'):
+                if not isinstance(record.get(key), str) or not re.fullmatch(r'[a-f0-9]{64}', record[key]):
+                    raise ValueError(f'Invalid receipt {key}')
+            for key in ('write_id', 'undo_of'):
+                if key in record and (not isinstance(record[key], str) or not re.fullmatch(r'[a-f0-9]{32}', record[key])):
+                    raise ValueError(f'Invalid receipt {key}')
+            if 'sequence' in record and (type(record['sequence']) is not int or record['sequence'] < 1):
+                raise ValueError('Invalid receipt sequence')
+            record['path'] = str(path)
+        except (OSError, ValueError, TypeError, KeyError, RecursionError) as error:
+            raise ValueError(f'Unresolved memory history at {receipt_path}: {error}. '
+                             'Existing history files are preserved. Reconcile this record before saving or Undo.') from error
         if record['status'] == 'prepared':
             record['status'] = 'unconfirmed'
             try:
@@ -482,7 +554,18 @@ class StrandFiles:
     def _receipt_records(self):
         with safe_directory(self.root / '.receipts') as fd:
             ids = [name[:-5] for name in os.listdir(fd) if re.fullmatch(r'[a-f0-9]{32}\.json', name)]
-        return [self.receipt(ident) for ident in ids]
+        records = [self.receipt(ident) for ident in ids]
+        sequences = {}
+        for record in records:
+            sequence = record.get('sequence')
+            if sequence is None:  # Supported legacy records have no sequence.
+                continue
+            path = self.root / '.receipts' / (record['id'] + '.json')
+            if sequence in sequences:
+                raise ValueError(f'Duplicate receipt sequence {sequence}: {sequences[sequence]} and {path}. '
+                                 'History is preserved; reconcile both records before saving or Undo.')
+            sequences[sequence] = path
+        return records
 
     @staticmethod
     def _legacy_order(records):
@@ -645,23 +728,12 @@ class StrandFiles:
             excerpts.append((heading + selected[:max(0, allowance - len(heading))])[:allowance])
         return unavailable + (marker + '\n\n'.join(excerpts))[:budget]
 
+    @contextmanager
     def backup_entries(self):
-        """Yield verified bytes, retaining ordinary future notes/manifests, excluding weights."""
-        def walk(directory):
-            with safe_directory(directory) as fd:
-                for name in sorted(os.listdir(fd)):
-                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
-                    path = directory / name
-                    if stat.S_ISDIR(info.st_mode):
-                        yield from walk(path)
-                    elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                        if path.suffix.lower() != '.gguf' and name not in ('.write-lock', '.lock') and not name.startswith('.strand-'):
-                            limit = MAX_RECEIPT_BYTES if self.root / '.receipts' in path.parents else MAX_FILE_BYTES
-                            data = safe_read(path, limit)
-                            if data is None:
-                                raise ValueError('Strand file disappeared during backup')
-                            yield path.relative_to(self.root).as_posix(), data
-                    else:
-                        raise ValueError(f'Unsafe linked file in Strand backup: {path}')
-        with self._operation():
-            yield from walk(self.root)
+        """Hold the Strand writer lock while the caller snapshots DB and files.
+
+        The yielded iterator contains open streams, consumed one at a time.
+        Lock order matches project deletion: Strand first, then SQLite.
+        """
+        with self._operation(), closing(backup_tree(self.root)) as entries:
+            yield entries

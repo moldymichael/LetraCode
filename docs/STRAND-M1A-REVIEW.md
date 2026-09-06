@@ -1,5 +1,10 @@
 # Strand M1a — local review
 
+Historical milestone record. Its original results and limits are preserved below.
+For the current reliability branch, see [Current implementation state](CURRENT-STATE.md)
+and [Reliability verification](RELIABILITY-VERIFICATION.md).
+
+
 September 5, 2026. This is a development branch for review, not an installed update.
 
 M1a at `cdfdf9d` has since received independent technical acceptance; broader manual KDE checks were deferred. The subsequent, separately developed source-editing milestone is documented in [Supervised coding proof](SUPERVISED-CODING-PROOF.md). Its prerequisite changes and real-model evidence are separate from the historical M1a results below.

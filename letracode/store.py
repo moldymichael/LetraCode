@@ -8,11 +8,11 @@ import stat
 import tempfile
 import uuid
 import zipfile
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .strand import StrandFiles, digest, safe_directory, safe_read, safe_write
+from .strand import BACKUP_CHUNK_BYTES, StrandFiles, backup_tree, digest, safe_directory, safe_read, safe_write
 
 
 def data_home() -> Path:
@@ -366,38 +366,76 @@ class Store:
 
     def backup(self, destination: Path):
         destination = Path(destination)
+        def copy_entries(archive, prefix, entries):
+            for relative, incoming in entries:
+                remaining = os.fstat(incoming.fileno()).st_size
+                with archive.open(prefix + relative, 'w', force_zip64=True) as out:
+                    while remaining:
+                        chunk = incoming.read(min(remaining, BACKUP_CHUNK_BYTES))
+                        if not chunk:
+                            raise ValueError(f'File shrank during backup: {relative}')
+                        out.write(chunk)
+                        remaining -= len(chunk)
+                    if incoming.read(1):
+                        raise ValueError(f'File grew during backup: {relative}')
+
         with tempfile.TemporaryDirectory(dir=self.directory) as scratch:
             copy = Path(scratch) / 'letracode.sqlite3'
-            with self.connection() as source:
-                target = sqlite3.connect(copy)
-                try:
-                    source.backup(target)
-                finally:
-                    target.close()
-            db = sqlite3.connect(copy)
-            db.row_factory = sqlite3.Row
-            try:
-                exported = {table: [dict(r) for r in db.execute(f'SELECT * FROM {table}')]
-                    for table in ('projects','chats','messages','links','settings')}
-            finally:
-                db.close()
             stage = Path(scratch) / 'backup.zip'
-            with zipfile.ZipFile(stage, 'w', zipfile.ZIP_DEFLATED) as archive:
-                archive.write(copy, 'letracode.sqlite3')
-                archive.writestr('letracode.json', json.dumps(exported, ensure_ascii=False, indent=2))
-                for relative, content in self.strand.backup_entries():
-                    archive.writestr('strand/' + relative, content)
-                archive.writestr('RESTORE.txt',
-                    'Close LetraCode. Keep a copy of the current data folder. Extract the complete archive, '
-                    'including strand/ and its hidden .history/ and .receipts/ directories, into a NEW empty data folder.\n'
-                    'Before opening a restored database, remove or retarget linked source roots and any writable '
-                    'destinations to isolated test locations. A copied database retains the original links and settings. '
-                    'For a safe test, use sqlite3 /new/folder/letracode.sqlite3 "DELETE FROM links;" and review settings '
-                    'before launch. Never point a restored test at the original sources.\n'
-                    'Then run letracode --data-dir /new/folder. Ordinary Strand files remain editable there; '
-                    'Undo uses the restored private history. Linked originals and GGUF model weights are excluded. '
-                    'Safe ordinary Strand manifests are included. The JSON export is human-readable; its legacy '
-                    'project memory column is empty because strand/memory/ is authoritative.\n')
+            # Freeze cooperating memory saves/deletions before copying SQLite.
+            # No SQLite transaction remains open while waiting on a writer,
+            # generating model output or displaying a user approval dialog.
+            with self.strand.backup_entries() as entries:
+                with self.connection() as source:
+                    target = sqlite3.connect(copy)
+                    try:
+                        source.backup(target)
+                    finally:
+                        target.close()
+                db = sqlite3.connect(copy)
+                db.row_factory = sqlite3.Row
+                try:
+                    exported = {table: [dict(r) for r in db.execute(f'SELECT * FROM {table}')]
+                        for table in ('projects','chats','messages','links','settings')}
+                finally:
+                    db.close()
+                with zipfile.ZipFile(stage, 'w', zipfile.ZIP_DEFLATED) as archive:
+                    archive.write(copy, 'letracode.sqlite3')
+                    archive.writestr('letracode.json', json.dumps(exported, ensure_ascii=False, indent=2))
+                    copy_entries(archive, 'strand/', entries)
+                    source_backups = self.directory / 'file-backups'
+                    # lexists also detects a broken link so it is refused,
+                    # rather than silently omitting a redirected backup root.
+                    if os.path.lexists(source_backups):
+                        with closing(backup_tree(source_backups)) as retained:
+                            copy_entries(archive, 'file-backups/', retained)
+                    archive.writestr('RESTORE.txt',
+                        'Close LetraCode. Keep a copy of the current data folder. Extract the complete archive, '
+                        'including strand/ and its hidden .history/, .receipts/, .deleted-projects/ and recovery '
+                        'directories, plus file-backups/, into a NEW empty data folder.\n'
+                        'Included: the SQLite database, a readable JSON export, ordinary Strand notes/manifests, '
+                        'retained memory/history/recovery bytes, and app-owned pre-edit source copies in file-backups/. '
+                        'Excluded: linked original source trees, GGUF model weights, temporary runtime files, logs '
+                        'and migration-backups/ database snapshots.\n'
+                        'Before opening a restored database, remove or retarget linked source roots and any writable '
+                        'destinations to isolated test locations. A copied database retains the original links and settings. '
+                        'For a safe test, use sqlite3 /new/folder/letracode.sqlite3 "DELETE FROM links;" and review settings '
+                        'before launch. Never point a restored test at the original sources.\n'
+                        'Then run letracode --data-dir /new/folder. Ordinary Strand files remain editable there; '
+                        'Undo uses the restored private history. The JSON export legacy project memory column is empty '
+                        'because strand/memory/ is authoritative. Oversized or undecodable preserved files are copied '
+                        'as opaque bytes; active memory parsing limits still apply.\n'
+                        'Inspect a file-backups/ copy as bytes or in a suitable editor. Its UUID-prefixed basename '
+                        'preserves the source filename; a saved tool result may identify the original path. Copy a '
+                        'chosen version to a separate review location and compare it before any explicit restoration. '
+                        'Restoration does not replay an edit, command, or pending tool call.\n'
+                        'Consistency: Strand saves and project deletions are excluded from the SQLite/file snapshot. '
+                        'A completed memory save may precede its saved chat tool result: inspect restored receipts '
+                        'when a chat action has no outcome, and never retry it automatically. Source pre-edit copies '
+                        'and external editor writes do not share the Strand lock; changes detected while copying '
+                        'abort the backup. Files changed after they were copied belong to a later backup. For a '
+                        'quiescent snapshot, finish active tools and close external editors first. Retained recovery '
+                        'records preserve original paths and may require manual reconciliation in the new folder.\n')
             # Stage alongside destination to keep replacing an existing backup atomic.
             fd, name = tempfile.mkstemp(prefix='.letracode-backup-', dir=destination.parent)
             try:

@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import source_files
-from .context import ProjectFiles, read_text, readable_without_approval, sensitive
+from .context import ProjectFiles, line_starts, read_source, readable_without_approval, sensitive
 from .web import fetch_public, search_results, search_url, validate_url
 
 
@@ -43,8 +43,8 @@ TOOL_SCHEMAS = [
     schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt or list_tool_results and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
     schema('list_tool_results','Discover saved tool results from this chat, including earlier paused or compacted turns, without rerunning actions. Metadata is partial; use read_tool_result for full saved output. Start after_id=0. For each next page keep through_id and set after_id=next_after_id. limit is 1–20, default 10.', {'after_id':{'type':'integer'},'through_id':{'type':'integer'},'limit':{'type':'integer'}}, []),
     schema('list_files','List a local folder (no recursive enumeration). Outside project links requires approval.', {'path':STRING}, ['path']),
-    schema('read_file','Read numbered file lines. UTF-8 source returns its whole-file sha256 for guarded edits; PDF/DOCX are read-only. Use start_line and max_lines for long files.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'}}, ['path']),
-    schema('search_project','Search linked project text files for evidence. Returns diverse passages with paths and line numbers.', {'query':STRING}, ['query']),
+    schema('read_file','Read numbered lines (start_line/max_lines) or exact Unicode character pages (offset/max_chars, default 4000, range 1–16000). Never mix modes. Follow next_offset with offset, including after a cut numbered line. Compare whole-source sha256 between pages for guarded UTF-8 edits. PDF/DOCX are read-only: source_sha256 and extraction.version identify evidence, never edit authority. Inspect source_truncated and extraction coverage even at EOF.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['path']),
+    schema('search_project','Search bounded overlapping character windows of linked source text. Returns diverse partial passages with paths, source lines and character offsets; use read_file to page further.', {'query':STRING}, ['query']),
     schema('write_file','Create or replace UTF-8 text with an approved diff and backup. expected_sha256 must match read_file for an existing file; null means create only if absent. Prefer edit_file for a small change.', {'path':STRING,'content':STRING,'expected_sha256':{'type':['string','null']}}, ['path','content','expected_sha256']),
     schema('edit_file','Replace exactly one nonempty old_text fragment in UTF-8 source; new_text may be empty. Supply the latest whole-file sha256 from read_file or an edit result. Rejects stale or ambiguous edits. Requires diff approval and backs up old bytes.', {'path':STRING,'expected_sha256':STRING,'old_text':STRING,'new_text':STRING}, ['path','expected_sha256','old_text','new_text']),
     schema('run_command','Ask user to approve a shell command. Runs unsandboxed with their account; timeout and output cap apply. Never bypass a denied action.', {'command':STRING,'cwd':STRING,'timeout':{'type':'integer'},'reason':STRING}, ['command','cwd']),
@@ -215,21 +215,46 @@ class ToolExecutor:
     def _read_file(self, args):
         path = self._path(args)
         self._read_permission(path)
+        character_mode = 'offset' in args or 'max_chars' in args
+        if character_mode and ('start_line' in args or 'max_lines' in args):
+            raise ValueError('Do not mix line and character paging arguments.')
+        offset, max_chars = args.get('offset', 0), args.get('max_chars', 4000)
+        if character_mode and (type(offset) is not int or offset < 0 or
+                               type(max_chars) is not int or not 1 <= max_chars <= 16000):
+            raise ValueError('offset must be nonnegative and max_chars must be 1–16000 integers.')
         start, maximum = args.get('start_line',1), args.get('max_lines',180)
         if type(start) is not int or type(maximum) is not int or start < 1 or not 1 <= maximum <= 400:
             raise ValueError('start_line must be positive and max_lines must be 1–400.')
         path = path.resolve()
-        editable = path.suffix.lower() not in {'.pdf', '.docx'}
-        if editable:
-            snapshot = source_files.snapshot(path)
-            contents, digest = snapshot['text'], snapshot['sha256']
-        else:
-            contents, digest = read_text(path), None
+        source = read_source(path)
+        contents = source.pop('text')
+        common = {'path': str(path), 'total_chars': len(contents), **source}
+        if character_mode:
+            text = contents[offset:offset + max_chars]
+            following = offset + len(text)
+            next_offset = following if following < len(contents) else None
+            return {**common, 'offset': offset, 'text': text, 'next_offset': next_offset,
+                    'output_truncated': next_offset is not None,
+                    'truncated': next_offset is not None or source['source_truncated']}
         lines = contents.splitlines()
+        starts = line_starts(contents)
         end = min(len(lines), start + maximum - 1)
-        text = '\n'.join(f'{i+1}: {lines[i]}' for i in range(start-1, end))
-        return {'path':str(path),'start_line':start,'total_lines':len(lines),'text':text[:16000],
-                'truncated':end<len(lines) or len(text)>16000,'sha256':digest,'editable':editable}
+        parts, length = [], 0
+        next_offset = starts[end] if end < len(lines) else None
+        for i in range(start - 1, end):
+            prefix = ('\n' if parts else '') + f'{i + 1}: '
+            available = 16000 - length
+            part = (prefix + lines[i])[:available]
+            parts.append(part)
+            length += len(part)
+            if len(prefix) + len(lines[i]) > available:
+                next_offset = starts[i] + max(0, available - len(prefix))
+                break
+        output_truncated = next_offset is not None
+        return {**common, 'start_line': start, 'total_lines': len(lines),
+                'text': ''.join(parts), 'next_offset': next_offset,
+                'output_truncated': output_truncated,
+                'truncated': output_truncated or source['source_truncated']}
 
     def _search_project(self, args):
         query = self._str(args, 'query', 500)

@@ -68,6 +68,8 @@ def test_incomplete_tool_history_gets_explicit_unknown_outcomes(tmp_path):
 
 def test_excess_tool_requests_are_all_saved_as_not_executed_and_pause(tmp_path):
     class TooMany(ScriptedEngine):
+        # Keep this batch-limit fixture independent of schema text growth.
+        config = type('Config', (), {'context_size': 16384, 'max_tokens': 1024})()
         requests = 0
         def complete(self, messages, *args, **kwargs):
             self.requests += 1
@@ -192,7 +194,11 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
         # Existing 32768-context / 3072-reply character allowance: 57392.
         assert len(json.dumps(request, ensure_ascii=False)) <= 57392
         assert_paired_tools(request)
-        assert request[0] == engine.requests[0][0]
+        # Optional retrieval can shrink as versioned cursor receipts accumulate;
+        # preserve the complete system/identity/project core ahead of it.
+        core = engine.requests[0][0]['content'].split('\n## Linked roots\n')[0]
+        assert request[0]['role'] == 'system'
+        assert request[0]['content'].startswith(core)
         assert request[1]['content'] == 'Read these project files, in order.'
         if request[-1]['role'] == 'tool':
             outcomes = [json.loads(m['content']) for m in request if m['role'] == 'tool']
@@ -346,9 +352,11 @@ def test_repeated_pause_compaction_keeps_earlier_saved_references(tmp_path):
         assert trimmed
         assert_paired_tools(messages)
         assert len(json.dumps(messages, ensure_ascii=False)) <= 2200
-        # Every prior turn is now omitted. The current checkpoint is the only
-        # way to recover the small set of prior result references directly.
-        assert [message['role'] for message in messages] == ['system', 'user']
+        # Old action bulk is omitted; authoritative user steering survives.
+        # The checkpoint still locates the original saved outcomes.
+        assert all(message['role'] == 'user' for message in messages[1:])
+        assert [message['content'] for message in messages[1:]] == [
+            row['content'] for row in store.messages(chat) if row['role'] == 'user']
         checkpoint = json.loads(messages[0]['content'].split('## Saved pause checkpoint\n')[1].split('\n')[0])
         assert set(evidence_ids) <= set(checkpoint['saved_result_ids'])
     assert checkpoint['saved_result_count'] == len(evidence_ids)
@@ -412,7 +420,8 @@ def test_many_pauses_recover_old_result_from_bounded_catalog_after_reopen(tmp_pa
             assert 'list_tool_results' in {tool['function']['name'] for tool in tools}
             assert 'list_tool_results' in messages[0]['content']
             if self.requests == 1:
-                assert len(messages) == 2  # Compaction discarded all old turns.
+                assert all(message['role'] == 'user' for message in messages[1:])
+                assert len(messages) == 26  # 24 steering rows, current user and system.
                 assert 'ARCHIVED-DELTA-41' not in json.dumps(messages)
                 name, arguments = 'list_tool_results', {'limit': 1}
             elif self.requests == 2:
@@ -440,8 +449,9 @@ def test_legacy_unbounded_checkpoint_fits_after_compaction(tmp_path):
     chat = store.create_chat('Legacy checkpoint')
     # Old checkpoints may include every result in one large tool batch. Their
     # obsolete inline index must not consume all future continuation budgets.
+    anchor = store.add_message(chat, 'user', 'Recover saved evidence.')
     saved_ids = [store.add_message(chat, 'tool', 'Original bounded evidence') for _ in range(500)]
-    old_checkpoint = {'reason': 'action_round_limit', 'user_message_id': 1, 'rounds': 10,
+    old_checkpoint = {'reason': 'action_round_limit', 'user_message_id': anchor, 'rounds': 10,
                       'saved_result_ids': saved_ids}
     store.add_message(chat, 'notice', 'Legacy pause', status='paused', payload={'checkpoint': old_checkpoint})
     store.add_message(chat, 'user', 'Continue.')

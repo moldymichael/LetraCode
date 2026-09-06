@@ -4,6 +4,9 @@ LetraCode is a private desktop chat app for a local AI model. It uses Fedora's
 native Qt/PySide6 packages, follows your KDE style, and keeps conversations on
 your computer. There is no cloud inference, account, or telemetry.
 
+For the development baseline, current capabilities and verification boundaries,
+see [Current implementation state](docs/CURRENT-STATE.md).
+
 ## Install on Fedora KDE
 
 1. Download `LetraCode-0.1.1.run`.
@@ -60,9 +63,11 @@ Installed application files live separately in
 `${XDG_DATA_HOME:-~/.local/share}/letracode-app`, so updates and uninstall do not
 delete your conversations.
 
-Choose **File → Back up all LetraCode data** while the app is open. Save the
-snapshot ZIP to your backup drive. It contains a consistent SQLite snapshot,
-human-readable JSON, and a restore guide. To remove the application while
+Choose **File → Back up chats, Strand and source backups** while the app is open. Save the
+snapshot ZIP to your backup drive. It contains a SQLite snapshot, human-readable JSON, Strand notes and retained
+recovery history, app-owned pre-edit source backups, and a restore guide.
+Linked originals, model weights, logs and migration snapshots are excluded.
+See the consistency boundary in [the reliability report](docs/RELIABILITY-VERIFICATION.md). To remove the application while
 retaining its data folder, run:
 
 ```bash

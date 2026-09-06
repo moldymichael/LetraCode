@@ -34,9 +34,10 @@ def release_files() -> list[Path]:
             "io.letracode.LetraCode.metainfo.xml",
         )
     )
-    verification = ROOT / "docs/VERIFICATION.md"
-    if verification.is_file():
-        files.append(verification)
+    # Ship capability claims with their linked current/historical explanations.
+    # Include portable verification entry points, never raw scratch or models.
+    files.extend((ROOT / "docs").rglob("*.md"))
+    files.extend((ROOT / "tools").glob("*.py"))
     missing = [path for path in files if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"required release file is missing: {missing[0]}")

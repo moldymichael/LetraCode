@@ -104,7 +104,8 @@ class StrandDialog(QDialog):
         self.learning_grant.toggled.connect(lambda enabled:store.set_setting('strand_learning_grant', enabled))
         layout.addWidget(self.learning_grant)
         self.history = QComboBox(); layout.addWidget(self.history)
-        undo = QPushButton('Undo selected saved change'); undo.clicked.connect(self.undo_selected); layout.addWidget(undo)
+        self.undo_button = QPushButton('Undo selected saved change')
+        self.undo_button.clicked.connect(self.undo_selected); layout.addWidget(self.undo_button)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject); layout.addWidget(buttons)
         self.state = None
@@ -145,7 +146,16 @@ class StrandDialog(QDialog):
 
     def refresh_receipts(self, selected_id=None):
         self.history.clear()
-        receipts = self.store.strand.receipts(scope=self.state.scope, project_id=self.state.project_id)
+        try:
+            receipts = self.store.strand.receipts(scope=self.state.scope, project_id=self.state.project_id)
+        except (OSError, ValueError, RuntimeError) as error:
+            self.history.setEnabled(False)
+            self.undo_button.setEnabled(False)
+            self.message.setText((self.state.error + '\n' if self.state.error else '')
+                                 + f'History unavailable: {error}\nUndo is unavailable until history is reconciled.')
+            return
+        self.history.setEnabled(True)
+        self.undo_button.setEnabled(bool(receipts))
         latest = None
         for receipt in receipts:
             order = f"#{receipt['sequence']}" if receipt.get('sequence') is not None else f"Legacy {receipt['id'][-8:]}"

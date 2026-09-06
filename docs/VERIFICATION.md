@@ -1,5 +1,10 @@
 # LetraCode — verification and limits
 
+Historical milestone record. Its original results and limits are preserved below.
+For the current reliability branch, see [Current implementation state](CURRENT-STATE.md)
+and [Reliability verification](RELIABILITY-VERIFICATION.md).
+
+
 ## Supervised coding prerequisites (current development branch)
 
 Worktree: `/home/miceoil/Projects/LetraCode-strand-development`, branch `codex/strand-development-loop`, based on accepted M1a `cdfdf9d19d9e19149d168a0b4942564de10e0f54`. The M1a checkout remains unchanged. The user independently accepted M1a and deferred broader manual KDE checks; this pass addresses the specific source-editing prerequisites, not a new broad M1a review.

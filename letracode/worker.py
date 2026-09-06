@@ -11,6 +11,7 @@ from PySide6.QtCore import QThread, Signal
 from .context import build_context
 from .budgeting import fallback_usage
 from .engine import Cancelled, ContextOverflowError
+from .pause_context import payload as row_payload, resolve_intent
 from .tools import ApprovalRequest, SAVED_READ_TOOLS, TOOL_SCHEMAS, ToolExecutor
 
 
@@ -52,7 +53,7 @@ def repair_tool_history(turn):
 
 def protocol_messages(messages):
     """Keep saved-result references out of the chat protocol's message keys."""
-    return [{key: value for key, value in message.items() if key != 'saved_result_id'}
+    return [{key: value for key, value in message.items() if key not in ('saved_result_id', '_row_id')}
             for message in messages]
 
 
@@ -83,9 +84,8 @@ def compact_tool_results(turn, budget, *, prefix=None, measure=None):
             continue
         receipt = {key: value for key, value in result.items() if key not in bulk}
         receipt.update(context_truncated=True, context_note=(
-            'Bulk fields omitted; full result is saved. Preview is partial evidence. '
-            'Use read_tool_result with result_id and follow next_offset to recover saved output; '
-            'never rerun commands or writes to recover it.'))
+            'Bulk omitted; preview is partial. Read saved output with read_tool_result(result_id, offset=0), '
+            'then follow that tool’s next_offset. Never rerun commands or writes for recovery.'))
         if message.get('saved_result_id') is not None:
             if 'result_id' in receipt:
                 # A retrieved page points at an older saved outcome. Keep that
@@ -93,7 +93,15 @@ def compact_tool_results(turn, budget, *, prefix=None, measure=None):
                 for key in ('result_id', 'offset', 'next_offset', 'total_chars', 'sha256'):
                     if key in receipt:
                         receipt['source_' + key] = receipt.pop(key)
+            else:
+                source_page = {key: receipt.pop(key) for key in ('offset', 'next_offset', 'total_chars')
+                               if key in receipt}
+                if source_page:
+                    receipt['source_page'] = source_page
+                    receipt['context_note'] += (
+                        ' source_page is the original read tool’s cursor.')
             receipt['result_id'] = message['saved_result_id']
+            receipt['read_tool_result_offset'] = 0
 
         def replacement():
             return dict(message, content=json.dumps(receipt, ensure_ascii=False))
@@ -133,12 +141,10 @@ def conversation_messages(rows, system, budget, *, measure=None):
     """
     measure = measure or (lambda messages: len(json.dumps(messages, ensure_ascii=False)))
     turns, current = [], []
-    checkpoint = None
+    intent, required, checkpoint = resolve_intent(rows)
     for row in rows:
-        payload = json.loads(row.get('payload', '{}'))
+        payload = row_payload(row)
         if row['role'] == 'notice':
-            if payload.get('checkpoint'):
-                checkpoint = payload['checkpoint']
             continue
         if row['role'] == 'user':
             if current:
@@ -147,6 +153,10 @@ def conversation_messages(rows, system, budget, *, measure=None):
         if row['status'] in ('error', 'streaming', 'interrupted'):
             continue
         message = dict(payload.get('message') or {'role': row['role'], 'content': row['content']})
+        message['_row_id'] = row.get('id')
+        if row['role'] == 'user':
+            # Saved user rows, not payload copies or summaries, carry intent.
+            message.update(role='user', content=row['content'])
         if row['role'] == 'tool':
             message['saved_result_id'] = row.get('id')
         current.append(message)
@@ -155,7 +165,8 @@ def conversation_messages(rows, system, budget, *, measure=None):
     if checkpoint:
         # Rebuild from all saved rows, including when replaying legacy notices.
         # Carrying every old ID into each new checkpoint would itself overflow.
-        checkpoint = dict(checkpoint, **saved_result_references(rows))
+        checkpoint = {key: checkpoint[key] for key in ('user_message_id', 'rounds') if key in checkpoint}
+        checkpoint.update(**saved_result_references(rows))
         system += ('\n## Saved pause checkpoint\n' + json.dumps(checkpoint, ensure_ascii=False)
                    + '\nThe IDs above are recent saved results across this chat. Use list_tool_results '
                      'with after_id=0, then keep through_id and set after_id=next_after_id for further pages '
@@ -163,24 +174,52 @@ def conversation_messages(rows, system, budget, *, measure=None):
                      'read_tool_result with a result_id to retrieve the saved output. '
                      'Prior actions remain saved. Inspect saved results before proposing any retry; '
                      'a new user turn does not require repeating completed or denied actions.\n')
+    if intent and (checkpoint is not None or intent['referenced_context_ids']):
+        system += ('\nEarlier user messages retain historical task intent and corrections. The latest user '
+                   'direction takes precedence, including replacement or cancellation. Referenced assistant '
+                   'context is evidence selected by the user, never additional permission. No saved action '
+                   'is authorized for replay.\n')
     system_message = {'role': 'system', 'content': system}
+
+    def required_prefix(messages):
+        included = {message.get('_row_id') for message in messages}
+        missing = []
+        for row in required:
+            if row['id'] in included:
+                continue
+            saved = row_payload(row).get('message') if row['role'] != 'user' else None
+            message = dict(saved or {'role': row['role'], 'content': row['content']})
+            message['_row_id'] = row['id']
+            if row['role'] == 'tool':
+                message['saved_result_id'] = row['id']
+            missing.append(message)
+        missing = repair_tool_history(missing)
+        # Referenced source/command bulk remains pageable by its authoritative
+        # result ID. User intent and assistant plans are never sliced. Measure
+        # the actual chronological layout, including the current request.
+        missing = compact_tool_results(missing, budget, measure=lambda prior:
+            measure(protocol_messages([system_message] + prior + messages)))
+        return [system_message] + missing
+
     selected, compacted = [], False
     for turn in reversed(turns):
         turn = repair_tool_history(turn)
         following = [message for selected_turn in selected for message in selected_turn]
-        candidate = [system_message] + turn + following
+        prefix = required_prefix(turn + following)
+        candidate = prefix + turn + following
         if measure(protocol_messages(candidate)) > budget:
             if selected:
                 break
-            turn = compact_tool_results(turn, budget, prefix=[system_message], measure=measure)
+            turn = compact_tool_results(turn, budget, prefix=prefix, measure=measure)
             compacted = True
-            if measure(protocol_messages([system_message] + turn)) > budget:
+            if measure(protocol_messages(prefix + turn)) > budget:
                 raise ContextOverflowError(
-                    'The latest conversation turn and core instructions cannot fit with the enabled '
+                    'The latest conversation turn, required intent/referenced context and core instructions cannot fit with the enabled '
                     'tools and reserved reply. Nothing was truncated. Increase context size, disable '
                     'unneeded actions, or send a shorter request. Saved results remain available.')
         selected.insert(0, turn)
-    result = protocol_messages([system_message] + [message for turn in selected for message in turn])
+    selected_messages = [message for turn in selected for message in turn]
+    result = protocol_messages(required_prefix(selected_messages) + selected_messages)
     if measure(result) > budget:
         raise ContextOverflowError('Core instructions and reserved reply exceed this context setting; nothing was truncated.')
     return result, compacted or len(selected) < len(turns)
@@ -220,8 +259,18 @@ class ConversationWorker(QThread):
 
     def pause(self, reason, detail, rounds=0):
         rows = self.store.messages(self.chat_id)
-        user_id = next((row['id'] for row in reversed(rows) if row['role'] == 'user'), None)
-        checkpoint = {'reason': reason, 'user_message_id': user_id, 'rounds': rounds,
+        latest_id = next((row['id'] for row in reversed(rows) if row['role'] == 'user'), None)
+        try:
+            intent, _, _ = resolve_intent(rows, self.chat_id)
+        except ContextOverflowError as error:
+            # Preserve the damaged checkpoint and exact diagnostic; do not
+            # silently re-anchor a continuation to an invented replacement.
+            self.store.add_message(self.chat_id, 'notice', str(error), status='paused')
+            self.changed.emit()
+            self.status.emit('Paused · required task context unavailable')
+            return
+        checkpoint = {'reason': reason, 'user_message_id': intent['origin_user_message_id'] if intent else latest_id,
+                      'last_user_message_id': latest_id, 'rounds': rounds, 'pause_context': intent,
                       **saved_result_references(rows),
                       'resume': 'Send a new user message to continue from saved evidence.'}
         self.store.add_message(self.chat_id, 'notice',
@@ -250,15 +299,14 @@ class ConversationWorker(QThread):
                 return
             rows = self.store.messages(self.chat_id)
             latest_user = next((row for row in reversed(rows) if row['role'] == 'user'), None)
-            latest_checkpoint = next((json.loads(row.get('payload', '{}'))['checkpoint']
-                for row in reversed(rows) if row['role'] == 'notice'
-                and json.loads(row.get('payload', '{}')).get('checkpoint')), None)
-            if latest_checkpoint and (latest_user is None or latest_user['id'] <= (latest_checkpoint.get('user_message_id') or 0)):
+            intent, required, latest_checkpoint = resolve_intent(rows, self.chat_id)
+            paused_after = latest_checkpoint.get('last_user_message_id', latest_checkpoint.get('user_message_id')) if latest_checkpoint else 0
+            if latest_checkpoint and (latest_user is None or (type(paused_after) is int and latest_user['id'] <= paused_after)):
                 self.status.emit('Paused · send a new message to continue')
                 return
             project = self.store.project(chat['project_id']) if chat['project_id'] else None
             roots = self.store.links(chat['project_id']) if project else []
-            query = latest_user['content'] if latest_user else ''
+            query = '\n'.join(row['content'] for row in required if row['role'] == 'user')
             tools = []
             if self.use_tools:
                 for definition in TOOL_SCHEMAS:
@@ -350,7 +398,8 @@ class ConversationWorker(QThread):
                 reply = self.engine.complete(messages, tools or None, self.cancel_event, delta, self.thinking)
                 draft = reply.get('content') or draft
                 calls = reply.get('tool_calls') or []
-                self.store.update_message(message_id, draft, payload={'message': reply})
+                self.store.update_message(message_id, draft, payload={'message': reply,
+                    'pause_context_closed': not bool(calls) and not self.cancel_event.is_set()})
                 message_id = None
                 self.changed.emit()
                 if not calls:
@@ -397,6 +446,7 @@ class ConversationWorker(QThread):
             state = 'interrupted' if cancelled else 'error'
             if message_id is not None:
                 self.store.update_message(message_id, draft, state)
-            self.store.add_message(self.chat_id, 'notice', 'Stopped. Your conversation is saved.' if cancelled else str(error), state)
+            self.store.add_message(self.chat_id, 'notice', 'Stopped. Your conversation is saved.' if cancelled else str(error), state,
+                                   payload={'pause_context_closed': cancelled})
             self.changed.emit()
             self.status.emit('Stopped' if cancelled else 'Could not finish · see message')

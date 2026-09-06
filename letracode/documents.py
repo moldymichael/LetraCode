@@ -70,10 +70,10 @@ def read_docx(path: Path, text_limit: int, document_limit: int) -> str:
     parts = []
     remaining = text_limit
     for part in blocks(body):
-        if parts:
-            remaining -= 1
         if remaining <= 0:
             break
-        parts.append(part[:remaining])
+        # A paragraph separator is extracted text too, including when it is
+        # exactly the final character allowed by the caller's coverage probe.
+        parts.append((('\n' if parts else '') + part)[:remaining])
         remaining -= len(parts[-1])
-    return '\n'.join(parts)
+    return ''.join(parts)
