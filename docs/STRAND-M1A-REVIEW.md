@@ -4,6 +4,8 @@ September 5, 2026. This is a development branch for review, not an installed upd
 
 M1a at `cdfdf9d` has since received independent technical acceptance; broader manual KDE checks were deferred. The subsequent, separately developed source-editing milestone is documented in [Supervised coding proof](SUPERVISED-CODING-PROOF.md). Its prerequisite changes and real-model evidence are separate from the historical M1a results below.
 
+Current supervised-coding result: prerequisite commit `483fb00` passes **280 automated tests**, but the actual coding proof **did not pass**. After inspection and a passing unchanged baseline, Qwen reached the existing 300-second completion deadline before producing its first edit request. No model-authored regression or patch was published. Six native command approvals, the saved continuation, a separately attributed fixture-setup correction and the failed outcome are retained in the proof document. The staged source fixture and untracked sentinel are unchanged. Review the prerequisite diff and failed transcript independently; broader KDE checks and real coding completion remain outstanding.
+
 ## Undo lifecycle stabilization (current)
 
 This focused pass starts from clean `932996ce27554647ea29471cc7af93bc5a47f0ae` on `codex/strand-m1a`. The 197-test baseline passed again, but new reproductions confirmed the same-second ordering defect and connected Undo safety/interface problems. The results below from earlier passes remain historical evidence.
