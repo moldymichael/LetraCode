@@ -104,6 +104,12 @@ The old trial took about 31 minutes with no patch. These observations justify
 profiling prompt/generation/read repetition before selecting segment and total
 task budgets; extending a deadline alone demonstrates no improvement.
 
+The new bounded coding trial also ended without a patch after 900 seconds:
+about 303 seconds prompt processing, 343 seconds generation and 248 seconds
+native approval wait. One completed request took 209 seconds. The separate
+[actual-model report](REAL-MODEL-ACCEPTANCE.md) records this wall-budget stop;
+it is not evidence for adopting a 180-second segment or extending engine limits.
+
 Keep finite persisted request/action/time/correction budgets, cancellation,
 true timeout classification, and a no-progress stop. Measure engine startup,
 prompt processing and generation separately from human wait time. Select

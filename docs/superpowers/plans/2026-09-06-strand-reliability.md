@@ -13,7 +13,11 @@
 - [x] 2. Source agent owns context/tools/source reader. Add deep marker and paging failures; implement bounded character windows, compatible read cursors and snapshot/extraction provenance. Check Unicode/BOM/CRLF, limits, changes and disabled tools.
 - [x] 3. Backup agent owns store/strand snapshot code. Reproduce oversized opaque archives; stream safely, include app-owned file backups and coordinate SQLite/files under Strand lock. Verify restore hashes, malformed links, destination failures and interleaving.
 - [x] 4. Measure 1/20/100/1000 small revisions in fresh directories; improve exact damage diagnostics conservatively. Keep fail-closed chronology/Undo and preserve all raw history. Record a future durable ordering design.
-- [ ] 5. Acceptance agent prepares portable fresh fixtures and finite runtime budgets. Run actual local inference only with existing executable/GGUF and normal human approvals. Save requests/results/patch and report coding and reading independently of deterministic tests.
+- [x] 5. Acceptance agent prepares portable fresh fixtures and finite runtime budgets. Run actual local inference only with existing executable/GGUF and normal human approvals. Save requests/results/patch and report coding and reading independently of deterministic tests.
 - [x] 6. Rebase future orchestration design on current code with a distinct namespace and schema >2. Ship linked small docs, not raw scratch. Review diff and full suite; document concrete results and limits.
 
 Each implementation step uses red/green focused checks with isolated XDG/data/temp roots. Final checks include all tests, supplied regressions, Python compilation, shell syntax, release documentation membership and whitespace. No installed app, live DB, source projects, model files, original evidence, unrelated changes, push or deployment is touched.
+
+Task 5 measurement is complete, not model acceptance: coding ended without a patch;
+reading follow-up retained intent and answered facts but failed full source coverage.
+See the separate actual-model report for outcomes and next measured experiments.

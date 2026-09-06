@@ -27,18 +27,35 @@ Focused results during implementation:
 | Measurement CLI duplicate counts | 1 failed | 1 passed in 0.20 s |
 | Portable acceptance harness | Scripted peer only, never a model-quality result | 15 passed in 3.95 s after provenance expansion |
 
-An intermediate combined run passed **371 tests in 15.54 s**. Ten Python 3.14
-warnings identify existing process-crash fixtures forking after Qt created
-threads; no test failed. After subsequent review fixes and packaging checks, an application run
-passed **379 tests in 15.28 s** (same ten warnings), with zero failures or skips,
-at `/tmp/letracode-check-2zl41qlq`. All five supplied audit regressions passed
-separately in **0.14 s**, at `/tmp/letracode-check-iobvy2t4`. Packaging/install
-checks passed **9 tests in 1.08 s**; all application, test and tooling Python files compiled without
-bytecode, shell syntax checks and `git diff --check` passed.
+The final combined suite passed **385 tests in 19.23 s**, with zero failures or
+skips. Ten Python 3.14 warnings come from existing process-crash fixtures forking
+after Qt created threads. The five supplied audit regressions also passed
+separately in **0.14 s**. Packaging/install checks passed **9 tests in 1.08 s**;
+41 Python files compiled without bytecode, shell syntax checks and
+`git diff --check` passed. Intermediate combined runs were 371/379 passes;
+these are development checkpoints, not additional acceptance results.
+The final documentation/release recheck passed **9 tests in 1.11 s**, retained
+under `documentation-final/` in the evidence directory.
 
-All tests use fresh visible `/tmp/letracode-check-*` roots with separate runtime,
+The tested application and harness are committed as
+`12d8436960bacf7eecc3605286593335c83e5b74`. Later report changes do not alter that
+application. Durable logs, exact invocations and model evidence are retained at
+`/home/miceoil/Projects/LetraCode-reliability-evidence-6v5gmg4f`:
+`baseline/`, `audit-before/`, `audit-after/`, `application-final/`, and
+`history-measurement/`. The directory also retains the original verified handoff
+ZIP and the isolated check wrapper. Original scratch paths in copied logs are
+provenance, not instructions to execute.
+
+Root-led full-suite and audit checks use fresh visible `/tmp/letracode-check-*`
+roots with separate runtime,
 cache, config, data and scratch directories. The actual invocations and full
-output remain in each root's `invocation.json` and `tests.log`. Baseline evidence
+output remain in those roots' `invocation.json` and log files. Source-focused
+checks used `/tmp/letracode-pages-final-SANHSp` and related disposable roots;
+their transcript-extracted commands and results are retained under
+`source-focused/`, clearly distinguished from original wrapper logs. Backup and
+history focused command/output excerpts are likewise labelled under
+`backup-history-focused/`.
+Baseline evidence
 is `/tmp/letracode-check-baseline-c569o8j0`; supplied red fixtures are
 `/tmp/letracode-check-audit-6d8saw_s`. To reproduce from this repository:
 
@@ -137,36 +154,6 @@ The [future design](FUTURE-TASKS-DESIGN.md) describes a recoverable reservation
 ledger/index and independent retained-descriptor validation; no pruning or
 metadata-only cache is introduced.
 
-## Actual local-model acceptance
-
-Application pass counts above use scripted/loopback inference. Actual model
-results belong here separately. The preserved [historical coding
-trial](SUPERVISED-CODING-PROOF.md) remains a **failure**: 19 requests, six command
-approvals, about 31 minutes, no model patch, and a 300-second request timeout.
-
-The new [acceptance runner](../tools/run_acceptance.py) requires an existing local
-executable/GGUF and a fresh output directory. It records runtime/model metadata,
-configuration, requests/replies/SSE, prompt/generation timing, actual saved tool
-results, human approval decisions, budgets, transcript and final files/patch.
-Its test harness is explicitly labelled scripted evidence. A runner exit or
-`acceptance_passed: null` requires review and is never a model pass.
-
-The verified local runtime is llama.cpp `0.4.0-dev`, commit `4d91760`; the existing
-Qwen3.6 35B-A3B GGUF is 22,134,528,992 bytes. Initial trials retain 12 GPU layers,
-eight threads, temperature 0.7, Instant and 3,072 reply tokens. Native approval
-dialogs remain human decisions. The runner can deny out-of-scope actions and
-stop at budgets; it cannot approve actions. Pauses require explicit native Send by default. Reading-only
-`--fixture-continuation` can supply one recorded test-operator user turn after
-worker cleanup; it is labelled separately and grants no tool approval.
-
-Reading uses twelve synthetic chapters, deep paragraph evidence, a later
-correction and an unknown fact; its evaluator key is outside the linked source
-root. Coding uses a disposable clone with an unrelated staged change and an
-untracked sentinel. Only the actual model may author the list_files truncation
-regression and fix. The reliability application changes do not implement that
-acceptance feature.
-
-
 ## Acceptance-driven cursor follow-up
 
 The first genuine reading trial exposed an additional application ambiguity:
@@ -189,3 +176,11 @@ versioned receipts. Saved bodies and tool-pairing assertions are unchanged.
 Other updated baseline fixtures explicitly retain all user steering and use a
 real user anchor for legacy checkpoint recovery; the batch-limit fixture uses
 16,384 context to isolate batch behavior from schema/path-length growth.
+
+## Actual local-model results are separate
+
+The actual local-model configurations, requests, approvals, timings, final
+artifacts and assessed outcomes are in
+[REAL-MODEL-ACCEPTANCE.md](REAL-MODEL-ACCEPTANCE.md). Application pass counts above
+use scripted/loopback inference and are not evidence of model-authored work or
+successful autonomous task completion.
