@@ -333,7 +333,7 @@ class ToolExecutor:
         return {'path':saved['path'],'written_characters':len(content),'backup':str(backup) if backup else None,
                 'sha256':saved['sha256']}
 
-    def _run_command(self, args):
+    def _command_parameters(self, args):
         command = self._str(args, 'command', 12000)
         cwd = self._path(args, 'cwd').resolve(strict=True)
         if not cwd.is_dir():
@@ -344,6 +344,17 @@ class ToolExecutor:
         reason = args.get('reason','')
         if not isinstance(reason, str):
             raise ValueError('Reason must be text.')
+        return command, cwd, timeout, reason
+
+    def execution_arguments(self, name, args):
+        """Normalize the actual command identity before checking saved effects."""
+        if name != 'run_command':
+            return args
+        command, cwd, timeout, _ = self._command_parameters(args)
+        return {'command': command, 'cwd': str(cwd), 'timeout': timeout}
+
+    def _run_command(self, args):
+        command, cwd, timeout, reason = self._command_parameters(args)
         self._ask(ApprovalRequest('Run this terminal command?', f'Working directory: {cwd}\nTime limit: {timeout} seconds\nPurpose: {reason[:1000]}\n\n{command}', 'command', 'Runs outside a sandbox with your user account. It can modify or delete files and send data over the network. Approve only a command you understand.'))
         env = {key:os.environ[key] for key in ('PATH','HOME','USER','LOGNAME','LANG','LC_ALL','TERM','TMPDIR','XDG_RUNTIME_DIR') if key in os.environ}
         env.update({'GIT_TERMINAL_PROMPT':'0','PAGER':'cat'})

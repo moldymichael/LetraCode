@@ -361,9 +361,17 @@ def evidence_state(rows, origin_user_id):
                 unresolved_reads.discard(os.path.normpath(descriptor['path']))
                 unresolved_reads.discard(_requested_path(_payload(row)))
     for row in rows:
-        if row['role'] != 'assistant' or row['status'] != 'complete':
+        if row['role'] != 'assistant':
             continue
-        observations = _payload(row).get('source_exposure', [])
+        data = _payload(row)
+        # Task incompleteness does not undo a successfully completed inference
+        # request. Streaming/interrupted/error rows still cannot prove exposure.
+        completed = data.get('request_completed', data.get('task_outcome') == 'source_incomplete'
+                             and 'source_exposure' in data)
+        if row['status'] != 'complete' and not (row['status'] == 'incomplete'
+                and completed is True):
+            continue
+        observations = data.get('source_exposure', [])
         if not isinstance(observations, list) or len(observations) > MAX_RANGES:
             raise ValueError('Invalid saved request exposure list (4096-observation limit).')
         for observation in observations:

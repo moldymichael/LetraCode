@@ -1,5 +1,57 @@
 # Reliability verification — September 6, 2026
 
+## September 7 independent-review fix round 1
+
+Review of `1296e258cde67ffa698f48c36b12e69c015ed5ee` found five additional
+boundary failures. Each was reproduced before production repair in
+`tests/test_continuation_review_fixes.py`: **9 failed in 0.29 s**, covering
+steering during approval, Stop before/during a run, provisional request exposure,
+smaller-page recovery after compaction, and equivalent commands whose rationale,
+default timeout or directory alias differed. A final-response reopen case also
+failed separately before the admission fix; an already-saved provisional reply
+without the new completion marker failed before compatibility support.
+
+Approval now rechecks the worker's saved input cursor after the wait and before
+returning authority to the tool. Stale approval yields paired not-executed
+`new_input` outcomes for the current and later calls. Stop and final response
+records retain a separate terminal input cursor even when their context closes;
+startup requires later explicit user input. Successful inference records request
+completion separately from a provisional task outcome. Existing provisional
+proofs remain valid through their application outcome metadata and source-proof
+validation; interrupted and streaming requests still receive no exposure credit.
+
+New completed source exposure resets a stall streak independently of retrieved
+ranges, but does not change the source epoch that protects effectful actions
+from replay. The smaller-page regression starts with a compacted 16000-character
+read, then exposes four complete 4000-character pages across six requests. Every
+smaller page is checked as actually present in the request. Disabling only the
+exposure-progress update reproduces the four-request false stop.
+
+Command identity uses exact shell text, resolved working directory and effective
+timeout. The command parser is shared between normalization and execution;
+descriptive `reason` remains in the approval but cannot bypass duplicate checks.
+Omitted timeout and explicit 60 seconds are equivalent. Execution uses the same
+normalized parameters checked against prior saved effects, and the controller
+records actual command-result parameters. Different command text, directory or
+timeout remain distinct; exposure alone does not unlock reruns.
+
+Fresh verification on the same Python 3.14.7 / pytest 8.4.2 / PySide6 6.11.2
+offscreen environment:
+
+- Broad focused lifecycle/evidence/tool/UI group: **219 passed in 18.87 s**.
+- Final focused review/evidence/continuation/tool group: **122 passed in 2.68 s**.
+- Fresh complete suite: **488 passed, 10 warnings in 27.74 s**, no failures or
+  skips. Existing fork-warning locations/counts are unchanged.
+- **49 Python files compiled** without bytecode; `git diff --check` passed.
+
+The full suite used the exact isolated invocation shown in the initial completion
+record below, with `LETRACODE_CHECK_ROOT=/tmp/letracode-continuation-fix1-0XS3YA`.
+Its full output remains in that root's `full.log`, with separate runtime, cache,
+config, data and scratch directories. No existing test was weakened or changed
+in this fix round. No real model, manuscript, live data or installed application
+was used. The local completion report records RED/GREEN diagnostics, final
+release checks and the separate fix commit. Controller review follows the fix.
+
 ## September 7 automatic bounded continuation completion
 
 The recovered implementation was preserved and completed directly in

@@ -60,6 +60,15 @@ def _canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
 
 
+def _effect_identity(name, args):
+    if name == 'run_command':
+        # The tool adapter supplies the resolved execution cwd. The optional
+        # approval rationale is descriptive, never part of the shell operation.
+        return _canonical({'command': args.get('command'), 'cwd': args.get('cwd'),
+                           'timeout': args.get('timeout', 60)})
+    return _canonical(args)
+
+
 def _fingerprint(name, args, result, empty_page):
     omitted = _VOLATILE
     argument_omitted = {'tool_call_id', 'call_id'}
@@ -171,8 +180,17 @@ class RunProgress:
         """
         if name not in _EFFECT_TOOLS:
             return None
-        found = self._effects.get((name, _canonical(args)))
+        found = self._effects.get((name, _effect_identity(name, args)))
         return found[1] if found is not None and found[0] in (None, self._generation) else None
+
+    def observe_source_exposure(self):
+        """New application-verified exposure breaks a stall streak, not replay protection.
+
+        The worker compares completed-request range unions before calling this.
+        Merely exposing an already retrieved source never changes the source
+        generation and cannot authorize another command or edit.
+        """
+        self.stalls = 0
 
     def _source_change(self, name, args, result, successful):
         if (not successful or not isinstance(result, dict)
@@ -246,7 +264,7 @@ class RunProgress:
             interrupted = name == 'run_command' and (result.get('timed_out') or result.get('cancelled')
                                                      or type(result.get('exit_code')) is not int)
             # Later source changes cannot resolve unknown interrupted effects.
-            self._effects[(name, _canonical(args))] = (None if interrupted else self._generation, result_id)
+            self._effects[(name, _effect_identity(name, args))] = (None if interrupted else self._generation, result_id)
         # Keep the just-saved outcome even if the dispatch consumed the final
         # time allowance. The caller can checkpoint the terminal snapshot.
         self.check_time()

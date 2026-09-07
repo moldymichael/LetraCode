@@ -259,6 +259,8 @@ class ConversationWorker(QThread):
         self._stop_lock = threading.Lock()
         self._finished = False
         self._cancel_thread = None
+        self._check_dispatch = None
+        self._approval_halted = None
 
     def ask(self, request):
         pending = PendingApproval(request)
@@ -269,6 +271,15 @@ class ConversationWorker(QThread):
             if self.cancel_event.is_set():
                 pending.decide(False)
         self.pending = None
+        if self._check_dispatch is not None and not self.cancel_event.is_set():
+            try:
+                self._check_dispatch()
+            except RunHalted as error:
+                # ToolExecutor owns approval execution, but only this worker
+                # owns the saved input cursor. Carry the halt back to its batch
+                # pairing path instead of letting a stale approval authorize it.
+                self._approval_halted = error
+                return False
         return pending.approved and not self.cancel_event.is_set()
 
     def request_stop(self):
@@ -349,6 +360,22 @@ class ConversationWorker(QThread):
                 return
             rows = self.store.messages(self.chat_id)
             latest_user = next((row for row in reversed(rows) if row['role'] == 'user'), None)
+            # Context closure and permission to start another run are separate.
+            # A stopped/finished run keeps its admission cursor even though its
+            # old objective is no longer required by resolve_intent().
+            for row in reversed(rows):
+                data = row_payload(row)
+                if row['role'] not in ('notice', 'assistant') or 'terminal_input_cursor' not in data:
+                    continue
+                cursor = data['terminal_input_cursor']
+                if (type(cursor) is not int or not any(saved['id'] == cursor
+                        and saved['role'] == 'user' and saved['status'] == 'complete'
+                        and saved['id'] < row['id'] for saved in rows)):
+                    raise ContextOverflowError('Terminal run input cursor is invalid or unavailable in this chat.')
+                if latest_user is None or latest_user['id'] <= cursor:
+                    self.status.emit('Stopped · send a new message to continue')
+                    return
+                break
             intent, required, latest_checkpoint = resolve_intent(rows, self.chat_id)
             paused_after = latest_checkpoint.get('last_user_message_id', latest_checkpoint.get('user_message_id')) if latest_checkpoint else 0
             if latest_checkpoint and (latest_user is None or (type(paused_after) is int and latest_user['id'] <= paused_after)):
@@ -373,6 +400,8 @@ class ConversationWorker(QThread):
                 if next((row['id'] for row in reversed(current) if row['role'] == 'user'), None) != input_cursor:
                     raise RunHalted('new_input', 'New user input was saved. This run stopped before another dispatch; review that input before continuing.')
                 return current
+
+            self._check_dispatch = check_run
 
             # A crashed action must not be inferred as safe to replay. Explicit
             # input can ask for reconciliation, but cannot invent its outcome.
@@ -471,9 +500,10 @@ class ConversationWorker(QThread):
                     system = context()
                 raise overflow
 
-            def retrieved_signature(current):
+            def source_signature(current, field='retrieved_ranges'):
                 return json.dumps([{key: item.get(key) for key in
-                    ('path', 'source_sha256', 'extractor_version', 'total_chars', 'retrieved_ranges')}
+                    ('path', 'source_sha256', 'extractor_version', 'total_chars', field,
+                     *(['exposure_observed'] if field == 'exposed_ranges' else []))}
                     for item in evidence_state(current, origin)['files']], sort_keys=True)
 
             batch_retry_used = False
@@ -482,6 +512,7 @@ class ConversationWorker(QThread):
                 # Same worker/token own cancellation and approvals throughout.
                 for round_index in range(10):
                     current = check_run()
+                    prior_exposure = source_signature(current, 'exposed_ranges')
                     messages = packed_messages()
                     exposure = request_exposure(messages, current)
                     self.progress.reserve_request()
@@ -507,9 +538,12 @@ class ConversationWorker(QThread):
                     calls = reply.get('tool_calls') or []
                     response_id = message_id
                     data = {'message': reply, 'pause_context_closed': False,
-                            'continuation': request_record, 'source_exposure': exposure}
+                            'continuation': request_record, 'source_exposure': exposure,
+                            'request_completed': True}
                     self.store.update_message(message_id, draft, payload=data)
                     message_id = None
+                    if prior_exposure != source_signature(self.store.messages(self.chat_id), 'exposed_ranges'):
+                        self.progress.observe_source_exposure()
                     self.changed.emit()
                     if not calls:
                         current = check_run()
@@ -529,7 +563,8 @@ class ConversationWorker(QThread):
                             self.progress.observe('provisional_response', {},
                                 {'error': 'The model ended without resolving incomplete source coverage; no new action or evidence.'}, response_id)
                             continue
-                        data.update(pause_context_closed=True, task_outcome='response_unverified')
+                        data.update(pause_context_closed=True, task_outcome='response_unverified',
+                                    terminal_input_cursor=input_cursor)
                         self.store.update_message(response_id, draft, payload=data)
                         self.changed.emit()
                         self.status.emit('Response saved · task completion is not independently verified')
@@ -556,7 +591,13 @@ class ConversationWorker(QThread):
                             args = json.loads(arguments) if isinstance(arguments, str) else arguments
                         except (json.JSONDecodeError, TypeError):
                             args = None
-                        prior = retrieved_signature(self.store.messages(self.chat_id)) if name == 'read_file' else None
+                        effect_args, identity_error = args, None
+                        if isinstance(args, dict) and not halted and not self.cancel_event.is_set():
+                            try:
+                                effect_args = executor.execution_arguments(name, args)
+                            except (ValueError, OSError, RuntimeError) as error:
+                                identity_error = str(error)
+                        prior = source_signature(self.store.messages(self.chat_id)) if name == 'read_file' else None
                         if halted or self.cancel_event.is_set():
                             result = json.dumps({'error': 'Not executed: this run was stopped before this action.',
                                 'executed': False, 'code': halted.reason if halted else 'cancelled'})
@@ -566,15 +607,30 @@ class ConversationWorker(QThread):
                                 'code': 'tool_batch_limit', 'executed': False})
                         elif not any(definition['function']['name'] == name for definition in tools):
                             result = json.dumps({'denied': 'This tool is disabled. Do not retry or bypass.'})
-                        elif isinstance(args, dict) and self.progress.duplicate_effect(name, args) is not None:
+                        elif identity_error is not None:
+                            result = json.dumps({'error': identity_error, 'executed': False})
+                        elif isinstance(effect_args, dict) and self.progress.duplicate_effect(name, effect_args) is not None:
                             result = json.dumps({'error': 'Repeated action was not executed. Read its saved result instead; no new source change justifies replay.',
                                 'executed': False, 'code': 'duplicate_action',
-                                'result_id': self.progress.duplicate_effect(name, args)})
+                                'result_id': self.progress.duplicate_effect(name, effect_args)})
                         else:
                             self.status.emit('Requested: ' + name)
-                            result = executor.execute(name, args)
+                            self._approval_halted = None
+                            # Use the same normalized execution parameters as
+                            # the replay check; retain rationale/unknown keys so
+                            # approval text and normal validation remain exact.
+                            execution_args = {**args, **effect_args} if isinstance(args, dict) else args
+                            result = executor.execute(name, execution_args)
+                            if self._approval_halted is not None:
+                                halted = self._approval_halted
+                                result = json.dumps({'error': halted.detail,
+                                    'executed': False, 'code': halted.reason})
                         ident = self.save_tool_result(call, args, result)
                         outcome = json.loads(result)
+                        if name == 'run_command' and outcome.get('executed') is True:
+                            # Record the parameters the tool actually used even
+                            # if a cwd alias changed between checking and launch.
+                            effect_args = {key: outcome[key] for key in ('command', 'cwd', 'timeout')}
                         if halted or self.cancel_event.is_set() or oversized:
                             continue
                         if 'denied' in outcome:
@@ -585,8 +641,8 @@ class ConversationWorker(QThread):
                             halted = RunHalted('action_blocker', 'An action failed or was interrupted with effects that need review. Its saved result is evidence, not permission to retry.')
                         else:
                             try:
-                                progress = (prior != retrieved_signature(self.store.messages(self.chat_id))) if name == 'read_file' else None
-                                self.progress.observe(name, args if isinstance(args, dict) else {}, outcome, ident, progress=progress)
+                                progress = (prior != source_signature(self.store.messages(self.chat_id))) if name == 'read_file' else None
+                                self.progress.observe(name, effect_args if isinstance(effect_args, dict) else {}, outcome, ident, progress=progress)
                             except RunHalted as error:
                                 halted = error
                     check_run()
@@ -621,8 +677,11 @@ class ConversationWorker(QThread):
                 if message_id is not None:
                     self.store.update_message(message_id, draft, state)
                 if cancelled:
+                    rows = self.store.messages(self.chat_id)
+                    cursor = next((row['id'] for row in reversed(rows) if row['role'] == 'user'), None)
+                    admission = {'terminal_input_cursor': cursor} if cursor is not None else {}
                     self.store.add_message(self.chat_id, 'notice', 'Stopped. Your conversation is saved.', state,
-                        payload={'pause_context_closed': True, 'continuation': self.run_record()})
+                        payload={'pause_context_closed': True, 'continuation': self.run_record(), **admission})
                     self.changed.emit()
                     self.status.emit('Stopped')
                 else:

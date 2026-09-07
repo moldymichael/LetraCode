@@ -23,8 +23,9 @@ explicit new user input is required after a stop.
 
 The September 7 completion builds on `017fccde46096cef7b00d3de38e1a7bc0b3054ed`
 in `/home/miceoil/Projects/worktrees/active/LetraCode-reliability`, preserving the
-interrupted implementation. Fresh full offscreen verification: **477 passed,
-10 existing Python 3.14 process-fork warnings, 27.05 seconds**, no failures or
+interrupted implementation. After the first independent-review fix round, fresh
+full offscreen verification is **488 passed, 10 existing Python 3.14 process-fork
+warnings, 27.74 seconds**, no failures or
 skips. Source retrieval and exposure in completed requests are tracked
 separately by source version. Partial responses remain provisional and receive
 bounded corrective opportunity. Transcript and Markdown export distinguish
