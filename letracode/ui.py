@@ -21,6 +21,7 @@ from . import __version__
 from .dialogs import ApprovalDialog, LinksDialog, ModelDialog
 from .engine import EngineConfig, LocalEngine
 from .worker import ConversationWorker
+from .store import message_status
 from .strand_ui import MemoryEditorState, StrandDialog
 
 
@@ -552,8 +553,8 @@ class MainWindow(QMainWindow):
             if role == 'tool':
                 payload = json.loads(message['payload']).get('message',{})
                 result = payload.get('content','')
-                state = 'Denied' if '"denied"' in result else 'Error' if '"error"' in result else 'Complete'
-                chunks.append(f'<p><b>Action · {state}</b> — {html.escape(payload.get("name","tool"))} &nbsp; <a href="letracode:action/{message["id"]}">View details</a></p>')
+                state = message_status(message)
+                chunks.append(f'<p><b>Action · {html.escape(state)}</b> — {html.escape(payload.get("name","tool"))} &nbsp; <a href="letracode:action/{message["id"]}">View details</a></p>')
                 if payload.get('name') == 'remember':
                     try:
                         receipt = json.loads(result)
@@ -564,7 +565,8 @@ class MainWindow(QMainWindow):
                         pass
                 continue
             name = {'user':'You','assistant':'LetraCode','notice':'Notice'}.get(role,role)
-            state = '' if message['status']=='complete' else f' · {message["status"]}'
+            status = message_status(message)
+            state = f' · {status}' if status else ''
             chunks.append(f'<hr><p><b>{name}{html.escape(state)}</b></p>')
             text = message['content']
             if role == 'user' or role == 'notice':

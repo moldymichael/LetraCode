@@ -647,3 +647,65 @@ def test_budget_endpoint_has_wall_clock_deadline(fake_server, gguf_model, tmp_pa
         assert not engine.running
     finally:
         engine.stop()
+
+
+@pytest.mark.parametrize('operation', ['completion', 'budget'])
+def test_operation_owns_cancel_watcher_until_teardown_finishes(fake_server, gguf_model, tmp_path, monkeypatch, operation):
+    from threading import Event, Thread
+    import letracode.engine as module
+    engine = make_engine(fake_server, gguf_model, tmp_path / 'data')
+    cancel_started, release, returned = Event(), Event(), Event()
+    cancel = Event()
+    original_cancel = engine.cancel
+
+    def slow_cancel():
+        original_cancel()
+        cancel_started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(engine, 'cancel', slow_cancel)
+    monkeypatch.setattr(module, '_BUDGET_REQUEST_TIMEOUT', 0.15)
+    monkeypatch.setattr(module, '_REQUEST_TIMEOUT', 0.15)
+    outcomes = []
+
+    def run():
+        try:
+            if operation == 'completion':
+                engine.complete([{'role': 'user', 'content': 'drip'}], None, cancel, lambda _: None)
+            else:
+                engine.request_usage([{'role': 'user', 'content': 'budget-drip'}], None, cancel)
+        except (module.EngineError, module.Cancelled) as error:
+            outcomes.append(error)
+        finally:
+            returned.set()
+
+    runner = Thread(target=run)
+    runner.start()
+    try:
+        assert cancel_started.wait(3)
+        assert not returned.wait(0.15), 'Operation returned with a live cancellation watcher'
+    finally:
+        release.set()
+        runner.join(3)
+        engine.stop()
+    assert not runner.is_alive()
+    assert len(outcomes) == 1
+
+
+def test_cancel_after_budgeting_is_reported_as_cancelled_before_generation(fake_server, gguf_model, tmp_path, monkeypatch):
+    from threading import Event
+    from letracode.engine import Cancelled
+    engine = make_engine(fake_server, gguf_model, tmp_path / 'data')
+    count = engine._request_usage
+
+    def cancel_after_count(*args):
+        usage = count(*args)
+        engine.cancel()
+        return usage
+
+    monkeypatch.setattr(engine, '_request_usage', cancel_after_count)
+    try:
+        with pytest.raises(Cancelled):
+            engine.complete([{'role': 'user', 'content': 'plain'}], None, Event(), lambda _: None)
+    finally:
+        engine.stop()

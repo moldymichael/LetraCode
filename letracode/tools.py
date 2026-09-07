@@ -234,6 +234,8 @@ class ToolExecutor:
             following = offset + len(text)
             next_offset = following if following < len(contents) else None
             return {**common, 'offset': offset, 'text': text, 'next_offset': next_offset,
+                    'coverage': {'version': 1, 'representation': 'raw-characters',
+                                 'ranges': [[offset, following]] if text else []},
                     'output_truncated': next_offset is not None,
                     'truncated': next_offset is not None or source['source_truncated']}
         lines = contents.splitlines()
@@ -251,8 +253,12 @@ class ToolExecutor:
                 next_offset = starts[i] + max(0, available - len(prefix))
                 break
         output_truncated = next_offset is not None
+        coverage_start = starts[start - 1] if start <= len(lines) else len(contents)
+        coverage_end = next_offset if next_offset is not None else len(contents)
         return {**common, 'start_line': start, 'total_lines': len(lines),
                 'text': ''.join(parts), 'next_offset': next_offset,
+                'coverage': {'version': 1, 'representation': 'numbered-lines',
+                             'ranges': [[coverage_start, coverage_end]] if coverage_start < coverage_end else []},
                 'output_truncated': output_truncated,
                 'truncated': output_truncated or source['source_truncated']}
 

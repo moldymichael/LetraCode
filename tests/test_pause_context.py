@@ -173,9 +173,10 @@ def test_real_worker_reopen_repeated_pause_and_latest_steering(tmp_path):
         worker = ConversationWorker(store, chat, engine, computer_enabled=False, web_enabled=False)
         worker.approval_needed.connect(lambda _: pytest.fail('Read-only saved evidence must not request approval'))
         worker.run()
-        assert len(engine.requests) == 10
+        assert len(engine.requests) == (5 if cycle == 0 else 4)
         assert all(objective in json.dumps(request) for request in engine.requests)
         checkpoint = json.loads(store.messages(chat)[-1]['payload'])['checkpoint']
+        assert checkpoint['reason'] == 'no_progress'
         assert checkpoint['user_message_id'] == anchor
         assert checkpoint['pause_context']['version'] == 1
         if archived:

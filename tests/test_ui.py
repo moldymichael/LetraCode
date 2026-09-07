@@ -227,3 +227,76 @@ def test_project_deletion_reports_when_missing_memory_could_not_be_archived(tmp_
     assert 'not archived' in w.statusBar().currentMessage().lower()
     assert not store.strand.path('project', project).exists()
     w.close()
+
+
+def test_transcript_and_export_separate_read_success_from_partial_coverage(tmp_path):
+    import threading
+    from letracode.tools import ToolExecutor
+    from letracode.worker import ConversationWorker
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Partial source')
+    store.add_message(chat, 'user', 'Read the entire chapter.')
+    source = tmp_path / 'chapter.txt'
+    source.write_text('Opening. The important ending.')
+    arguments = {'path': str(source), 'offset': 0, 'max_chars': 8}
+    result = ToolExecutor([str(tmp_path)], store.directory, lambda _: False, threading.Event()).execute('read_file', arguments)
+    worker = ConversationWorker(store, chat, None)
+    worker.save_tool_result({'id': 'read', 'function': {'name': 'read_file'}}, arguments, result)
+    store.add_message(chat, 'assistant', 'I read every word and completed the task.', status='incomplete',
+        payload={'task_outcome': 'source_incomplete'})
+    notice = 'Continuing automatically into segment 2; the preceding ten rounds are saved.'
+    store.add_message(chat, 'notice', notice, status='continuing', payload={'segment_boundary': True})
+    window = MainWindow(store)
+    try:
+        window.select_chat(chat)
+        for visible in (window.transcript.toPlainText(), store.export_markdown(chat)):
+            assert 'Action · Executed successfully' in visible
+            assert 'Source coverage partial' in visible
+            assert 'Provisional response · Source coverage incomplete' in visible
+            assert 'Task outcome unverified' in visible
+            assert notice in visible
+            assert 'I read every word and completed the task.' in visible
+    finally:
+        window.close()
+
+
+def test_ordinary_completion_claim_never_becomes_verified_task_status(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Unverified response')
+    # Legacy assistant prose has no application verification authority either.
+    store.add_message(chat, 'assistant', 'The task is complete and fully verified.')
+    window = MainWindow(store)
+    try:
+        window.select_chat(chat)
+        for visible in (window.transcript.toPlainText(), store.export_markdown(chat)):
+            assert 'Response saved · Task outcome unverified' in visible
+            assert 'The task is complete and fully verified.' in visible
+    finally:
+        window.close()
+
+
+def test_command_exit_status_overrides_successful_result_storage_in_ui(tmp_path):
+    import json
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data')
+    chat = store.create_chat('Command results')
+    for ident, result in enumerate([
+        {'executed': True, 'exit_code': 1, 'output': 'check failed', 'timed_out': False, 'cancelled': False, 'output_limit_reached': False},
+        {'executed': True, 'exit_code': 0, 'output': 'The data contains "error" and "denied" strings.', 'timed_out': False, 'cancelled': False, 'output_limit_reached': False},
+        {'error': 'A later action was blocked.', 'executed': False, 'code': 'new_input'},
+        {'output': 'Saved legacy output without a recorded exit status.'},
+    ]):
+        store.add_message(chat, 'tool', json.dumps(result), payload={'message': {
+            'name': 'run_command', 'role': 'tool', 'tool_call_id': str(ident), 'content': json.dumps(result)}})
+    window = MainWindow(store)
+    try:
+        window.select_chat(chat)
+        for visible in (window.transcript.toPlainText(), store.export_markdown(chat)):
+            assert visible.count('Action · Executed successfully') == 1
+            assert 'Action · Failed' in visible
+            assert 'Action · Not executed' in visible
+            assert 'Action · Outcome unknown' in visible
+    finally:
+        window.close()

@@ -115,9 +115,17 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
         if index == 6:
             assert result['exit_code'] == 0 and 'ACCEPTANCE_PASS' in result['output']
             return call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': 5}, str(index))
-        assert index == 7
-        assert result['exit_code'] == 0
-        assert '-    return value' in result['output'] and '+    return min(10, max(0, value))' in result['output']
+        if index == 7:
+            assert result['exit_code'] == 0
+            assert '-    return value' in result['output'] and '+    return min(10, max(0, value))' in result['output']
+            return call('read_file', {'path': str(source), 'offset': 0, 'max_chars': 16000}, str(index))
+        expected_source = original.replace('return value', 'return min(10, max(0, value))')
+        if index == 8:
+            assert result['text'] == expected_source[:16000] and result['next_offset'] == 16000
+            return call('read_file', {'path': str(source), 'offset': 16000, 'max_chars': 16000}, str(index))
+        assert index == 9
+        assert result['text'] == expected_source[16000:] and result['next_offset'] is None
+        assert result['sha256'] == hashlib.sha256(expected_source.encode()).hexdigest()
         return {'role': 'assistant', 'content': 'Acceptance passed after two failed checks. The saved Git diff is ready for review.'}
 
     engine = CodingEngine(reply)
@@ -144,7 +152,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
     assert store.messages(chat)[-1]['content'] == 'Acceptance passed after two failed checks. The saved Git diff is ready for review.'
     assert observed_failures == ['NEGATIVE_BOUNDARY', 'UPPER_BOUNDARY']
     assert approvals == ['command', 'write', 'command', 'write', 'command', 'command']
-    assert len(engine.requests) == 8
+    assert len(engine.requests) == 10  # Include exposure of the complete edited source version.
     assert source.read_text() == original.replace('return value', 'return min(10, max(0, value))')
     saved = store.messages(chat)
     edit_calls = [item for row in saved if row['role'] == 'assistant'
@@ -186,11 +194,8 @@ def test_denied_or_stopped_edit_approval_keeps_source_and_saved_outcome_after_re
                  'old_text': 'return value', 'new_text': 'return max(0, value)'}
 
     def reply(index, messages):
-        if index == 0:
-            return call('edit_file', arguments)
-        assert not stop
-        assert 'denied' in json.loads(messages[-1]['content'])
-        return {'role': 'assistant', 'content': 'The edit was denied; no retry.'}
+        assert index == 0, 'Denied/Stopped actions must not dispatch another request'
+        return call('edit_file', arguments)
 
     engine = CodingEngine(reply)
     worker = ConversationWorker(store, chat, engine, web_enabled=False)
@@ -210,7 +215,7 @@ def test_denied_or_stopped_edit_approval_keeps_source_and_saved_outcome_after_re
     worker.run()
     assert len(approvals) == 1
     assert source.read_bytes() == original
-    assert len(engine.requests) == (1 if stop else 2)
+    assert len(engine.requests) == 1
     rows = store.messages(chat)
     saved = next(row for row in rows if row['role'] == 'tool')
     outcome = json.loads(json.loads(saved['payload'])['message']['content'])

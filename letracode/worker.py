@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import threading
 import time
+import uuid
+from dataclasses import asdict
 
 from PySide6.QtCore import QThread, Signal
 
@@ -12,6 +14,8 @@ from .context import build_context
 from .budgeting import fallback_usage
 from .engine import Cancelled, ContextOverflowError
 from .pause_context import payload as row_payload, resolve_intent
+from .continuation import RunHalted, RunLimits, RunProgress
+from .evidence import evidence_state, request_exposure, source_evidence, summary as evidence_summary
 from .tools import ApprovalRequest, SAVED_READ_TOOLS, TOOL_SCHEMAS, ToolExecutor
 
 
@@ -145,6 +149,16 @@ def conversation_messages(rows, system, budget, *, measure=None):
     for row in rows:
         payload = row_payload(row)
         if row['role'] == 'notice':
+            # A saved application boundary permits older segment history to
+            # yield context space. Authoritative user intent remains required.
+            if payload.get('segment_boundary') is True:
+                boundary = payload.get('checkpoint', {})
+                if (boundary.get('reason') != 'action_round_limit'
+                        or boundary.get('continuation', {}).get('version') != 1):
+                    raise ContextOverflowError('Automatic segment checkpoint is malformed.')
+                if current:
+                    turns.append(current)
+                    current = []
             continue
         if row['role'] == 'user':
             if current:
@@ -230,7 +244,7 @@ class ConversationWorker(QThread):
     status = Signal(str)
     approval_needed = Signal(object)
 
-    def __init__(self, store, chat_id, engine, thinking=False, web_enabled=True, computer_enabled=True, use_tools=True):
+    def __init__(self, store, chat_id, engine, thinking=False, web_enabled=True, computer_enabled=True, use_tools=True, *, limits=None):
         super().__init__()
         self.store, self.chat_id, self.engine = store, chat_id, engine
         self.thinking = thinking
@@ -238,6 +252,13 @@ class ConversationWorker(QThread):
         self.use_tools = use_tools
         self.cancel_event = threading.Event()
         self.pending = None
+        self.limits = limits if limits is not None else RunLimits()
+        self.progress = None
+        self.run_id = uuid.uuid4().hex
+        self.stop_reason = None
+        self._stop_lock = threading.Lock()
+        self._finished = False
+        self._cancel_thread = None
 
     def ask(self, request):
         pending = PendingApproval(request)
@@ -251,13 +272,28 @@ class ConversationWorker(QThread):
         return pending.approved and not self.cancel_event.is_set()
 
     def request_stop(self):
-        self.cancel_event.set()
+        self._cancel('user_stop')
+
+    def _cancel(self, reason):
+        with self._stop_lock:
+            if self._finished:
+                return
+            self.stop_reason = self.stop_reason or reason
+            self.cancel_event.set()
+            # Launch once under the same lock used by finalization. Starting
+            # here ensures run() can always join an already-started thread.
+            if self._cancel_thread is None:
+                self._cancel_thread = threading.Thread(target=self.engine.cancel,
+                    name='letracode-worker-cancel', daemon=True)
+                self._cancel_thread.start()
         if self.pending:
             self.pending.decide(False)
-        # Engine cancellation may wait for subprocess teardown. Never block Qt.
-        threading.Thread(target=self.engine.cancel, daemon=True).start()
 
-    def pause(self, reason, detail, rounds=0):
+    def run_record(self):
+        return {'version': 1, 'run_id': self.run_id, 'limits': asdict(self.limits),
+                **(self.progress.snapshot() if self.progress else {})}
+
+    def pause(self, reason, detail, rounds=0, *, automatic=False):
         rows = self.store.messages(self.chat_id)
         latest_id = next((row['id'] for row in reversed(rows) if row['role'] == 'user'), None)
         try:
@@ -272,25 +308,39 @@ class ConversationWorker(QThread):
         checkpoint = {'reason': reason, 'user_message_id': intent['origin_user_message_id'] if intent else latest_id,
                       'last_user_message_id': latest_id, 'rounds': rounds, 'pause_context': intent,
                       **saved_result_references(rows),
-                      'resume': 'Send a new user message to continue from saved evidence.'}
+                      'continuation': self.run_record(),
+                      'resume': ('Next bounded segment in this active run only.' if automatic else
+                                 'Send a new user message to continue from saved evidence.')}
         self.store.add_message(self.chat_id, 'notice',
-            detail + ' All completed outcomes are saved. Send a new message to continue.',
-            status='paused', payload={'checkpoint': checkpoint})
+            detail + (' Saved evidence carries into the next bounded segment.' if automatic else
+                      ' All completed outcomes are saved. The task is not marked complete.'),
+            status='continuing' if automatic else 'paused',
+            payload={'checkpoint': checkpoint, 'segment_boundary': automatic})
         self.changed.emit()
-        self.status.emit('Paused · progress saved')
+        self.status.emit('Continuing · progress saved' if automatic else 'Paused · progress saved')
 
     def save_tool_result(self, call, args, result):
         name = call.get('function', {}).get('name', '')
         tool_message = {'role': 'tool', 'tool_call_id': call.get('id', ''), 'name': name, 'content': result}
         title = f'{name}\n\nArguments:\n{json.dumps(args, ensure_ascii=False, indent=2)}\n\nResult:\n{result}'
-        ident = self.store.add_message(self.chat_id, 'tool', title, payload={'message': tool_message})
+        data = {'message': tool_message, 'arguments': args}
+        try:
+            data['source_evidence'] = source_evidence(name, json.loads(result))
+        except (TypeError, ValueError) as error:
+            data['source_evidence_error'] = str(error)
+        ident = self.store.add_message(self.chat_id, 'tool', title, payload=data)
         # Legacy rows and a crash between these writes still use their row ID.
-        self.store.update_message(ident, title, payload={'message': tool_message, 'saved_result_id': ident})
+        data['saved_result_id'] = ident
+        self.store.update_message(ident, title, payload=data)
         self.changed.emit()
+        if 'source_evidence_error' in data:
+            raise ValueError('Saved source evidence could not be verified: ' + data['source_evidence_error'])
+        return ident
 
     def run(self):
         message_id, draft = None, ''
         rounds = 0
+        timer = None
         try:
             if self.cancel_event.is_set():
                 raise Cancelled()
@@ -304,6 +354,40 @@ class ConversationWorker(QThread):
             if latest_checkpoint and (latest_user is None or (type(paused_after) is int and latest_user['id'] <= paused_after)):
                 self.status.emit('Paused · send a new message to continue')
                 return
+            if intent is None:
+                return
+            origin = intent['origin_user_message_id']
+            input_cursor = latest_user['id']
+            self.progress = RunProgress(self.limits)
+            timer = threading.Timer(self.limits.max_seconds, lambda: self._cancel('time_budget'))
+            timer.daemon = True
+            timer.start()
+
+            def check_run():
+                if self.cancel_event.is_set():
+                    if self.stop_reason == 'time_budget':
+                        raise RunHalted('time_budget', f'Run reached its {self.limits.max_seconds:g}-second wall limit, including approval wait.')
+                    raise Cancelled()
+                self.progress.check_time()
+                current = self.store.messages(self.chat_id)
+                if next((row['id'] for row in reversed(current) if row['role'] == 'user'), None) != input_cursor:
+                    raise RunHalted('new_input', 'New user input was saved. This run stopped before another dispatch; review that input before continuing.')
+                return current
+
+            # A crashed action must not be inferred as safe to replay. Explicit
+            # input can ask for reconciliation, but cannot invent its outcome.
+            pending = set()
+            for row in rows:
+                if row['id'] < origin:
+                    continue
+                message = row_payload(row).get('message', {})
+                if row['role'] == 'assistant':
+                    pending.update(call.get('id') for call in message.get('tool_calls') or [])
+                elif row['role'] == 'tool':
+                    pending.discard(message.get('tool_call_id'))
+            if pending:
+                raise RunHalted('unknown_outcome', 'A saved action has no recorded outcome. It may have run. Reconcile it before another action; automatic replay is blocked.')
+
             project = self.store.project(chat['project_id']) if chat['project_id'] else None
             roots = self.store.links(chat['project_id']) if project else []
             query = '\n'.join(row['content'] for row in required if row['role'] == 'user')
@@ -321,8 +405,6 @@ class ConversationWorker(QThread):
             if reply_size + 128 >= context_size:
                 raise ContextOverflowError('The reserved reply leaves no room for core instructions and the user request.')
             self.status.emit('Reading fresh Strand and project context…')
-            # Retrieval character allowance only. The formatted request, schemas,
-            # template and reply reservation are all measured below before use.
             retrieval_budget = min(20000, int((context_size - reply_size - 128) * 1.3))
             model_path = getattr(self.engine.config, 'model_path', '')
             provenance = (f'Local model file: {Path(model_path).name if model_path else "not configured"}. '
@@ -341,24 +423,41 @@ class ConversationWorker(QThread):
                     last_usage = fallback_usage(messages, tools or None, reply_size, self.thinking)
                 return last_usage.total_tokens
 
+            def run_context(current):
+                state = evidence_state(current, origin)
+                snapshot = self.progress.snapshot()
+                # Full outcomes remain in the checkpoint and saved result pages.
+                brief = []
+                for item in snapshot['last_outcomes'][-3:]:
+                    brief.append({**item, 'outcome': {key: value for key, value in item['outcome'].items()
+                        if key != 'output_tail'}})
+                return ('\n## Active bounded run (application evidence)\n'
+                    f'Original user message: {origin}; segment {snapshot["segments"]}; '
+                    f'requests {snapshot["requests"]}/{self.limits.max_requests}; '
+                    f'actions {snapshot["actions"]}/{self.limits.max_actions}; '
+                    f'wall limit {self.limits.max_seconds:g}s; consecutive stalls {snapshot["stalls"]}/{self.limits.max_stalls}.\n'
+                    'Ten action rounds form one segment; safe progress continues automatically. '
+                    'This grants no new user permission. Preserve the original question and latest steering. '
+                    'Use saved results, not repeated commands/edits, to recover earlier evidence. '
+                    'A tool-free answer is not proof of task completion. If source coverage is incomplete, '
+                    'retrieve missing pages needed for the original question or explicitly report the limitation; '
+                    'never claim whole-work inspection from partial pages.\n'
+                    + 'Recent action/verification outcomes: ' + json.dumps(brief, ensure_ascii=False)
+                    + '\n' + evidence_summary(state, max_files=3))
+
             def packed_messages():
                 nonlocal retrieval_budget
-                # Commands can mutate files even when they fail, and ordinary
-                # editors can change sources between read-only tool rounds.
-                system = build_context(project, roots if self.computer_enabled else [], query,
-                    retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance,
-                    allow_core_overflow=True)
+                current = check_run()
+                extra = run_context(current)
+                def context():
+                    return build_context(project, roots if self.computer_enabled else [], query,
+                        retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance,
+                        allow_core_overflow=True) + extra
+                system = context()
                 overflow = None
-                # The character allowance only seeds retrieval. Escaping, tools,
-                # template expansion and Unicode can require less evidence.
-                # Rebuild through the context API so identity/project core and
-                # the user request are never sliced to make that evidence fit.
-                # Equal excerpts at adjacent allowances are not a lower bound:
-                # keep halving the finite allowance until zero has been tried.
                 while True:
                     try:
-                        messages, trimmed = conversation_messages(self.store.messages(self.chat_id), system,
-                            context_size, measure=measure)
+                        messages, trimmed = conversation_messages(current, system, context_size, measure=measure)
                         if trimmed or overflow:
                             self.status.emit('Using bounded context; full conversation and tool results remain saved.')
                         if last_usage and 'estimate' in last_usage.method:
@@ -369,84 +468,173 @@ class ConversationWorker(QThread):
                     if retrieval_budget == 0:
                         break
                     retrieval_budget //= 2
-                    candidate = build_context(project, roots if self.computer_enabled else [], query,
-                        retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance,
-                        allow_core_overflow=True)
-                    system = candidate
+                    system = context()
                 raise overflow
 
-            messages = packed_messages()
+            def retrieved_signature(current):
+                return json.dumps([{key: item.get(key) for key in
+                    ('path', 'source_sha256', 'extractor_version', 'total_chars', 'retrieved_ranges')}
+                    for item in evidence_state(current, origin)['files']], sort_keys=True)
+
             batch_retry_used = False
-            for round_index in range(10):
-                if self.cancel_event.is_set():
-                    raise Cancelled()
-                rounds = round_index + 1
-                draft = ''
-                message_id = self.store.add_message(self.chat_id, 'assistant', '', status='streaming')
-                self.changed.emit()
-                last_save = 0.0
-
-                def delta(text):
-                    nonlocal draft, last_save
-                    draft += text
-                    if time.monotonic() - last_save > 0.12:
-                        self.store.update_message(message_id, draft, 'streaming')
-                        self.changed.emit()
-                        last_save = time.monotonic()
-
-                self.status.emit('Thinking locally…' if self.thinking else 'Replying locally…')
-                reply = self.engine.complete(messages, tools or None, self.cancel_event, delta, self.thinking)
-                draft = reply.get('content') or draft
-                calls = reply.get('tool_calls') or []
-                self.store.update_message(message_id, draft, payload={'message': reply,
-                    'pause_context_closed': not bool(calls) and not self.cancel_event.is_set()})
-                message_id = None
-                self.changed.emit()
-                if not calls:
-                    if self.cancel_event.is_set():
-                        raise Cancelled()
-                    self.status.emit('Ready · saved on this computer')
-                    return
-                oversized = len(calls) > 8
-                for call in calls:
-                    function = call.get('function', {})
-                    name = function.get('name', '')
-                    arguments = function.get('arguments', '{}')
-                    try:
-                        args = json.loads(arguments) if isinstance(arguments, str) else arguments
-                    except json.JSONDecodeError:
-                        args = None
-                    if oversized:
-                        result = json.dumps({'error': 'Batch exceeds 8 actions. No action in this batch ran. '
-                            'Request one tool call at a time; inspect already saved evidence before repeating any action.',
-                            'code': 'tool_batch_limit', 'executed': False})
-                    elif not any(definition['function']['name'] == name for definition in tools):
-                        result = json.dumps({'denied': 'This tool is disabled. Do not retry or bypass.'})
-                    else:
-                        self.status.emit('Requested: ' + name)
-                        result = executor.execute(name, args)
-                    self.save_tool_result(call, args, result)
-                if self.cancel_event.is_set():
-                    raise Cancelled()
-                if oversized:
-                    if batch_retry_used:
-                        self.pause('tool_batch_limit', 'Paused after two oversized action batches; neither batch was executed.', rounds)
-                        return
-                    batch_retry_used = True
-                    self.status.emit('Oversized batch saved without execution; requesting one smaller step.')
-                if rounds < 10:
+            while True:
+                # This is a new bounded segment, not an enlarged round loop.
+                # Same worker/token own cancellation and approvals throughout.
+                for round_index in range(10):
+                    current = check_run()
                     messages = packed_messages()
-            self.pause('action_round_limit', 'Paused after 10 action rounds.', rounds)
+                    exposure = request_exposure(messages, current)
+                    self.progress.reserve_request()
+                    rounds = round_index + 1
+                    draft = ''
+                    request_record = self.run_record()
+                    message_id = self.store.add_message(self.chat_id, 'assistant', '', status='streaming',
+                        payload={'continuation': request_record, 'source_exposure_pending': exposure})
+                    self.changed.emit()
+                    last_save = 0.0
+
+                    def delta(text):
+                        nonlocal draft, last_save
+                        draft += text
+                        if time.monotonic() - last_save > 0.12:
+                            self.store.update_message(message_id, draft, 'streaming')
+                            self.changed.emit()
+                            last_save = time.monotonic()
+
+                    self.status.emit('Thinking locally…' if self.thinking else 'Replying locally…')
+                    reply = self.engine.complete(messages, tools or None, self.cancel_event, delta, self.thinking)
+                    draft = reply.get('content') or draft
+                    calls = reply.get('tool_calls') or []
+                    response_id = message_id
+                    data = {'message': reply, 'pause_context_closed': False,
+                            'continuation': request_record, 'source_exposure': exposure}
+                    self.store.update_message(message_id, draft, payload=data)
+                    message_id = None
+                    self.changed.emit()
+                    if not calls:
+                        current = check_run()
+                        coverage = evidence_state(current, origin)
+                        source_work = any(row['id'] >= origin and row['role'] == 'tool'
+                            and row_payload(row).get('message', {}).get('name') in ('read_file', 'search_project')
+                            for row in current)
+                        if source_work and coverage['incomplete']:
+                            data['task_outcome'] = 'source_incomplete'
+                            self.store.update_message(response_id, draft, 'incomplete', payload=data)
+                            self.store.add_message(self.chat_id, 'notice',
+                                'Provisional response: source coverage is incomplete. '
+                                'Any exhaustive-reading claim in the model response is unverified.\n'
+                                + evidence_summary(coverage, max_files=3),
+                                payload={'coverage': coverage, 'task_outcome': 'source_incomplete'})
+                            self.changed.emit()
+                            self.progress.observe('provisional_response', {},
+                                {'error': 'The model ended without resolving incomplete source coverage; no new action or evidence.'}, response_id)
+                            continue
+                        data.update(pause_context_closed=True, task_outcome='response_unverified')
+                        self.store.update_message(response_id, draft, payload=data)
+                        self.changed.emit()
+                        self.status.emit('Response saved · task completion is not independently verified')
+                        return
+
+                    oversized = len(calls) > 8
+                    halted = None
+                    try:
+                        self.progress.reserve_actions(len(calls))
+                    except RunHalted as error:
+                        halted = error
+                    for call in calls:
+                        if halted is None:
+                            try:
+                                check_run()
+                            except RunHalted as error:
+                                halted = error
+                            except Cancelled:
+                                halted = RunHalted('cancelled', 'Stopped before this action.')
+                        function = call.get('function', {})
+                        name = function.get('name', '')
+                        arguments = function.get('arguments', '{}')
+                        try:
+                            args = json.loads(arguments) if isinstance(arguments, str) else arguments
+                        except (json.JSONDecodeError, TypeError):
+                            args = None
+                        prior = retrieved_signature(self.store.messages(self.chat_id)) if name == 'read_file' else None
+                        if halted or self.cancel_event.is_set():
+                            result = json.dumps({'error': 'Not executed: this run was stopped before this action.',
+                                'executed': False, 'code': halted.reason if halted else 'cancelled'})
+                        elif oversized:
+                            result = json.dumps({'error': 'Batch exceeds 8 actions. No action in this batch ran. '
+                                'Request one tool call at a time; inspect already saved evidence before repeating any action.',
+                                'code': 'tool_batch_limit', 'executed': False})
+                        elif not any(definition['function']['name'] == name for definition in tools):
+                            result = json.dumps({'denied': 'This tool is disabled. Do not retry or bypass.'})
+                        elif isinstance(args, dict) and self.progress.duplicate_effect(name, args) is not None:
+                            result = json.dumps({'error': 'Repeated action was not executed. Read its saved result instead; no new source change justifies replay.',
+                                'executed': False, 'code': 'duplicate_action',
+                                'result_id': self.progress.duplicate_effect(name, args)})
+                        else:
+                            self.status.emit('Requested: ' + name)
+                            result = executor.execute(name, args)
+                        ident = self.save_tool_result(call, args, result)
+                        outcome = json.loads(result)
+                        if halted or self.cancel_event.is_set() or oversized:
+                            continue
+                        if 'denied' in outcome:
+                            halted = RunHalted('approval_denied', 'Approval was denied or the tool is disabled. No further action will run; do not bypass this decision.')
+                        elif (outcome.get('timed_out') or outcome.get('cancelled') or
+                              name in ('write_file', 'edit_file', 'run_command', 'remember') and
+                              'error' in outcome and outcome.get('executed') is not False):
+                            halted = RunHalted('action_blocker', 'An action failed or was interrupted with effects that need review. Its saved result is evidence, not permission to retry.')
+                        else:
+                            try:
+                                progress = (prior != retrieved_signature(self.store.messages(self.chat_id))) if name == 'read_file' else None
+                                self.progress.observe(name, args if isinstance(args, dict) else {}, outcome, ident, progress=progress)
+                            except RunHalted as error:
+                                halted = error
+                    check_run()
+                    if halted:
+                        raise halted
+                    if oversized:
+                        if batch_retry_used:
+                            raise RunHalted('tool_batch_limit', 'Paused after two oversized action batches; neither batch was executed.')
+                        batch_retry_used = True
+                        self.status.emit('Oversized batch saved without execution; requesting one smaller step.')
+                check_run()
+                self.progress.next_segment()
+                self.pause('action_round_limit',
+                    f'Continuing automatically into segment {self.progress.segments}; the preceding ten rounds are saved.',
+                    rounds, automatic=True)
         except ContextOverflowError as error:
             if message_id is not None:
                 self.store.update_message(message_id, draft, 'error')
             self.pause('context_limit', str(error), rounds)
+        except RunHalted as error:
+            if message_id is not None:
+                self.store.update_message(message_id, draft, 'interrupted')
+            self.pause(error.reason, error.detail, rounds)
         except Exception as error:
             cancelled = self.cancel_event.is_set() or isinstance(error, Cancelled)
-            state = 'interrupted' if cancelled else 'error'
-            if message_id is not None:
-                self.store.update_message(message_id, draft, state)
-            self.store.add_message(self.chat_id, 'notice', 'Stopped. Your conversation is saved.' if cancelled else str(error), state,
-                                   payload={'pause_context_closed': cancelled})
-            self.changed.emit()
-            self.status.emit('Stopped' if cancelled else 'Could not finish · see message')
+            if cancelled and self.stop_reason == 'time_budget':
+                if message_id is not None:
+                    self.store.update_message(message_id, draft, 'interrupted')
+                self.pause('time_budget', f'Run reached its {self.limits.max_seconds:g}-second wall limit, including approval wait.', rounds)
+            else:
+                state = 'interrupted' if cancelled else 'error'
+                if message_id is not None:
+                    self.store.update_message(message_id, draft, state)
+                if cancelled:
+                    self.store.add_message(self.chat_id, 'notice', 'Stopped. Your conversation is saved.', state,
+                        payload={'pause_context_closed': True, 'continuation': self.run_record()})
+                    self.changed.emit()
+                    self.status.emit('Stopped')
+                else:
+                    self.pause('runtime_error', str(error), rounds)
+                    self.status.emit('Could not finish · see saved blocker')
+        finally:
+            with self._stop_lock:
+                self._finished = True
+            if timer:
+                timer.cancel()
+                timer.join()
+            # Qt remains responsive while this worker owns engine teardown.
+            # Its finished signal must never hand a stale cancel to a new run.
+            if self._cancel_thread is not None:
+                self._cancel_thread.join()

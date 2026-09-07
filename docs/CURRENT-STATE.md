@@ -12,12 +12,30 @@ with Instant/Thinking modes; model roles and platform changes remain decisions.
 
 Existing capabilities include persistent chats/projects/drafts, guarded source
 edits, file hashes, retained recovery inodes, conflict-aware memory saves and
-Undo, runtime token accounting, saved-result paging and supervised continuation.
+Undo, runtime token accounting, saved-result paging and automatic bounded continuation.
 Memory durability is implemented. A durable background task scheduler is not.
-Continuation still requires a new user message after the ten-round pause.
+One worker continues through ten-round segments without synthetic user turns.
+Default run caps are twelve segments, 120 model requests, 240 proposed actions,
+one hour including approval wait, and three consecutive failed/repeated
+non-progress outcomes. Stop, denied/unknown actions, new saved user input and
+exhausted limits halt dispatch. Reopening a checkpoint never restarts work;
+explicit new user input is required after a stop.
 
-The reliability implementation and portable harness are committed locally as
-`12d8436960bacf7eecc3605286593335c83e5b74`. Final application verification is
+The September 7 completion builds on `017fccde46096cef7b00d3de38e1a7bc0b3054ed`
+in `/home/miceoil/Projects/worktrees/active/LetraCode-reliability`, preserving the
+interrupted implementation. Fresh full offscreen verification: **477 passed,
+10 existing Python 3.14 process-fork warnings, 27.05 seconds**, no failures or
+skips. Source retrieval and exposure in completed requests are tracked
+separately by source version. Partial responses remain provisional and receive
+bounded corrective opportunity. Transcript and Markdown export distinguish
+successful execution, incomplete coverage and unverified task outcomes.
+The 27-page synthetic whole-work reading trial spans three segments; the real
+file/process coding fixture spans four, preserving staged and untracked work.
+These scripted engines establish application behavior, not model quality or
+independent task success. Independent review follows the local commit.
+
+The preceding September 6 reliability implementation and portable harness were
+committed locally as `12d8436960bacf7eecc3605286593335c83e5b74`. Its historical verification was
 **385 passed in 19.23 seconds**, plus all **five supplied audit regressions
 passing separately in 0.14 seconds**. The original paused objective, preceding
 referenced context and later steering now survive supervised continuation;
@@ -50,8 +68,10 @@ Current application results and remaining boundaries are recorded in
 [RELIABILITY-VERIFICATION.md](RELIABILITY-VERIFICATION.md). Separate bounded
 real-model trials and their assessed outcomes are in
 [REAL-MODEL-ACCEPTANCE.md](REAL-MODEL-ACCEPTANCE.md); application test passes
-are not model acceptance. The reading harness can record one explicit fixture
-Continue, separately labelled from native human actions and tool approvals.
+are not model acceptance. The reading harness records native automatic segment
+boundaries separately from user turns. An explicit fixture Continue is supported
+only for legacy manual checkpoints, never for a production denial, no-progress
+stop or exhausted run.
 
 Earlier [verification](VERIFICATION.md) and [M1a review](STRAND-M1A-REVIEW.md)
 are historical milestone records, not the current capability specification.

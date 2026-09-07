@@ -235,6 +235,7 @@ class LocalEngine:
         if not self._operation_lock.acquire(blocking=False):
             raise EngineError("A local model completion is already in progress")
         watcher_done = threading.Event()
+        watcher = None
         deadline_expired = threading.Event()
         connection: http.client.HTTPConnection | None = None
         response: http.client.HTTPResponse | None = None
@@ -259,15 +260,17 @@ class LocalEngine:
                 token = self._api_token
                 process = self._process
             if port is None or token is None or process is None:
+                self._raise_if_cancelled(cancel)
                 raise EngineError("The local model server is not running")
 
             deadline = time.monotonic() + _REQUEST_TIMEOUT
-            threading.Thread(
+            watcher = threading.Thread(
                 target=self._watch_external_cancel,
                 args=(cancel, watcher_done, deadline, deadline_expired),
                 name="letracode-engine-cancel",
                 daemon=True,
-            ).start()
+            )
+            watcher.start()
             connection = http.client.HTTPConnection(_HOST, port, timeout=_REQUEST_TIMEOUT)
             with self._state_lock:
                 self._active_connection = connection
@@ -329,6 +332,8 @@ class LocalEngine:
             raise EngineError(f"Local model connection failed: {exc}") from exc
         finally:
             watcher_done.set()
+            if watcher is not None:
+                watcher.join()
             with self._state_lock:
                 if self._active_response is response:
                     self._active_response = None
@@ -431,6 +436,7 @@ class LocalEngine:
         with self._state_lock:
             port, token = self._port, self._api_token
         if port is None or token is None:
+            self._raise_if_cancelled(cancel)
             raise EngineError('The local model server is not running')
         payload = json.dumps(body, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
         if len(payload) > _MAX_REQUEST_BYTES:
@@ -439,9 +445,10 @@ class LocalEngine:
         response = None
         watcher_done, deadline_expired = threading.Event(), threading.Event()
         deadline = time.monotonic() + _BUDGET_REQUEST_TIMEOUT
-        threading.Thread(target=self._watch_external_cancel,
+        watcher = threading.Thread(target=self._watch_external_cancel,
             args=(cancel, watcher_done, deadline, deadline_expired),
-            name='letracode-budget-cancel', daemon=True).start()
+            name='letracode-budget-cancel', daemon=True)
+        watcher.start()
         with self._state_lock:
             self._active_connection = connection
         try:
@@ -476,6 +483,7 @@ class LocalEngine:
             raise EngineError(f'Local model budget connection failed: {exc}') from exc
         finally:
             watcher_done.set()
+            watcher.join()
             with self._state_lock:
                 if self._active_connection is connection:
                     self._active_connection = None

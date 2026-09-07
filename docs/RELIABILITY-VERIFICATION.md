@@ -1,5 +1,156 @@
 # Reliability verification — September 6, 2026
 
+## September 7 automatic bounded continuation completion
+
+The recovered implementation was preserved and completed directly in
+`/home/miceoil/Projects/worktrees/active/LetraCode-reliability`, on
+`codex/strand-reliability`, above `017fccde46096cef7b00d3de38e1a7bc0b3054ed`.
+The sections below this September 7 addition are historical September 6 evidence.
+No live data, model/runtime configuration, installed app, original worktree or
+historical model evidence was changed. No install, training, merge or push was
+performed. Installer tests use disposable simulated destinations.
+
+One cancellable worker owns the run across ten-round segments. Defaults remain
+twelve segments, 120 completion requests, 240 proposed actions, one hour including
+approval wait, and three consecutive failed/repeated non-progress outcomes.
+Reservations precede dispatch. New saved input is fenced before each action in
+a batch; undispatched calls receive paired `executed: false`, `code: new_input`
+results. Denial, unknown effects, Stop and budget exhaustion stop the run. A
+checkpoint is saved evidence, not startup authority. No synthetic user turn is
+inserted by native continuation, and no schema migration was added.
+
+Ordinary-source coverage is keyed by path, hash and extractor version, and counts
+text exposed in completed model requests separately from retrieval. Compacted
+previews and internal search scans earn no full-exposure credit. Saved JSON pages
+can recover old source evidence without replaying actions. A successful modern
+read resolves an earlier failed attempt for the same normalized requested path,
+including a saved alias; historical failures remain visible. Legacy metadata,
+unresolved other paths, a later failed attempt, current-version gaps and truncated
+extraction remain incomplete. Rebuilding history normalizes paths lexically and
+does not follow today's symlinks to reinterpret old source identities.
+
+Stop launches engine cancellation once without blocking Qt. Worker completion
+joins its timer and engine cancellation thread. Completion and token-budget
+operations also join their internal cancellation watchers before releasing
+operation ownership. Cancellation between token counting and generation is
+reported as cancellation rather than a missing server. No stale cancellation
+thread can be handed to the next worker by the finished signal.
+
+Transcript and Markdown export share application status labels: successful
+execution, denied/failed/not-executed/unknown outcomes, partial source retrieval,
+provisional incomplete responses and unverified task outcomes. Ordinary assistant
+completion claims do not grant verified status. Trusted notices remain visible
+and exported. Offscreen transcript/export behavior was tested, and an observer
+window capture was visually checked for readable wrapping. Interactive KDE
+keyboard/dialog behavior was not assessed in this pass.
+
+### Observed regression and final results
+
+All commands ran from the active reliability worktree with system Python
+**3.14.7**, pytest **8.4.2**, PySide6 **6.11.2**, on Linux
+`7.1.13-200.fc44.x86_64`. Initial focused checks used
+`QT_QPA_PLATFORM=offscreen python3 -m pytest -q`; no real model was loaded.
+
+| Check | Observed result |
+| --- | --- |
+| Recovered `tests/test_automatic_review.py`, before production edits | **3 failed in 0.13 s**: batch steering wrote a forbidden file; recovered read used five requests instead of three; old cancellation interrupted a new worker. |
+| Additional cancellation/evidence regressions | Four expected failures, three conservative evidence cases already passed; deterministic completion/budget watcher RED rerun: **2 failed in 0.58 s**. Cancellation after counting separately failed before repair. |
+| New transcript/export behavior, before UI edits | **3 failed in 0.24 s**: absent action-success, partial/provisional and unverified-response labels. Unknown legacy command status also failed before repair. |
+| Worker/pause/UI/evidence focused group after repairs | **103 passed in 8.11 s**. |
+| Observer/UI/engine/review focused group | **67 passed in 15.73 s**. |
+| Coding/compaction/Strand/source/tool focused group | **103 passed in 1.96 s**. |
+| One fresh complete offscreen suite | **477 passed, 10 warnings in 27.05 s**; no failures or skips. |
+| Release/document/installer checks | **9 passed in 1.10 s**. |
+| Compilation, shell syntax, version and whitespace | **48 Python files compiled** without bytecode; shell syntax passed; `LetraCode 0.1.1`; `git diff --check` passed. |
+
+The ten full-suite warnings are the existing Python 3.14 warnings for process
+crash fixtures forking after Qt started threads: four source-file, one store,
+five Strand tests. No new warnings remain. The detailed completion report is
+local controller evidence under `.superpowers/sdd/2026-09-07-automatic-continuation/`;
+it records the individual RED/GREEN commands, fixture rulings and local commit.
+
+The exact full-suite invocation was:
+
+```bash
+set -o pipefail
+export LETRACODE_CHECK_ROOT=/tmp/letracode-continuation-final-BXwLWZ
+mkdir -p "$LETRACODE_CHECK_ROOT"/{runtime,cache,config,data,scratch}
+chmod 700 "$LETRACODE_CHECK_ROOT/runtime"
+export QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1
+export XDG_RUNTIME_DIR="$LETRACODE_CHECK_ROOT/runtime"
+export XDG_CACHE_HOME="$LETRACODE_CHECK_ROOT/cache" XDG_CONFIG_HOME="$LETRACODE_CHECK_ROOT/config"
+export XDG_DATA_HOME="$LETRACODE_CHECK_ROOT/data" TMPDIR="$LETRACODE_CHECK_ROOT/scratch"
+python3 -m pytest -q -p no:cacheprovider --basetemp="$LETRACODE_CHECK_ROOT/full" 2>&1 | tee "$LETRACODE_CHECK_ROOT/full.log"
+```
+
+For a new run, create a new root with `mktemp -d`; pytest clears its basetemp.
+The existing root retains the complete log and disposable fixture evidence.
+Additional verification commands:
+
+```bash
+python3 -B - <<'PY'
+from pathlib import Path
+files = sorted(path for directory in ('letracode', 'tests', 'tools', 'packaging') for path in Path(directory).rglob('*.py'))
+for path in files:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(files)} Python files without writing bytecode')
+PY
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m letracode --version
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q -p no:cacheprovider tests/test_release_docs.py tests/test_install.py
+PYTHONDONTWRITEBYTECODE=1 python3 packaging/build-release.py --output-dir /tmp/letracode-continuation-release-Fo9n2f
+git diff --check
+```
+
+The builder produced `LetraCode-0.1.1.tar.gz` and `LetraCode-0.1.1.run` in a
+fresh temporary directory; neither installer was run. Final documentation is
+packaged again into a separate fresh directory, recorded in the completion
+report. The release test validates linked current/historical documents, scripts
+and exclusion of model/database artifacts.
+
+### Fixture changes and limits
+
+Legacy fixtures were updated only where they encoded superseded behavior:
+denials now terminate before another request; repeated catalogs stop for no
+progress; capped/compacted first-page claims remain provisional; a run-wide
+request limit supplies the saved-history reopen checkpoint; synthetic modern
+source rows now supply the required provenance fields. Compaction tests retain
+their original size, exact saved-body, pairing, all-steering and no-reexecution
+assertions. The coding loop retains its two failing real checks and final diff,
+and adds two reads covering the edited source version before the final answer.
+Its staged and untracked preservation checks remain intact.
+
+The fallback plateau fixture now uses 5200 words for the fitting case because
+mandatory continuation/evidence context increased request size. At 5400 words,
+measured requests were 36345/34137 tokens with optional excerpts and 33605 at
+minimum; 5200 words fits only after optional excerpts are omitted. The 6000-word
+case still exhausts every optional reduction and stops without cutting user or
+core instructions. The legacy acceptance fixture supplies a new source revision
+for its second segment so it exercises a manual checkpoint, not a repeated-read
+stall. Native observer results separate automatic segments, user continuations
+and the explicitly opted-in legacy fixture turn; production stops cannot trigger
+the fixture continuation callback.
+
+The named synthetic whole-work regression reads **27 actual pages from six
+synthetic chapters**, retrieves older saved evidence, crosses two boundaries
+(three segments), and retains the question across **30 requests** with one user
+turn. The bounded coding demonstration crosses three boundaries (four segments)
+in **32 requests**, using 31 real tool actions, two source edits, three actual
+verification invocations with exit codes **1, 1, 0**, final diff and saved failed
+output recovery. Approval callbacks are scripted fixture decisions, not human
+approvals. Stop at a boundary/pending approval, reopen-without-dispatch,
+no-progress cycles and count/time limits are separately exercised.
+
+Grey Area is absent from repository fixtures. These tests did not evaluate the
+user's actual manuscript, local-model reasoning quality or independent task
+completion. Coverage remains bounded ordinary-source evidence, not a whole-work
+inventory, fresh disk verification or understanding score. Historical untracked
+reads can conservatively keep a resumed response provisional. Cancellation
+ownership can delay worker completion while the engine finishes teardown, but
+does not block Qt. Independent review is the controller's next step.
+
+## Historical September 6 record
+
 Implementation branch: `codex/strand-reliability`, isolated at
 `/home/miceoil/Projects/LetraCode-reliability`, based on
 `e57b271753b01210e913a6314bdc715b17190f02`. The older original checkout and all

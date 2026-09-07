@@ -23,6 +23,62 @@ def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
 
 
+def message_status(message):
+    """Share application outcome labels between transcript and Markdown export.
+
+    A complete SQLite row means storage succeeded, not that the task did.
+    Assistant prose never supplies verification or action status.
+    """
+    try:
+        data = json.loads(message.get('payload') or '{}')
+        data = data if isinstance(data, dict) else {}
+        reply = data.get('message') or {}
+        reply = reply if isinstance(reply, dict) else {}
+    except (TypeError, ValueError):
+        data, reply = {}, {}
+    status = message['status']
+    if message['role'] == 'assistant':
+        if data.get('task_outcome') == 'source_incomplete':
+            return 'Provisional response · Source coverage incomplete · Task outcome unverified'
+        if status == 'complete' and not reply.get('tool_calls'):
+            return 'Response saved · Task outcome unverified'
+    if message['role'] == 'tool':
+        if status != 'complete':
+            return 'Outcome unknown · ' + status
+        try:
+            result = json.loads(reply.get('content', ''))
+        except (TypeError, ValueError):
+            return 'Outcome unknown'
+        if not isinstance(result, dict):
+            return 'Outcome unknown'
+        if 'denied' in result:
+            return 'Denied'
+        if result.get('executed') is False:
+            return 'Not executed'
+        if result.get('timed_out') or result.get('cancelled'):
+            return 'Interrupted · effects require review'
+        if reply.get('name') == 'run_command' and 'error' not in result and type(result.get('exit_code')) is not int:
+            return 'Outcome unknown'
+        if 'error' in result or result.get('exit_code', 0) != 0:
+            return 'Failed'
+        label = 'Executed successfully'
+        if reply.get('name') in ('read_file', 'search_project'):
+            from .evidence import source_evidence
+            try:
+                sources = source_evidence(reply['name'], result)
+                if not sources or sources != data.get('source_evidence'):
+                    return label + ' · Source coverage untracked'
+                partial = any(source['source_truncated'] or
+                    sum(end - start for start, end in source['ranges']) < source['total_chars']
+                    for source in sources)
+                label += ' · Source coverage partial' if partial else ' · Supported source text retrieved'
+                label += ' · Retrieval alone does not verify model exposure'
+            except (TypeError, ValueError):
+                label += ' · Source coverage untracked'
+        return label
+    return '' if status == 'complete' else status
+
+
 class Store:
     def __init__(self, directory: Path | None = None):
         self.directory = Path(directory or data_home()).absolute()
@@ -360,7 +416,8 @@ class Store:
         chunks = [f"# {chat['title']}\n"]
         for m in self.messages(chat_id):
             title = {'user':'You', 'assistant':'LetraCode', 'tool':'Action', 'notice':'Notice'}.get(m['role'], m['role'])
-            suffix = '' if m['status'] == 'complete' else f" · {m['status']}"
+            status = message_status(m)
+            suffix = f' · {status}' if status else ''
             chunks.append(f"## {title}{suffix}\n\n{m['content']}\n")
         return '\n'.join(chunks)
 

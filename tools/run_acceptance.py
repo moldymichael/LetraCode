@@ -355,6 +355,7 @@ def run_native(fixture, config, budget, recorder):
             self.finished_report = False
             self.stop_reason = None
             self.fixture_continuation_used = False
+            self.observed_boundaries = set()
             super().__init__(store)
 
         def capture(self):
@@ -362,6 +363,11 @@ def run_native(fixture, config, budget, recorder):
                 if self.observed_rows.get(row['id']) != row:
                     self.observed_rows[row['id']] = row
                     recorder.event('saved_row', row=row)
+                data = json.loads(row['payload'])
+                if data.get('segment_boundary') is True and row['id'] not in self.observed_boundaries:
+                    self.observed_boundaries.add(row['id'])
+                    recorder.event('segment_boundary', row_id=row['id'],
+                                   continuation=data['checkpoint']['continuation'])
 
         def start_worker(self):
             if budget.turns >= budget.max_turns or budget.requests >= budget.max_requests:
@@ -408,6 +414,12 @@ def run_native(fixture, config, budget, recorder):
             if self.stop_reason:
                 self.finish_trial(self.stop_reason)
                 return
+            checkpoint = json.loads(rows[-1]['payload']).get('checkpoint', {}) if rows else {}
+            legacy_pause = (paused and checkpoint.get('reason') == 'action_round_limit'
+                            and 'continuation' not in checkpoint)
+            if (paused and not legacy_pause) or (rows and rows[-1]['status'] == 'interrupted'):
+                self.finish_trial('application_stopped')
+                return
             if paused and budget.turns < budget.max_turns and budget.requests < budget.max_requests:
                 self.composer.setPlainText(fixture['continuation'])
                 if fixture.get('fixture_continuation') and not self.fixture_continuation_used:
@@ -423,7 +435,13 @@ def run_native(fixture, config, budget, recorder):
                 self.finish_trial('paused_budget_exhausted' if paused else 'worker_finished')
 
         def send_fixture_continuation(self, paused_message_id):
-            if self.finished_report or self.worker or self.fixture_continuation_used:
+            if self.finished_report or self.worker or self.fixture_continuation_used or self.stop_reason:
+                return
+            rows = self.store.messages(self.chat_id)
+            if not rows or rows[-1]['id'] != paused_message_id or rows[-1]['status'] != 'paused':
+                return
+            checkpoint = json.loads(rows[-1]['payload']).get('checkpoint', {})
+            if checkpoint.get('reason') != 'action_round_limit' or 'continuation' in checkpoint:
                 return
             if (budget.turns >= budget.max_turns or budget.requests >= budget.max_requests
                     or time.monotonic() - budget.started >= budget.max_seconds):
@@ -442,14 +460,27 @@ def run_native(fixture, config, budget, recorder):
             root = Path(fixture['root'])
             rows = self.store.messages(self.chat_id)
             self.capture()
+            runs = {}
+            for row in rows:
+                data = json.loads(row['payload'])
+                progress = data.get('continuation') or data.get('checkpoint', {}).get('continuation')
+                if isinstance(progress, dict) and progress.get('version') == 1 and progress.get('run_id'):
+                    runs[progress['run_id']] = progress
+            user_turns = sum(row['role'] == 'user' for row in rows)
+            automatic = bool(self.observed_boundaries)
             final = {'evidence_kind':recorder.evidence_kind, 'outcome':outcome,
                      'acceptance_passed':None, 'assessment':'Requires independent evidence review; worker completion alone is not acceptance',
                      'budget':dataclasses.asdict(budget), 'elapsed_seconds':time.monotonic() - budget.started,
                      'rows':rows, 'engine_stopped':not self.engine.running,
                      'pause_exercised':any(row['status'] == 'paused' for row in rows),
-                     'continuation_exercised':budget.turns > 1,
+                     'user_turns':user_turns,
+                     'application_progress':{'segment_boundaries':len(self.observed_boundaries), 'runs':list(runs.values())},
+                     'continuation_exercised':automatic or user_turns > 1,
+                     'automatic_continuation_exercised':automatic,
+                     'user_continuation_exercised':user_turns > 1 + int(self.fixture_continuation_used),
                      'fixture_continuation_exercised':self.fixture_continuation_used,
-                     'continuation_policy':'One fixture-operator continuation, then manual' if fixture.get('fixture_continuation') else 'Manual'}
+                     'continuation_policy':'Native bounded automatic segments; production stops require new user input. '
+                        + ('One opt-in fixture turn for a legacy manual checkpoint only.' if fixture.get('fixture_continuation') else 'No fixture user turns.')}
             with recorder.lock:
                 final['measurements'] = summarize_events(root / 'events.jsonl')
             if fixture['case'] == 'coding':

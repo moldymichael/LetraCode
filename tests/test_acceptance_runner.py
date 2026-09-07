@@ -172,13 +172,16 @@ def test_unbounded_trial_is_rejected(value):
         runner.Budget(max_seconds=value)
 
 
-def test_scripted_pause_does_not_send_continuation_automatically(tmp_path, monkeypatch):
+@pytest.mark.parametrize('opt_in', [False, True])
+@pytest.mark.parametrize('blocked', ['repeated_read', 'denied_read'])
+def test_production_stop_never_sends_fixture_continuation(tmp_path, monkeypatch, opt_in, blocked):
     import os
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     from letracode.engine import EngineConfig, LocalEngine
     from letracode.budgeting import RequestUsage
     fixture = runner.prepare_fixture(tmp_path / 'trial', 'reading', repository(tmp_path))
-    path = str(Path(fixture['linked_root']) / 'chapter-01.txt')
+    fixture['fixture_continuation'] = opt_in
+    path = str(Path(fixture['linked_root']) / 'chapter-01.txt') if blocked == 'repeated_read' else fixture['answer_key']
     monkeypatch.setattr(LocalEngine, 'start', lambda *args: None)
     monkeypatch.setattr(LocalEngine, 'request_usage', lambda *args: RequestUsage(500, 100, 128, 'scripted'))
     counter = 0
@@ -195,19 +198,86 @@ def test_scripted_pause_does_not_send_continuation_automatically(tmp_path, monke
     assert result['pause_exercised'] is True
     assert result['continuation_exercised'] is False
     assert len([row for row in result['rows'] if row['role'] == 'user']) == 1
-    assert result['budget']['requests'] == 10
-    assert result['outcome'] == 'wall_time_budget_exhausted'
+    assert result['budget']['requests'] == (4 if blocked == 'repeated_read' else 1)
+    assert result['outcome'] == 'application_stopped'
+    assert not result['fixture_continuation_exercised']
+    assert not result['automatic_continuation_exercised']
+    events = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+    assert not any(item['kind'] == 'fixture_continuation' for item in events)
 
 
-@pytest.mark.parametrize('finish_after_resume', [True, False])
-def test_opted_in_reading_fixture_continues_once_with_distinct_origin(tmp_path, monkeypatch, finish_after_resume):
+def test_native_automatic_segments_keep_one_worker_and_one_user_turn(tmp_path, monkeypatch):
     import os
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
     from letracode.engine import EngineConfig, LocalEngine
     from letracode.budgeting import RequestUsage
     fixture = runner.prepare_fixture(tmp_path / 'trial', 'reading', repository(tmp_path))
+    pages = [(path, offset) for path in sorted(Path(fixture['linked_root']).glob('chapter-*.txt'))
+             for offset in range(0, len(path.read_text()), 2000)]
+    assert len(pages) > 20
+    starts, requests = [], []
+    monkeypatch.setattr(LocalEngine, 'start', lambda *args: starts.append(True))
+    monkeypatch.setattr(LocalEngine, 'request_usage', lambda *args: RequestUsage(500, 100, 128, 'scripted'))
+    def scripted(self, messages, tools, cancel, on_delta, thinking=False):
+        requests.append(messages)
+        assert any(message['role'] == 'user' and message['content'] == fixture['prompt'] for message in messages)
+        index = len(requests) - 1
+        if index == len(pages):
+            return {'role':'assistant', 'content':'Scripted full-source traversal; independent acceptance remains unverified.'}
+        path, offset = pages[index]
+        return {'role':'assistant','content':'', 'tool_calls':[{'id':f'page-{index}', 'type':'function',
+            'function':{'name':'read_file','arguments':json.dumps({'path':str(path),'offset':offset,'max_chars':2000})}}]}
+    monkeypatch.setattr(LocalEngine, 'complete', scripted)
+    root = Path(fixture['root'])
+    runner.run_native(fixture, EngineConfig(executable='/scripted/runtime', model_path='/scripted/model.gguf'),
+                      runner.Budget(max_seconds=15), runner.Recorder(root, evidence_kind='scripted-engine-test'))
+    result = json.loads((root / 'result.json').read_text())
+    assert len(starts) == 1
+    assert result['budget']['turns'] == 1 and result['user_turns'] == 1
+    assert result['budget']['requests'] == len(pages) + 1
+    assert result['automatic_continuation_exercised'] and result['continuation_exercised']
+    assert not result['fixture_continuation_exercised'] and not result['user_continuation_exercised']
+    progress = result['application_progress']
+    assert progress['segment_boundaries'] == len(pages) // 10
+    assert len(progress['runs']) == 1
+    assert progress['runs'][0]['segments'] == 1 + len(pages) // 10
+    assert progress['runs'][0]['actions'] == len(pages)
+    assert progress['runs'][0]['requests'] == len(pages) + 1
+    assert result['outcome'] == 'worker_finished' and result['engine_stopped']
+    events = [json.loads(line) for line in (root / 'events.jsonl').read_text().splitlines()]
+    boundaries = [item for item in events if item['kind'] == 'segment_boundary']
+    assert len(boundaries) == progress['segment_boundaries']
+    assert len({item['row_id'] for item in boundaries}) == len(boundaries)
+    assert all(item['continuation']['run_id'] == progress['runs'][0]['run_id'] for item in boundaries)
+    assert sum(item['kind'] == 'turn_started' for item in events) == 1
+    assert not any(item['kind'] in ('fixture_continuation', 'approval_requested') for item in events)
+
+
+@pytest.mark.parametrize('finish_after_resume', [True, False])
+def test_opted_in_legacy_fixture_continues_once_with_distinct_origin(tmp_path, monkeypatch, finish_after_resume):
+    import os
+    os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
+    from letracode.engine import EngineConfig, LocalEngine
+    from letracode.budgeting import RequestUsage
+    from letracode.continuation import RunLimits
+    from letracode.worker import ConversationWorker
+    import letracode.ui as ui
+    class ScriptedLegacyWorker(ConversationWorker):
+        """Only this test recreates an archived manual ten-round checkpoint."""
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, limits=RunLimits(max_segments=1), **kwargs)
+        def run(self):
+            super().run()
+            row = self.store.messages(self.chat_id)[-1]
+            data = json.loads(row['payload'])
+            if data.get('checkpoint', {}).get('reason') == 'segment_budget':
+                data['checkpoint'].pop('continuation')
+                data['checkpoint']['reason'] = 'action_round_limit'
+                self.store.update_message(row['id'], 'Scripted legacy manual ten-round pause.', 'paused', payload=data)
+    monkeypatch.setattr(ui, 'ConversationWorker', ScriptedLegacyWorker)
+    fixture = runner.prepare_fixture(tmp_path / 'trial', 'reading', repository(tmp_path))
     fixture['fixture_continuation'] = True
-    path = str(Path(fixture['linked_root']) / 'chapter-01.txt')
+    paths = [path for path in sorted(Path(fixture['linked_root']).glob('chapter-*.txt')) if path.name != 'chapter-02.txt'][:10]
     monkeypatch.setattr(LocalEngine, 'start', lambda *args: None)
     monkeypatch.setattr(LocalEngine, 'request_usage', lambda *args: RequestUsage(500, 100, 128, 'scripted'))
     counter = 0
@@ -216,8 +286,13 @@ def test_opted_in_reading_fixture_continues_once_with_distinct_origin(tmp_path, 
         counter += 1
         if counter > 10 and finish_after_resume:
             return {'role':'assistant', 'content':'Scripted completion after fixture continuation.'}
+        if counter == 11:
+            # The second legacy segment must observe new evidence, otherwise
+            # the production no-progress rule correctly stops repeated reads.
+            for path in paths:
+                path.write_text(path.read_text() + '\nExternal fixture revision for the second legacy segment.\n')
         return {'role':'assistant','content':'', 'tool_calls':[{'id':f'call-{counter}',
-            'type':'function', 'function':{'name':'read_file','arguments':json.dumps({'path':path})}}]}
+            'type':'function', 'function':{'name':'read_file','arguments':json.dumps({'path':str(paths[(counter - 1) % 10])})}}]}
     monkeypatch.setattr(LocalEngine, 'complete', scripted)
     root = Path(fixture['root'])
     runner.run_native(fixture, EngineConfig(executable='/scripted/runtime', model_path='/scripted/model.gguf'),

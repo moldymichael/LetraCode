@@ -29,7 +29,7 @@ class ScriptedEngine:
         pass
 
 
-def test_worker_routes_denial_to_model_and_persists_turn(tmp_path):
+def test_worker_saves_denial_and_stops_without_another_model_request(tmp_path):
     s = Store(tmp_path / 'data')
     c = s.create_chat('Tools')
     s.add_message(c,'user','Try the action')
@@ -38,8 +38,9 @@ def test_worker_routes_denial_to_model_and_persists_turn(tmp_path):
     w.run()
     messages = s.messages(c)
     assert any(m['role']=='tool' and 'denied' in m['content'].lower() for m in messages)
-    assert messages[-1]['content'] == 'The action was denied. No file was changed.'
-    assert messages[-1]['status'] == 'complete'
+    assert messages[-1]['status'] == 'paused'
+    assert json.loads(messages[-1]['payload'])['checkpoint']['reason'] == 'approval_denied'
+    assert sum(message['role'] == 'assistant' for message in messages) == 1
 
 
 def test_cancelled_worker_keeps_user_message(tmp_path):
@@ -116,6 +117,7 @@ def test_excess_batch_allows_one_smaller_correction(tmp_path):
                     'name':'read_file','arguments':json.dumps({'path':str(path)})}} for i in range(count)]}
     store,chat,paths=linked_reading_chat(tmp_path,1)
     path=paths[0]
+    path.write_text('Complete source for the batch-correction fixture.')
     engine=Corrected()
     engine.config=type('Config', (), {'context_size':32768, 'max_tokens':1024})()
     ConversationWorker(store,chat,engine).run()
@@ -150,7 +152,7 @@ class ReadingEngine(ScriptedEngine):
     def complete(self, messages, tools, cancel, on_delta, thinking=False):
         self.requests.append(copy.deepcopy(messages))
         index = len(self.requests) - 1
-        if index == len(self.batches):
+        if index >= len(self.batches):
             return {'role':'assistant', 'content':'Finished reading the requested files.'}
         return {'role':'assistant', 'content':f'Reading batch {index + 1}.', 'tool_calls':[
             {'id':f'read_{index}_{item}', 'type':'function', 'function':{
@@ -185,10 +187,14 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
     worker.run()
 
     rows = store.messages(chat)
-    assert rows[-1]['content'] == 'Finished reading the requested files.'
-    assert rows[-1]['status'] == 'complete'
+    # These capped/compacted first pages never exposed the entire sources.
+    # Keep the scripted claim, label it provisional, then stop the stall loop.
+    assert rows[-1]['status'] == 'paused'
+    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'no_progress'
+    claims = [row for row in rows if row['content'] == 'Finished reading the requested files.']
+    assert len(claims) == 3 and all(row['status'] == 'incomplete' for row in claims)
     assert not any(row['status'] == 'error' for row in rows)
-    assert len(engine.requests) == 9
+    assert len(engine.requests) == 11
     assert engine.config.context_size == 32768
     for request in engine.requests:
         # Existing 32768-context / 3072-reply character allowance: 57392.
@@ -211,7 +217,7 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
                 assert outcomes[-1]['context_preview']
     assert len(json.loads(engine.requests[1][-1]['content'])['text']) == 16000
     assert any(json.loads(m['content']).get('context_truncated')
-               for m in engine.requests[-1] if m['role'] == 'tool')
+               for m in engine.requests[8] if m['role'] == 'tool')
 
     saved_tools = [row for row in rows if row['role'] == 'tool']
     assert len(saved_tools) == len(paths)
@@ -236,9 +242,11 @@ def test_single_oversized_read_keeps_a_marked_preview_and_full_saved_result(tmp_
     engine = ReadingEngine([paths], context_size=8192, max_tokens=1024)
     ConversationWorker(store, chat, engine).run()
     rows = store.messages(chat)
-    assert rows[-1]['content'] == 'Finished reading the requested files.'
-    assert len(engine.requests) == 2
-    request = engine.requests[-1]
+    assert rows[-1]['status'] == 'paused'
+    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'no_progress'
+    assert sum(row['status'] == 'incomplete' for row in rows) == 3
+    assert len(engine.requests) == 4
+    request = engine.requests[1]
     assert len(json.dumps(request, ensure_ascii=False)) <= 12336
     assert_paired_tools(request)
     shortened = json.loads(request[-1]['content'])
@@ -297,28 +305,30 @@ def test_context_packing_never_shortens_an_oversized_user_prompt(tmp_path):
     assert store.messages(chat)[0]['content'] == prompt
 
 
-def test_action_round_pause_resumes_from_saved_history_without_reexecution(tmp_path):
+def test_run_limit_reopens_from_saved_history_without_reexecution(tmp_path):
+    from letracode.continuation import RunLimits
     class Endless(ScriptedEngine):
         requests=0
         def complete(self, messages, *args, **kwargs):
             self.requests+=1
-            return {'role':'assistant','content':'Inspect missing source','tool_calls':[{
+            return {'role':'assistant','content':'Inspect one source character','tool_calls':[{
                 'id':str(self.requests),'type':'function','function':{
-                    'name':'read_file','arguments':json.dumps({'path':str(path)})}}]}
-    store=Store(tmp_path/'data'); chat=store.create_chat('Pause')
-    path=tmp_path/'missing.txt'
+                    'name':'read_file','arguments':json.dumps({'path':str(path), 'offset':self.requests - 1, 'max_chars':1})}}]}
+    store,chat,paths=linked_reading_chat(tmp_path,1)
+    path=paths[0]; path.write_text('0123456789')
     engine=Endless()
-    store.add_message(chat,'user','Inspect')
-    worker=ConversationWorker(store,chat,engine)
+    engine.config=type('Config', (), {'context_size':16384, 'max_tokens':1024})()
+    worker=ConversationWorker(store,chat,engine,limits=RunLimits(max_requests=10))
     worker.approval_needed.connect(lambda pending: pending.decide(False))
     worker.run()
     rows=store.messages(chat)
     assert engine.requests==10
     assert rows[-1]['status']=='paused'
     checkpoint=json.loads(rows[-1]['payload'])['checkpoint']
-    assert checkpoint['reason']=='action_round_limit'
+    assert checkpoint['reason']=='request_budget'
     assert len(checkpoint['saved_result_ids'])==10
     class Resume(ScriptedEngine):
+        config=type('Config', (), {'context_size':16384, 'max_tokens':1024})()
         def complete(self,messages,*args,**kwargs):
             assert_paired_tools(messages)
             assert 'saved' in messages[0]['content'].lower()
@@ -342,7 +352,8 @@ def test_repeated_pause_compaction_keeps_earlier_saved_references(tmp_path):
         store.add_message(chat, 'assistant', '', payload={'message': {
             'role': 'assistant', 'content': '', 'tool_calls': [call]}})
         worker = ConversationWorker(store, chat, ScriptedEngine())
-        worker.save_tool_result(call, {}, json.dumps({'path': f'/synthetic/{cycle}', 'text': 'saved evidence'}))
+        worker.save_tool_result(call, {}, json.dumps({'path': f'/synthetic/{cycle}', 'text': 'saved evidence',
+            'offset':0, 'total_chars':14, 'editable':True, 'sha256':'a' * 64, 'source_truncated':False}))
         evidence_ids.append(store.messages(chat)[-1]['id'])
         store.add_message(chat, 'assistant', 'Previous working notes. ' * 300)
         worker.pause('action_round_limit', 'Paused with saved evidence.', 10)
@@ -427,8 +438,10 @@ def test_many_pauses_recover_old_result_from_bounded_catalog_after_reopen(tmp_pa
             elif self.requests == 2:
                 result_id = json.loads(messages[-1]['content'])['results'][0]['result_id']
                 name, arguments = 'read_tool_result', {'result_id': result_id}
-            else:
+            elif self.requests == 3:
                 assert json.loads(messages[-1]['content'])['content'] == original
+                return {'role': 'assistant', 'content': 'Recovered ARCHIVED-DELTA-41; command exited 7.'}
+            else:
                 return {'role': 'assistant', 'content': 'Recovered ARCHIVED-DELTA-41; command exited 7.'}
             return {'role': 'assistant', 'content': '', 'tool_calls': [{
                 'id': f'recover_{self.requests}', 'type': 'function', 'function': {
@@ -437,8 +450,10 @@ def test_many_pauses_recover_old_result_from_bounded_catalog_after_reopen(tmp_pa
     engine = DiscoverSaved()
     ConversationWorker(reopened, chat, engine, computer_enabled=False, web_enabled=False).run()
     after = reopened.messages(chat)
-    assert after[-1]['content'] == 'Recovered ARCHIVED-DELTA-41; command exited 7.'
-    assert engine.requests == 3
+    claims = [row for row in after[len(before):] if row['content'] == 'Recovered ARCHIVED-DELTA-41; command exited 7.']
+    assert len(claims) == 3 and all(row['status'] == 'incomplete' for row in claims)
+    assert json.loads(after[-1]['payload'])['checkpoint']['reason'] == 'no_progress'
+    assert engine.requests == 5  # Historical failed reads remain explicitly incomplete.
     assert [json.loads(row['payload'])['message']['name'] for row in after[len(before):] if row['role'] == 'tool'] == [
         'list_tool_results', 'read_tool_result']
     assert reopened.tool_result_page(chat, expected[0])['content'] == original
@@ -528,7 +543,7 @@ def test_compacted_receipts_reference_saved_result_without_protocol_metadata(tmp
     engine=ReadingEngine([paths],context_size=8192,max_tokens=1024)
     ConversationWorker(store,chat,engine).run()
     row=next(row for row in store.messages(chat) if row['role']=='tool')
-    receipt=json.loads(engine.requests[-1][-1]['content'])
+    receipt=json.loads(engine.requests[1][-1]['content'])
     assert receipt['result_id']==row['id']
     assert 'read_tool_result' in receipt['context_note']
     assert all('saved_result_id' not in message for request in engine.requests for message in request)
@@ -763,7 +778,10 @@ def test_runtime_count_pauses_truly_oversized_core_without_truncation(tmp_path):
     assert json.loads(rows[-1]['payload'])['checkpoint']['reason']=='context_limit'
 
 
-@pytest.mark.parametrize('word_count,should_fit', [(5400, True), (6000, False)])
+# The application run/evidence instructions now occupy mandatory context. At
+# 5400 words the measured minimal request is 33605 tokens; 5200 words leaves
+# only enough room after optional excerpts are omitted, still below 32768.
+@pytest.mark.parametrize('word_count,should_fit', [(5200, True), (6000, False)])
 def test_fallback_budget_crosses_optional_context_plateau_without_cutting_core_or_user(
     tmp_path, monkeypatch, word_count, should_fit,
 ):
