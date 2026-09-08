@@ -24,8 +24,10 @@ across supported versions. Read snapshots refuse a conflicting open writer;
 retained recovery files still detect edits after a save.
 
 Windows data and guarded editable files must be on a local drive. UNC/network
-shares, device paths, junctions and symbolic links are refused by guarded
-storage. File data and recovery records are flushed. Windows has no supported
+shares, device paths, junctions, symbolic links and directories explicitly
+configured for case-sensitive Windows filenames are refused by guarded storage.
+Read-only files must be made writable before saving. File data and recovery
+records are flushed. Windows has no supported
 unprivileged equivalent of Linux directory fsync, so power-loss durability of
 directory entries follows Windows/filesystem guarantees. Existing collision,
 interruption and recovery checks remain in place.

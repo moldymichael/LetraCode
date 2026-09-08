@@ -326,6 +326,12 @@ class LocalEngine:
                 raise Cancelled("Local model completion was cancelled") from exc
             with self._state_lock:
                 process = self._process
+            if process is not None and process.poll() is None:
+                # A socket reset can precede Windows process-exit notification.
+                try:
+                    process.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
             if process is not None and process.poll() is not None:
                 raise EngineError(
                     f"The local model server exited during completion (code {process.returncode})"

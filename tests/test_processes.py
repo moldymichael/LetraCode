@@ -85,7 +85,12 @@ def test_frozen_launcher_restores_app_dll_search_and_child_uses_system_search(tm
         assert kernel.SetDllDirectoryW(str(bundled))
         monkeypatch.setattr(sys, 'frozen', True, raising=False)
         process = start_process([sys.executable, '-c',
-            'import ctypes; print(ctypes.windll.kernel32.GetDllDirectoryW(0, None))'], stdout=subprocess.PIPE)
+            'import ctypes; from ctypes import wintypes; '
+            'get_path = ctypes.windll.kernel32.GetDllDirectoryW; '
+            'get_path.argtypes = [wintypes.DWORD, wintypes.LPWSTR]; '
+            'get_path.restype = wintypes.DWORD; '
+            'value = ctypes.create_unicode_buffer(32768); '
+            'get_path(len(value), value); print(len(value.value))'], stdout=subprocess.PIPE)
         output, _ = process.communicate(timeout=10)
         assert output.strip() == b'0'
         assert current() == str(bundled)

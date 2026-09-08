@@ -27,6 +27,23 @@ from .strand import (StrandFiles, MAX_FILE_BYTES, MAX_RECEIPT_BYTES, backup_tree
 _UNREVIEWED_IDENTITY = object()
 
 
+def _same_path(left, right):
+    if left is None or right is None:
+        return left == right
+    return fs.windows_path_equal(left, right) if fs.IS_WINDOWS else left == right
+
+
+def _under_path(path, parent):
+    parts, prefix = path.split('/'), parent.split('/')
+    return len(parts) > len(prefix) and all(_same_path(a, b) for a, b in zip(parts, prefix))
+
+
+def _relocated_path(path, source, destination):
+    # Slice components, never case-mapped strings: retain each child's spelling.
+    suffix = path.split('/')[len(source.split('/')):]
+    return '/'.join([destination, *suffix])
+
+
 class MemoryFiles(StrandFiles):
     def __init__(self, root, *, legacy=False, initialize=True, migration_locked=False):
         self.root = Path(root).absolute()
@@ -102,7 +119,7 @@ class MemoryFiles(StrandFiles):
     def _storage(self, relative, project_id=None, *, empty=False):
         relative = self._relative(relative, empty=empty)
         self._project(project_id)
-        if project_id is None and (relative == 'memory/projects' or relative.startswith('memory/projects/')):
+        if project_id is None and (_same_path(relative, 'memory/projects') or _under_path(relative, 'memory/projects')):
             raise ValueError('Legacy project storage is outside shared Memory scope')
         return (f'.projects/{project_id}/' if project_id else '') + relative
 
@@ -126,15 +143,15 @@ class MemoryFiles(StrandFiles):
             return
         if project_id is not None:
             prefix = f'.projects/{project_id}'
-            if tree and relative == prefix:
+            if tree and _same_path(relative, prefix):
                 return
-            if relative == f'memory/projects/{project_id}.md':
+            if _same_path(relative, f'memory/projects/{project_id}.md'):
                 return
-            if not relative.startswith(prefix + '/'):
+            if not _under_path(relative, prefix):
                 raise ValueError('Memory path crosses project ownership')
             relative = relative[len(prefix) + 1:]
         self._relative(relative)
-        if project_id is None and (relative == 'memory/projects' or relative.startswith('memory/projects/')):
+        if project_id is None and (_same_path(relative, 'memory/projects') or _under_path(relative, 'memory/projects')):
             raise ValueError('Legacy project files are outside shared Memory')
         if not tree and Path(relative).suffix.lower() not in ('.md', '.txt', '.markdown'):
             raise ValueError('Registry file is not Markdown or text')
@@ -173,8 +190,8 @@ class MemoryFiles(StrandFiles):
                     raise ValueError('Duplicate Memory legacy alias')
                 aliases.add(alias)
             if not row['deleted']:
-                destination = row['path'].casefold() if fs.IS_WINDOWS else row['path']
-                if destination in destinations:
+                destination = row['path']
+                if (any(_same_path(destination, prior) for prior in destinations) if fs.IS_WINDOWS else destination in destinations):
                     raise ValueError('Duplicate live Memory destination')
                 destinations.add(destination)
 
@@ -303,7 +320,7 @@ class MemoryFiles(StrandFiles):
         storage = self._storage(relative, project_id)
         meta, raw = self._metadata()
         found = [(ident, row) for ident, row in meta['files'].items()
-                 if (row['path'].casefold() == storage.casefold() if fs.IS_WINDOWS else row['path'] == storage)
+                 if _same_path(row['path'], storage)
                  and row.get('project_id') == project_id and not row.get('deleted')]
         if len(found) > 1:
             raise ValueError('Conflicting Memory file identities')
@@ -332,7 +349,7 @@ class MemoryFiles(StrandFiles):
         storage = self._storage(relative, project_id)
         meta, _ = self._metadata()
         return next((row.get('legacy_scope') for row in meta['files'].values()
-                     if row['path'] == storage and row.get('project_id') == project_id), None)
+                     if _same_path(row['path'], storage) and row.get('project_id') == project_id), None)
 
     def _check_old_recovery(self, row):
         for relative in row.get('recovery_paths', []):
@@ -711,14 +728,14 @@ class MemoryFiles(StrandFiles):
             # its former containing folder would hide later editor writes from
             # that file's conflict checks. Keep this recovery location stable.
             for row in meta['files'].values():
-                inside = row['path'].startswith(source + '/')
-                if not inside and any(path.startswith(source + '/') for path in row.get('recovery_paths', [])):
+                inside = _under_path(row['path'], source)
+                if not inside and any(_under_path(path, source) for path in row.get('recovery_paths', [])):
                     raise ValueError('Folder contains retained recovery state for a Memory file elsewhere. '
                                      'Its recovery location must remain in place; individual ordinary entries can be moved or deleted.')
-            if project_id is None and (source == 'memory' or source.startswith('memory/projects')) and os.path.lexists(self.root / 'memory/projects'):
+            if project_id is None and (_same_path(source, 'memory') or _same_path(source, 'memory/projects') or _under_path(source, 'memory/projects')) and os.path.lexists(self.root / 'memory/projects'):
                 raise ValueError('Folder contains reserved project recovery state. Its recovery location must remain in place.')
         for ident, row in meta['files'].items():
-            if not row.get('deleted') and (row['path'] == source or row['path'].startswith(source + '/')):
+            if not row.get('deleted') and (_same_path(row['path'], source) or _under_path(row['path'], source)):
                 if row.get('project_id') != project_id:
                     raise ValueError('Moving a folder across project ownership is refused')
                 self._check_old_recovery(row)
@@ -728,15 +745,15 @@ class MemoryFiles(StrandFiles):
                 if operation == 'delete':
                     changed['deleted'] = True
                 else:
-                    replacement = destination + row['path'][len(source):]
+                    replacement = _relocated_path(row['path'], source, destination)
                     changed['path'] = replacement
                     changed['history_paths'] = list(dict.fromkeys(row.get('history_paths', []) + [row['path'], replacement]))
                     # File moves leave prior adjacent recovery inodes in place;
                     # folder moves carry their recovery directories with them.
-                    if row['path'] == source:
+                    if _same_path(row['path'], source):
                         changed['recovery_paths'] = list(dict.fromkeys(row.get('recovery_paths', []) + [source]))
                     else:
-                        changed['recovery_paths'] = [destination + path[len(source):] if path.startswith(source + '/') else path for path in row.get('recovery_paths', [])]
+                        changed['recovery_paths'] = [_relocated_path(path, source, destination) if _under_path(path, source) else path for path in row.get('recovery_paths', [])]
                 after[ident] = changed
         if files_after is not None:
             before = {ident: copy.deepcopy(meta['files'].get(ident)) for ident in files_after}
@@ -746,7 +763,7 @@ class MemoryFiles(StrandFiles):
         # Retire them in the same journaled update, retaining all history.
         for ident, row in meta['files'].items():
             if ident not in after and not row['deleted'] and (
-                    row['path'] == destination or row['path'].startswith(destination + '/')):
+                    _same_path(row['path'], destination) or _under_path(row['path'], destination)):
                 if row.get('project_id') != project_id:
                     raise ValueError('Destination registry crosses project ownership')
                 before[ident] = copy.deepcopy(row)
@@ -831,7 +848,7 @@ class MemoryFiles(StrandFiles):
 
     def move(self, relative, destination, expected_sha256, project_id=None, *, expected_file_id=_UNREVIEWED_IDENTITY, expected_entry_identity=_UNREVIEWED_IDENTITY):
         source = self._storage(relative, project_id); destination = self._storage(destination, project_id)
-        if source == destination or destination.startswith(source + '/'):
+        if _same_path(source, destination) or _under_path(destination, source):
             raise ValueError('A folder cannot be moved into itself')
         target = self._checked_storage(destination)
         with self._operation():
@@ -873,7 +890,7 @@ class MemoryFiles(StrandFiles):
 
     @staticmethod
     def _paths_overlap(one, two):
-        return one == two or one.startswith(two + '/') or two.startswith(one + '/')
+        return _same_path(one, two) or _under_path(one, two) or _under_path(two, one)
 
     def _tree_undo_error(self, record):
         if record['status'] != 'saved':
@@ -897,13 +914,13 @@ class MemoryFiles(StrandFiles):
         self._ordered_records()
         storage = self._storage(relative, project_id) if relative is not None else None
         content = self._receipt_records()
-        content = [row for row in content if row.get('project_id') == project_id and (storage is None or row['relative_path'] == storage)]
+        content = [row for row in content if row.get('project_id') == project_id and (storage is None or _same_path(row['relative_path'], storage))]
         content = self._undo_history(content)
         operations = []
         for record, raw in self._operation_records():
             if record.get('project_id') != project_id:
                 continue
-            if storage is not None and storage not in (record.get('source'), record.get('destination')):
+            if storage is not None and not any(_same_path(storage, record.get(key)) for key in ('source', 'destination')):
                 continue
             error = self._tree_undo_error(record)
             record = dict(record, is_latest=not bool(error), undo_error=error)

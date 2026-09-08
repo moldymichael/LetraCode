@@ -81,6 +81,18 @@ kernel.UnlockFileEx.argtypes = [w.HANDLE, w.DWORD, w.DWORD, w.DWORD, ctypes.POIN
 kernel.UnlockFileEx.restype = w.BOOL
 
 
+kernel.CompareStringOrdinal.argtypes = [w.LPCWSTR, ctypes.c_int, w.LPCWSTR, ctypes.c_int, w.BOOL]
+kernel.CompareStringOrdinal.restype = ctypes.c_int
+
+
+def windows_path_equal(left, right):
+    result = kernel.CompareStringOrdinal(left, len(left.encode('utf-16-le')) // 2,
+                                          right, len(right.encode('utf-16-le')) // 2, True)
+    if not result:
+        _error()
+    return result == 2  # CSTR_EQUAL
+
+
 def _error(path=None):
     error = ctypes.get_last_error()
     if error in (80, 183):
@@ -113,7 +125,7 @@ def _handle(path, access=READ_ATTRIBUTES, *, share_delete=True, share_write=True
             _error(str(path))
         # Compare normalized long names, refusing DOS 8.3 aliases as well as
         # redirection through a remapped drive or unexpected namespace.
-        if buffer.value.rstrip('\\').casefold() != _native(path).rstrip('\\').casefold():
+        if not windows_path_equal(buffer.value.rstrip('\\'), _native(path).rstrip('\\')):
             raise ValueError(f'Unsafe Windows pathname alias: {path}')
         return handle
     except BaseException:
@@ -172,11 +184,17 @@ class Directory:
 
 
 def _directory(path, *, share_delete=False):
-    handle = _handle(path, share_delete=share_delete)
+    handle = _handle(path, READ, share_delete=share_delete)
     try:
         info = _info(handle)
         if not info.attributes & DIRECTORY or info.attributes & REPARSE:
             raise ValueError(f'Unsafe directory (links and reparse points are refused): {path}')
+        case_flags = w.DWORD()
+        if kernel.GetFileInformationByHandleEx(handle, 23, ctypes.byref(case_flags), ctypes.sizeof(case_flags)):
+            if case_flags.value & 1:
+                raise ValueError(f'Guarded storage refuses case-sensitive Windows directories: {path}')
+        elif ctypes.get_last_error() not in (1, 50, 87):
+            _error(str(path))
         return handle
     except BaseException:
         kernel.CloseHandle(handle)

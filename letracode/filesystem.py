@@ -29,6 +29,17 @@ def windows_component(name):
     return name
 
 
+def windows_path_equal(left, right):
+    """Windows ordinal equality, with a host-independent simulation for tests.
+
+    Win32 overrides this with CompareStringOrdinal. Its case mapping does not
+    expand characters like Unicode casefold (Straße and Strasse are distinct).
+    """
+    def simple_upper(text):
+        return ''.join(char.upper() if len(char.upper()) == 1 else char for char in text)
+    return simple_upper(left) == simple_upper(right)
+
+
 def __getattr__(name):
     # Resolve dynamically so ordinary os fault-injection tests still exercise
     # the original POSIX implementation. Callers opt in with fs.operation().
@@ -81,7 +92,7 @@ def rename_noreplace(src_fd, src, dst_fd, dst, *, expected_identity=None):
 if IS_WINDOWS:
     from ._windows_filesystem import (safe_directory, open, stat, fstat, listdir,
         mkdir, close, fsync, fchmod, unlink, replace, rename_noreplace, flock,
-        LOCK_EX, LOCK_SH, LOCK_UN, LOCK_NB)
+        LOCK_EX, LOCK_SH, LOCK_UN, LOCK_NB, windows_path_equal)
 else:
     import fcntl
     from fcntl import LOCK_EX, LOCK_SH, LOCK_UN, LOCK_NB

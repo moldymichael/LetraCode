@@ -77,7 +77,8 @@ class MainWindow(QMainWindow):
             self.engine_config.executable = shutil.which('llama-server.exe' if is_windows() else 'llama-server') or ''
         self.engine = LocalEngine(self.engine_config,store.directory)
         self.setWindowTitle('LetraCode')
-        self.resize(1260,820)
+        available = self.screen().availableGeometry()
+        self.resize(min(1260, available.width() - 32), min(820, available.height() - 64))
         self.setMinimumSize(850,570)
         icon_path = Path(__file__).parent / 'assets/io.letracode.LetraCode.svg'
         self.setWindowIcon(QIcon.fromTheme('io.letracode.LetraCode',QIcon(str(icon_path))))

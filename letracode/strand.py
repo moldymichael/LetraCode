@@ -267,6 +267,8 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
         raise ValueError('Invalid write transaction ID')
     if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o7777):
         raise ValueError('Invalid file mode')
+    if fs.IS_WINDOWS and mode is not None and not mode & 0o222:
+        raise PermissionError('File is read-only; change its attribute before saving')
 
     def check_cancel():
         if cancel is not None and cancel.is_set():
@@ -276,6 +278,8 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
     with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace) as recovery:
         _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
         observed = _read_at(fd, path.name, max_bytes, with_stat=True)
+        if fs.IS_WINDOWS and observed is not None and not observed[1].st_mode & 0o222:
+            raise PermissionError('File is read-only; change its attribute before saving')
         if expected_entry_identity is not None and (observed is None or
                 [observed[1].st_dev, observed[1].st_ino] != list(expected_entry_identity)):
             raise ValueError('File identity changed; reload to review the replacement before saving')

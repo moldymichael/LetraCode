@@ -53,10 +53,13 @@ def powershell(script: str, **values: str) -> str:
     env.update(values)
     result = subprocess.run(
         [executable, "-NoProfile", "-NonInteractive", "-Command",
-         "$ErrorActionPreference = 'Stop'; "
+         "$ErrorActionPreference = 'Stop'; $ProgressPreference = 'SilentlyContinue'; "
          "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); " + script],
-        env=env, text=True, encoding="utf-8", capture_output=True, check=True,
+        env=env, text=True, encoding="utf-8", capture_output=True,
     )
+    if result.returncode:
+        detail = (result.stderr or result.stdout).strip()
+        raise RuntimeError(f"Windows shortcut operation failed: {detail or result.returncode}")
     return result.stdout.strip()
 
 
@@ -75,7 +78,7 @@ def managed_shortcut(path: Path, app_dir: Path) -> bool:
         details = shortcut_details(path)
         target = os.path.normcase(str(app_dir / ".venv/Scripts/letracode-gui.exe"))
         return details.get("Description") == APP_ID and os.path.normcase(details.get("TargetPath", "")) == target
-    except (OSError, ValueError, subprocess.CalledProcessError):
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError):
         return False
 
 

@@ -209,6 +209,31 @@ def test_uninstall_partial_deletion_restores_marker_and_can_be_retried(installer
     assert not shortcut.exists()
 
 
+def test_shortcut_errors_include_the_windows_diagnostic(installer, monkeypatch):
+    monkeypatch.setattr(shutil, "which", lambda executable: "powershell.exe")
+    monkeypatch.setattr(subprocess, "run", lambda *args, **kwargs:
+        subprocess.CompletedProcess(args[0], 1, "", "COM could not save the Unicode shortcut"))
+    with pytest.raises(RuntimeError, match="COM could not save the Unicode shortcut"):
+        installer.powershell("unused")
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Needs native Windows PowerShell and COM")
+def test_native_shortcut_with_unicode_paths(tmp_path):
+    spec = importlib.util.spec_from_file_location("native_windows_install", ROOT / "packaging/windows_install.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    app = tmp_path / "Local App Data é 日本語/letracode-app"
+    target = app / ".venv/Scripts/letracode-gui.exe"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"placeholder")
+    shortcut = module.shortcut_path(tmp_path / "Roaming App Data é 日本語")
+    shortcut.parent.mkdir(parents=True)
+    temporary = shortcut.with_name(".LetraCode.0123456789abcdef0123456789abcdef.lnk")
+    module.write_shortcut(temporary, app)
+    temporary.rename(shortcut)
+    assert module.managed_shortcut(shortcut, app)
+
+
 @pytest.mark.parametrize("action", ["install", "uninstall"])
 def test_installer_refuses_application_symlink(installer, locations, tmp_path, action):
     local, roaming = locations

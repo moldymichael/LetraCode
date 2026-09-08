@@ -120,7 +120,7 @@ def test_windows_registry_rejects_case_aliases(tmp_path, monkeypatch):
     alias['history_paths'] = ['note.md']
     metadata['files']['a' * 32] = alias
     monkeypatch.setattr(fs, 'IS_WINDOWS', True)
-    with pytest.raises(ValueError, match='Duplicate'):
+    with pytest.raises(ValueError, match='Duplicate|alias'):
         memory._validate_metadata(metadata)
 
 
@@ -215,6 +215,37 @@ def test_windows_busy_editor_blocks_save_without_losing_bytes(tmp_path):
     assert target.read_bytes() == b'External save through retained handle'
 
 
+@pytest.mark.parametrize('folder', [False, True])
+def test_windows_case_renamed_memory_keeps_identity_activation_and_history(tmp_path, monkeypatch, folder):
+    from letracode import filesystem as fs
+    from letracode.store import Store
+    memory = Store(tmp_path / 'data').memory
+    if folder:
+        memory.create_folder('Notes')
+    relative = 'Notes/Note.md' if folder else 'Note.md'
+    memory.create_file(relative, 'original')
+    before = memory.file_snapshot(relative)
+    memory.set_active(relative, True, before['sha256'])
+    source = 'Notes' if folder else 'Note.md'
+    renamed = source.lower()
+    (memory.root / source).rename(memory.root / renamed)
+    monkeypatch.setattr(fs, 'IS_WINDOWS', True)
+    path = renamed + '/Note.md' if folder else renamed
+    reviewed = memory.file_snapshot(path)
+    assert reviewed['file_id'] == before['file_id']
+    assert reviewed['always_active']
+    entry = memory.snapshot_entry(renamed)
+    receipt = memory.move(renamed, 'Renamed' if folder else 'Renamed.md', entry['sha256'])
+    destination = 'Renamed/Note.md' if folder else 'Renamed.md'
+    after = memory.file_snapshot(destination)
+    assert after['file_id'] == before['file_id']
+    assert after['always_active']
+    assert 'original' in memory.core()
+    assert before['file_id'] in receipt['files_after']
+    memory.undo(receipt['id'])
+    assert memory.file_snapshot(path)['file_id'] == before['file_id']
+
+
 def test_guarded_move_publishes_complete_unicode_name(tmp_path):
     from letracode import filesystem as fs
     destination = tmp_path / 'Recovered 日本語 é'
@@ -243,3 +274,38 @@ def test_windows_ordinal_names_do_not_alias_private_memory(tmp_path, monkeypatch
     context = memory.core()
     assert 'public reviewed notes' in context
     assert 'private unselected notes' not in context
+
+
+def test_readonly_source_save_keeps_attribute_or_refuses_unchanged(tmp_path):
+    import stat
+    from letracode import source_files
+    target = tmp_path / 'readonly.py'
+    target.write_bytes(b'original\n')
+    target.chmod(0o444)
+    try:
+        before = source_files.snapshot(target)
+        try:
+            source_files.publish(target, b'changed\n', before['sha256'], mode=before['mode'])
+        except (OSError, ValueError):
+            assert target.read_bytes() == b'original\n'
+        assert not stat.S_IMODE(target.stat().st_mode) & 0o222
+    finally:
+        target.chmod(0o666)
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows per-directory case sensitivity')
+def test_windows_case_sensitive_directories_are_refused(tmp_path):
+    from letracode import filesystem as fs
+    root = tmp_path / 'case-sensitive'
+    root.mkdir()
+    enabled = subprocess.run(['fsutil', 'file', 'setCaseSensitiveInfo', str(root), 'enable'],
+                             capture_output=True, text=True)
+    if enabled.returncode:
+        pytest.skip('Windows host cannot enable per-directory case sensitivity: ' + enabled.stdout + enabled.stderr)
+    try:
+        with pytest.raises(ValueError, match='case-sensitive'):
+            with fs.safe_directory(root):
+                pytest.fail('Case-sensitive directory was accepted')
+    finally:
+        subprocess.run(['fsutil', 'file', 'setCaseSensitiveInfo', str(root), 'disable'],
+                       check=True, capture_output=True)

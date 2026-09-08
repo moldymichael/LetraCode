@@ -45,6 +45,7 @@ def command_argv(command):
     executable = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
     # Encoding the script avoids an additional layer of Windows argv quoting.
     script = (
+        "$ProgressPreference = 'SilentlyContinue'; "
         '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); '
         '$OutputEncoding = [Console]::OutputEncoding; '
         '\n' + command + '\n'
