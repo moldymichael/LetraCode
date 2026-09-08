@@ -159,7 +159,7 @@ Build the Fedora `.run` and reproducible source `.tar.gz`/`.zip` archives with:
 python3 packaging/build-release.py
 ```
 
-To build Windows downloads, use native Windows x64 Python 3.11 and
+To build Windows downloads, use native Windows x64 Python 3.13 and
 [Inno Setup 6](https://jrsoftware.org/isinfo.php):
 
 ```powershell
