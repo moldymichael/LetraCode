@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import threading
 import time
 import zipfile
@@ -9,6 +10,11 @@ import pytest
 
 from letracode.tools import ToolExecutor
 from letracode.context import ProjectFiles, build_context
+
+
+def python_command(source):
+    from tools.run_acceptance import python_command as command
+    return command('-c', source)
 
 
 def executor(tmp_path, approve=lambda request: False, roots=None):
@@ -24,13 +30,13 @@ def test_unlinked_read_and_denied_commands_have_no_effect(tmp_path):
     assert not (tmp_path / 'should-not-exist').exists()
 
 
-def test_linked_read_and_symlink_escape(tmp_path):
+def test_linked_read_and_symlink_escape(tmp_path, make_symlink):
     root = tmp_path / 'project'
     root.mkdir()
     (root / 'a.md').write_text('good evidence')
     secret = tmp_path / 'secret.md'
     secret.write_text('never automatically include')
-    (root / 'escape.md').symlink_to(secret)
+    make_symlink(root / 'escape.md', secret)
     (root / '.env').write_text('API_KEY=secret')
     tool = executor(tmp_path, roots=[str(root)])
     assert 'good evidence' in tool.execute('read_file', {'path': str(root / 'a.md')})
@@ -76,13 +82,14 @@ def test_write_does_not_overwrite_change_during_approval(tmp_path):
 
 def test_command_output_and_timeout(tmp_path):
     tool = executor(tmp_path, lambda _: True)
-    data = json.loads(tool.execute('run_command', {'command':'printf hello', 'cwd':str(tmp_path)}))
+    data = json.loads(tool.execute('run_command', {'command':python_command("print('hello', end='')"), 'cwd':str(tmp_path)}))
     assert data['output'] == 'hello'
     assert data['exit_code'] == 0
     start = time.monotonic()
-    data = json.loads(tool.execute('run_command', {'command':'sleep 10', 'cwd':str(tmp_path), 'timeout':1}))
+    command = python_command('import time; time.sleep(10)')
+    data = json.loads(tool.execute('run_command', {'command':command, 'cwd':str(tmp_path), 'timeout':1}))
     assert data['timed_out']
-    assert data['command'] == 'sleep 10'
+    assert data['command'] == command
     assert data['cwd'] == str(tmp_path)
     assert data['timeout'] == 1
     assert data['executed'] is True
@@ -108,10 +115,10 @@ def test_invalid_tool_arguments_are_errors_not_actions(tmp_path):
     assert 'error' in tool.execute('invented_tool', {})
 
 
-def test_retrieval_rejects_sensitive_symlinked_ancestor(tmp_path):
+def test_retrieval_rejects_sensitive_symlinked_ancestor(tmp_path, make_symlink):
     hidden = tmp_path / '.private' / 'project'; hidden.mkdir(parents=True)
     (hidden/'note.txt').write_text('SECRET CONTENT')
-    (tmp_path/'visible').symlink_to(tmp_path/'.private',target_is_directory=True)
+    make_symlink(tmp_path/'visible', tmp_path/'.private', target_is_directory=True)
     files = ProjectFiles([str(tmp_path/'visible'/'project')])
     assert files.inventory() == []
     assert files.search('SECRET') == []
@@ -167,7 +174,7 @@ def test_source_approval_exposes_line_ending_and_bom_changes(tmp_path, before, a
 def test_edit_file_accepts_deletion_and_nonempty_whitespace_fragment(tmp_path, old_text, new_text, expected):
     path = tmp_path / 'source.txt'
     before = 'keep\nremove\n' if old_text == 'remove\n' else 'keep\nremove'
-    path.write_text(before)
+    path.write_bytes(before.encode('utf-8'))
     result = json.loads(executor(tmp_path, lambda _: True).execute('edit_file', {
         'path':str(path), 'expected_sha256':hashlib.sha256(before.encode()).hexdigest(),
         'old_text':old_text, 'new_text':new_text}))
@@ -177,7 +184,7 @@ def test_edit_file_accepts_deletion_and_nonempty_whitespace_fragment(tmp_path, o
 
 @pytest.mark.parametrize('before,old_text', [('same same', 'same'), ('aaa', 'aa'), ('keep', ''), ('keep', 'missing')])
 def test_edit_file_rejects_missing_empty_and_ambiguous_fragments_before_approval(tmp_path, before, old_text):
-    path = tmp_path / 'source.txt'; path.write_text(before)
+    path = tmp_path / 'source.txt'; path.write_bytes(before.encode('utf-8'))
     requests = []
     result = json.loads(executor(tmp_path, lambda request: requests.append(request) or True).execute('edit_file', {
         'path':str(path), 'expected_sha256':hashlib.sha256(before.encode()).hexdigest(),
@@ -268,8 +275,9 @@ def test_documents_remain_readable_but_cannot_be_edited_as_source_text(tmp_path,
     assert path.read_bytes() == before
 
 
-@pytest.mark.parametrize('command,code,output', [('printf passed', 0, 'passed'), ('printf failed; exit 7', 7, 'failed')])
-def test_command_results_identify_command_cwd_and_effective_timeout(tmp_path, command, code, output):
+@pytest.mark.parametrize('code,output', [(0, 'passed'), (7, 'failed')])
+def test_command_results_identify_command_cwd_and_effective_timeout(tmp_path, code, output):
+    command = python_command(f'print({output!r}, end=""); raise SystemExit({code})')
     result = json.loads(executor(tmp_path, lambda _: True).execute(
         'run_command', {'command':command, 'cwd':str(tmp_path)}))
     assert result['command'] == command
@@ -279,3 +287,89 @@ def test_command_results_identify_command_cwd_and_effective_timeout(tmp_path, co
     assert result['exit_code'] == code and result['output'] == output
     assert result['timed_out'] is False and result['cancelled'] is False
     assert result['output_limit_reached'] is False
+
+
+def test_command_approval_names_shell_and_preserves_unicode(tmp_path):
+    requests = []
+    tool = executor(tmp_path, lambda request: requests.append(request) or True)
+    folder = tmp_path / 'Project café with spaces'
+    folder.mkdir()
+    command = python_command("print('café \\u03bb')")
+    result = json.loads(tool.execute('run_command', {'command':command, 'cwd':str(folder)}))
+    assert result['exit_code'] == 0
+    assert result['output'].strip() == 'café λ'
+    assert ('PowerShell' if os.name == 'nt' else 'Bash') in requests[0].details
+    assert command in requests[0].details
+
+
+def test_command_pipe_reading_does_not_require_selectable_file_descriptors(tmp_path, monkeypatch):
+    import selectors
+    def reject_pipe(*args, **kwargs):
+        raise OSError('Windows selectors cannot monitor anonymous pipes')
+    monkeypatch.setattr(selectors, 'DefaultSelector', reject_pipe)
+    result = json.loads(executor(tmp_path, lambda _: True).execute(
+        'run_command', {'command':python_command("print('pipe works')"), 'cwd':str(tmp_path)}))
+    assert result.get('output', '').strip() == 'pipe works'
+
+
+@pytest.mark.parametrize('platform', ['linux', 'win32'])
+def test_command_environment_excludes_secrets_and_keeps_windows_runtime(monkeypatch, platform):
+    import letracode.tools as tools_module
+    from types import SimpleNamespace
+    from letracode.tools import command_environment
+    monkeypatch.setattr(tools_module, 'sys', SimpleNamespace(platform=platform))
+    monkeypatch.setenv('SystemRoot', r'C:\Windows')
+    monkeypatch.setenv('USERPROFILE', r'C:\Users\Writer')
+    monkeypatch.setenv('LOCALAPPDATA', r'C:\Users\Writer\AppData\Local')
+    monkeypatch.setenv('OPENAI_API_KEY', 'secret-test-only')
+    environment = command_environment()
+    assert 'OPENAI_API_KEY' not in environment
+    if platform == 'win32':
+        assert environment['PYTHONIOENCODING'] == 'utf-8'
+        assert environment['SYSTEMROOT'] == r'C:\Windows'
+        assert environment['USERPROFILE'] == r'C:\Users\Writer'
+        assert environment['LOCALAPPDATA'].endswith(r'AppData\Local')
+    else:
+        assert 'PYTHONIOENCODING' not in environment
+        assert 'SYSTEMROOT' not in environment
+
+
+def test_command_output_is_bounded_and_cancel_interrupts_wait(tmp_path):
+    tool = executor(tmp_path, lambda _: True)
+    result = json.loads(tool.execute('run_command', {
+        'command':python_command("print('x' * 200000)"), 'cwd':str(tmp_path)}))
+    assert result['output_limit_reached']
+    assert len(result['output']) <= 64000
+    timer = threading.Timer(0.5, tool.cancel.set)
+    timer.start()
+    started = time.monotonic()
+    try:
+        result = json.loads(tool.execute('run_command', {
+            'command':python_command('import time; time.sleep(30)'), 'cwd':str(tmp_path)}))
+    finally:
+        timer.cancel()
+    assert result['cancelled']
+    assert time.monotonic() - started < 4
+
+
+def test_command_preserves_exit_status_when_output_closes_first(tmp_path):
+    tool = executor(tmp_path, lambda _: True)
+    command = python_command('import os, time; os.close(1); os.close(2); time.sleep(0.1); raise SystemExit(7)')
+    result = json.loads(tool.execute('run_command', {'command':command, 'cwd':str(tmp_path)}))
+    assert result['exit_code'] == 7
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Native Windows PowerShell')
+def test_windows_powershell_syntax_output_and_failure_codes(tmp_path):
+    tool = executor(tmp_path, lambda _: True)
+    for command, output, exit_code in [
+        ("Write-Output 'café λ'", 'café λ', 0),
+        (python_command('import sys; sys.exit(7)'), '', 7),
+        ("Write-Error 'failed as requested'", None, 1),
+        ("cmd.exe /c exit 0; Get-Item -LiteralPath 'C:\\letracode-definitely-missing'", None, 1),
+        ("cmd.exe /c exit 7; Write-Output 'recovered'", 'recovered', 0),
+    ]:
+        result = json.loads(tool.execute('run_command', {'command':command, 'cwd':str(tmp_path)}))
+        assert result['exit_code'] == exit_code
+        if output is not None:
+            assert result['output'].strip() == output

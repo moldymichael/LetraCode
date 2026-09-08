@@ -7,6 +7,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from letracode import filesystem as fs
+
 from letracode.store import Store
 import letracode.strand as strand_module
 
@@ -380,6 +382,7 @@ def test_atomic_write_failure_leaves_original_content(tmp_path, monkeypatch):
     assert strand.snapshot('global')['text'] == original['text']
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX fork/FIFO injection; portable subprocess crash recovery is covered in test_filesystem')
 def test_file_swapped_to_fifo_during_open_is_rejected_without_blocking(tmp_path):
     strand = Store(tmp_path / 'data').strand
     target = strand.root / 'memory/global.md'
@@ -387,7 +390,7 @@ def test_file_swapped_to_fifo_during_open_is_rejected_without_blocking(tmp_path)
     result = context.Queue()
 
     def read_during_swap():
-        original_open = os.open
+        original_open = fs.open
 
         def swap(name, flags, *args, **kwargs):
             if name == 'global.md':
@@ -419,14 +422,14 @@ def test_oversized_external_file_is_preserved_and_read_fails_explicitly(tmp_path
     target = strand.root / 'memory/global.md'
     oversized = b'x' * (2 * 1024 * 1024 + 1)
     if grow_during_open:
-        original_open = os.open
+        original_open = fs.open
 
         def grow(name, flags, *args, **kwargs):
             if name == 'global.md':
                 target.write_bytes(oversized)
             return original_open(name, flags, *args, **kwargs)
 
-        monkeypatch.setattr(os, 'open', grow)
+        monkeypatch.setattr(fs, 'open', grow)
     else:
         target.write_bytes(oversized)
     with pytest.raises(ValueError, match='too large|size limit'):
@@ -547,6 +550,11 @@ def test_late_write_through_old_editor_descriptor_is_recoverable_and_reported(tm
     project = Store(directory).create_project('Editor race')
     before = strand.snapshot('project', project)
     with strand.path('project', project).open('r+b') as editor:
+        if fs.IS_WINDOWS:
+            with pytest.raises(PermissionError):
+                strand.replace('project', 'Proposed save', before['sha256'], project)
+            assert strand.path('project', project).read_text() == before['text']
+            return
         strand.replace('project', 'Proposed save', before['sha256'], project)
         editor.write(b'Late external edit through an already open file')
         editor.flush()
@@ -573,6 +581,7 @@ def test_unavailable_project_context_is_explicit_and_does_not_hide_global_memory
 
 
 @pytest.mark.parametrize('stage', ['capture', 'publish'])
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX fork/FIFO injection; portable subprocess crash recovery is covered in test_filesystem')
 def test_process_crash_during_save_recovers_without_creating_empty_memory(tmp_path, stage):
     directory = tmp_path / 'data'
     strand = Store(directory).strand
@@ -670,6 +679,7 @@ def test_recovery_inodes_and_journals_survive_backup_restore(tmp_path):
 
 
 @pytest.mark.parametrize('record', ['journal', 'done'])
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX fork/FIFO injection; portable subprocess crash recovery is covered in test_filesystem')
 def test_crash_halfway_through_recovery_record_write_does_not_break_startup(tmp_path, record):
     directory = tmp_path / 'data'
     strand = Store(directory).strand

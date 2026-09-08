@@ -225,7 +225,7 @@ class Store:
                 source.backup(target)
             finally:
                 target.close()
-        with destination.open('rb') as saved:
+        with destination.open('r+b') as saved:
             fs.fsync(saved.fileno())
         with safe_directory(directory) as fd:
             fs.fsync(fd)

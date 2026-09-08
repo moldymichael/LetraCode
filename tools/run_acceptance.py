@@ -27,6 +27,22 @@ if str(SOURCE) not in sys.path:
 from letracode.engine import EngineConfig, EngineError, LocalEngine
 
 
+def python_command(*arguments, environment=None):
+    """Quote a Python invocation for the platform's approved command shell."""
+    arguments = [sys.executable, *map(str, arguments)]
+    environment = environment or {}
+    if sys.platform == 'win32':
+        def literal(value):
+            return "'" + value.replace("'", "''") + "'"
+        assignments = ''.join(f'$env:{key}={literal(value)}; ' for key, value in environment.items())
+        # Windows PowerShell's legacy native argv binding strips embedded
+        # double quotes unless escaped for the native command-line parser.
+        command = '& ' + ' '.join(literal(value.replace('"', '\\"')) for value in arguments)
+        return assignments + command
+    assignments = ' '.join(f'{key}={shlex.quote(value)}' for key, value in environment.items())
+    return (assignments + ' ' if assignments else '') + shlex.join(arguments)
+
+
 def git(directory, *arguments, input=None):
     return subprocess.run(['git', *arguments], cwd=directory, input=input,
                           stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -107,8 +123,13 @@ def prepare_fixture(root, case, source):
         sentinel.write_text('Preserve this unrelated untracked sentinel.\n')
         fixture['baseline'] = git_state(target)
         fixture['implementation_path'] = str(source_file)
-        command = ('QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 '
-                   'PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 python3 -m pytest -q -p no:cacheprovider')
+        test_arguments = ('-B', '-m', 'pytest', '-q', '-p', 'no:cacheprovider')
+        test_environment = {'QT_QPA_PLATFORM': 'offscreen', 'PYTHONDONTWRITEBYTECODE': '1',
+                            'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1'}
+        focused_command = python_command(*test_arguments, 'tests/test_tools.py',
+            '--basetemp=' + str(test_root / 'focused'), environment=test_environment)
+        full_command = python_command(*test_arguments,
+            '--basetemp=' + str(test_root / 'full'), environment=test_environment)
         fixture['instructions'] = f'''Use only the disposable checkout {target}.
 Implement accurate list_files truncation reporting: truncated=false for exactly 300 eligible entries,
 true for more than 300 eligible entries, and false when only hidden omitted entries exceed 300.
@@ -122,8 +143,8 @@ Preserve the unrelated staged line and untracked sentinel exactly; leave your ch
 Do not commit, stage, reset, clean, switch branches, change Git configuration, install, download,
 access live app data/models, or access the internet. Commands require native human approval.
 Read-only Git inspection and Python test/check commands in this checkout are permitted proposals.
-Focused command: {command} tests/test_tools.py --basetemp={shlex.quote(str(test_root / 'focused'))}
-Full command: {command} --basetemp={shlex.quote(str(test_root / 'full'))}
+Focused command: {focused_command}
+Full command: {full_command}
 Use a 300-second tool timeout for tests. Test parents already exist outside the linked checkout.
 At most two corrections after the initial implementation; stop and report if still failing.
 Every tool approval is individual. Never bypass a denial or replay historical commands.

@@ -122,3 +122,94 @@ def test_windows_registry_rejects_case_aliases(tmp_path, monkeypatch):
     monkeypatch.setattr(fs, 'IS_WINDOWS', True)
     with pytest.raises(ValueError, match='Duplicate'):
         memory._validate_metadata(metadata)
+
+
+@pytest.mark.parametrize('stage', ['capture', 'publish', 'journal', 'done', 'archive'])
+def test_subprocess_crash_retains_recoverable_memory(tmp_path, stage):
+    from letracode.store import Store
+    store = Store(tmp_path / 'data')
+    project = store.create_project('Interrupted operation')
+    scope = 'project' if stage == 'archive' else 'global'
+    project_id = project if stage == 'archive' else None
+    original = store.memory.path(scope, project_id)
+    original.write_text('Original notes', encoding='utf-8')
+    program = r'''
+import os
+import sys
+from pathlib import Path
+from letracode import filesystem as fs
+from letracode.store import Store
+import letracode.strand as strand
+store = Store(Path(sys.argv[1]))
+stage, project = sys.argv[2:]
+scope = 'project' if stage == 'archive' else 'global'
+project_id = project if stage == 'archive' else None
+target = store.memory.path(scope, project_id)
+before = store.memory.snapshot(scope, project_id)
+real_move = strand.rename_noreplace
+def move(src_fd, src, dst_fd, dst, **options):
+    result = real_move(src_fd, src, dst_fd, dst, **options)
+    if (stage in ('capture', 'archive') and src == target.name or
+            stage == 'publish' and dst == target.name and src.endswith('.proposed')):
+        fs.fsync(src_fd)
+        fs.fsync(dst_fd)
+        os._exit(73)
+    return result
+strand.rename_noreplace = move
+real_fdopen = os.fdopen
+class InterruptedRecord:
+    def __init__(self, stream): self.stream = stream
+    def __enter__(self): return self
+    def __exit__(self, *args): self.stream.close()
+    def __getattr__(self, name): return getattr(self.stream, name)
+    def write(self, data):
+        prefix = b'{"before_sha256"' if stage == 'journal' else b'{"status": "saved"'
+        if stage in ('journal', 'done') and data.startswith(prefix):
+            self.stream.write(data[:1])
+            self.stream.flush()
+            fs.fsync(self.stream.fileno())
+            os._exit(73)
+        return self.stream.write(data)
+os.fdopen = lambda *args, **kwargs: InterruptedRecord(real_fdopen(*args, **kwargs))
+if stage == 'archive':
+    store.delete_project(project)
+else:
+    store.memory.replace(scope, 'Published notes', before['sha256'], project_id)
+os._exit(74)
+'''
+    completed = subprocess.run([sys.executable, '-c', program, str(store.directory), stage, project],
+                               capture_output=True, timeout=20)
+    assert completed.returncode == 73, completed.stderr.decode()
+    reopened = Store(store.directory)
+    if stage == 'archive':
+        assert reopened.project(project)['memory_error']
+        assert not original.exists()
+        archived = list((reopened.memory.root / '.deleted-projects' / project).glob('*.md'))
+        assert len(archived) == 1 and archived[0].read_text(encoding='utf-8') == 'Original notes'
+    else:
+        expected = 'Original notes' if stage in ('capture', 'journal') else 'Published notes'
+        assert reopened.memory.snapshot(scope, project_id)['text'] == expected
+        if stage in ('publish', 'done'):
+            receipt = reopened.memory.receipts()[0]
+            assert receipt['status'] == 'saved'
+            reopened.memory.undo(receipt['id'])
+            assert reopened.memory.snapshot(scope, project_id)['text'] == 'Original notes'
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows file sharing and inode retention')
+def test_windows_busy_editor_blocks_save_without_losing_bytes(tmp_path):
+    from letracode import filesystem as fs
+    from letracode.store import Store
+    store = Store(tmp_path / 'data')
+    before = store.memory.snapshot('global')
+    target = store.memory.path('global')
+    fd = fs.open(target, os.O_RDWR | fs.O_NOFOLLOW)
+    try:
+        with pytest.raises(PermissionError):
+            store.memory.replace('global', 'App save', before['sha256'])
+        os.write(fd, b'External save through retained handle')
+        fs.fsync(fd)
+    finally:
+        fs.close(fd)
+    assert Store(store.directory).memory.snapshot('global')['text'] == 'External save through retained handle'
+    assert target.read_bytes() == b'External save through retained handle'

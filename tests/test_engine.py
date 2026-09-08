@@ -4,10 +4,15 @@ import json
 from pathlib import Path
 import socket
 import stat
+import subprocess
+import sys
 import textwrap
 import time
 
 import pytest
+
+
+pytestmark = pytest.mark.usefixtures('python_engine_peer')
 
 
 PEER_SOURCE = r'''#!/usr/bin/env python3
@@ -209,7 +214,9 @@ ThreadingHTTPServer((args.host, args.port), Handler).serve_forever()
 
 @pytest.fixture
 def fake_server(tmp_path: Path) -> Path:
-    path = tmp_path / "llama-server-fake"
+    folder = tmp_path / 'Model server café with spaces'
+    folder.mkdir()
+    path = folder / "llama-server-fake.exe"
     path.write_text(textwrap.dedent(PEER_SOURCE))
     path.chmod(path.stat().st_mode | stat.S_IXUSR)
     return path
@@ -386,7 +393,7 @@ def test_start_reports_rejected_required_flags_as_outdated_server(
     from letracode.engine import EngineConfig, EngineError, LocalEngine
     from threading import Event
 
-    executable = tmp_path / "old-llama-server"
+    executable = tmp_path / "old-llama-server.exe"
     executable.write_text(
         "#!/usr/bin/env python3\nprint('error: unknown argument: --jinja', flush=True)\n"
     )
@@ -709,3 +716,61 @@ def test_cancel_after_budgeting_is_reported_as_cancelled_before_generation(fake_
             engine.complete([{'role': 'user', 'content': 'plain'}], None, Event(), lambda _: None)
     finally:
         engine.stop()
+
+
+def test_windows_rejects_batch_engine_launchers(tmp_path, gguf_model, monkeypatch):
+    import letracode.engine as engine_module
+    from types import SimpleNamespace
+    from letracode.engine import EngineConfig, EngineError, LocalEngine
+    monkeypatch.setattr(engine_module, 'sys', SimpleNamespace(platform='win32'))
+    executable = tmp_path / 'llama-server.cmd'
+    executable.write_text('@echo off\n', encoding='utf-8')
+    executable.chmod(0o700)
+    engine = LocalEngine(EngineConfig(executable=str(executable), model_path=str(gguf_model)), tmp_path / 'data')
+    with pytest.raises(EngineError, match=r'\.exe'):
+        engine._validated_paths()
+
+
+@pytest.mark.parametrize('setting', ['', 'llama-server'])
+def test_windows_discovers_native_executable_before_batch_files(tmp_path, gguf_model, monkeypatch, setting):
+    import letracode.engine as engine_module
+    from types import SimpleNamespace
+    from letracode.engine import EngineConfig, LocalEngine
+    native = tmp_path / 'llama-server.exe'
+    native.touch()
+    batch = tmp_path / 'llama-server.cmd'
+    batch.touch()
+    monkeypatch.setattr(engine_module, 'sys', SimpleNamespace(platform='win32'))
+    monkeypatch.setattr(engine_module.shutil, 'which', lambda name: str(native if name == 'llama-server.exe' else batch))
+    engine = LocalEngine(EngineConfig(executable=setting, model_path=str(gguf_model)), tmp_path / 'data')
+    executable, _ = engine._validated_paths()
+    assert executable == native
+
+
+def test_restart_cleans_descendants_of_an_exited_server(tmp_path, fake_server, gguf_model):
+    from letracode.processes import start_process, stop_process
+    from threading import Event
+    ready = tmp_path / 'old-server-child-ready'
+    survived = tmp_path / 'old-server-child-survived'
+    child = (
+        f'from pathlib import Path; import time; Path({str(ready)!r}).touch(); '
+        f'time.sleep(1.5); Path({str(survived)!r}).touch()'
+    )
+    parent = (
+        'import subprocess, sys, time; from pathlib import Path; '
+        f'subprocess.Popen([sys.executable, "-c", {child!r}], '
+        'stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); '
+        f'\nwhile not Path({str(ready)!r}).exists(): time.sleep(0.01)'
+    )
+    previous = start_process([sys.executable, '-c', parent], stdout=subprocess.DEVNULL)
+    engine = make_engine(fake_server, gguf_model, tmp_path / 'data')
+    try:
+        previous.wait(timeout=10)
+        assert ready.exists()
+        engine._process = previous
+        engine.start(Event())
+        time.sleep(1.7)
+        assert not survived.exists()
+    finally:
+        engine.stop()
+        stop_process(previous, timeout=0.5)

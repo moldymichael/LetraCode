@@ -10,6 +10,7 @@ import stat
 from pathlib import Path
 
 from .strand import MAX_FILE_BYTES, digest, safe_snapshot, safe_write
+from .filesystem import IS_WINDOWS
 
 RECOVERY_NAMESPACE = '.letracode-recovery'
 
@@ -38,7 +39,8 @@ def snapshot(path, *, allow_missing=False):
     if observed is None:
         if not allow_missing:
             raise FileNotFoundError(f'Source file is missing: {path}')
-        return {'path': str(path), 'raw': None, 'text': None, 'sha256': None, 'mode': 0o600}
+        return {'path': str(path), 'raw': None, 'text': None, 'sha256': None,
+                'mode': 0o666 if IS_WINDOWS else 0o600}
     raw, info = observed
     return {'path': str(path), 'raw': raw, 'text': _text(raw),
             'sha256': digest(raw), 'mode': stat.S_IMODE(info.st_mode)}

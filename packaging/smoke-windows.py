@@ -53,11 +53,21 @@ def launch_and_close(executable: Path, data: Path, work: Path, stage: str, env: 
         observed = []
         while time.monotonic() < deadline and child.poll() is None:
             observed = native_window(child.pid)
+            errors = [(handle, title) for handle, title in observed
+                      if title in ("Could not open LetraCode", "Unhandled exception in script")]
+            if errors:
+                from PIL import ImageGrab
+                ImageGrab.grab(all_screens=True).save(work / f"{stage}-error.png")
+                detail = window_accessible_text(errors[0][0])
+                (work / f"{stage}-error.log").write_text(detail, encoding="utf-8")
+                raise RuntimeError(f"{stage}: {errors[0][1]}: {detail}")
             window = next((handle for handle, title in observed if title == "LetraCode"), None)
             if window and (data / "letracode.sqlite3").is_file():
                 break
             time.sleep(0.2)
         if not window or child.poll() is not None:
+            from PIL import ImageGrab
+            ImageGrab.grab(all_screens=True).save(work / f"{stage}-error.png")
             raise RuntimeError(f"{stage}: the native app window did not open; exit={child.poll()}, windows={observed}")
         time.sleep(1)
         if child.poll() is not None:
@@ -76,6 +86,23 @@ def launch_and_close(executable: Path, data: Path, work: Path, stage: str, env: 
         if child.poll() is None:
             subprocess.run(["taskkill.exe", "/PID", str(child.pid), "/T", "/F"], capture_output=True)
             child.wait(timeout=15)
+
+
+def window_accessible_text(handle: int) -> str:
+    """Read a Qt error dialog through Windows UI Automation, without app hooks."""
+    env = os.environ.copy()
+    env["LETRACODE_SMOKE_WINDOW"] = str(handle)
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); "
+        "Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes; "
+        "$window = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr][long]$env:LETRACODE_SMOKE_WINDOW); "
+        "$elements = $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, [System.Windows.Automation.Condition]::TrueCondition); "
+        "$elements | ForEach-Object { $_.Current.Name }"
+    )
+    result = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
+                            env=env, capture_output=True, text=True, encoding="utf-8", timeout=25)
+    return (result.stdout + result.stderr).strip()
 
 
 def run_installer(executable: Path, work: Path, log_name: str, *extra: str) -> None:
@@ -125,6 +152,16 @@ def smoke(installer: Path, portable: Path, work: Path) -> dict:
         db.execute("INSERT INTO messages(chat_id,role,content,created) VALUES ('installer-smoke','user','Keep this conversation 日本語','2026-09-08')")
     sentinel = data / "installation-retention.txt"
     sentinel.write_text("Keep my chats, notes and recovery data 日本語", encoding="utf-8")
+    from letracode.store import Store
+    store = Store(data)
+    store.memory.create_file("Installer note.md", "Before the saved edit")
+    note = store.memory.file_snapshot("Installer note.md")
+    store.memory.replace_file("Installer note.md", "Keep my saved note 日本語", note["sha256"])
+    retained_files = {path: path.read_bytes() for directory in (".history", ".receipts")
+                      for path in (store.memory.root / directory).rglob("*") if path.is_file()}
+    if not retained_files:
+        raise RuntimeError("The retention fixture did not create recovery history")
+    retained_files[store.memory.root / "Installer note.md"] = "Keep my saved note 日本語".encode("utf-8")
     # Alter an installed app file to prove that a subsequent install replaces it.
     (app / "version.json").write_text('{"version":"obsolete"}', encoding="utf-8")
     run_installer(installer, work, "update.log", f"/DIR={app}")
@@ -143,6 +180,9 @@ def smoke(installer: Path, portable: Path, work: Path) -> dict:
             raise RuntimeError("The retained conversation was damaged")
     if sentinel.read_text(encoding="utf-8") != "Keep my chats, notes and recovery data 日本語":
         raise RuntimeError("Uninstall changed retained user data")
+    for path, content in retained_files.items():
+        if path.read_bytes() != content:
+            raise RuntimeError(f"Update or uninstall changed project/recovery data: {path}")
     extracted = work / "Extracted Portable With Spaces é 日本語"
     with zipfile.ZipFile(portable) as archive:
         if archive.testzip() is not None:
@@ -153,6 +193,7 @@ def smoke(installer: Path, portable: Path, work: Path) -> dict:
     report = {"version": version, "installer": installer.name, "native_window": True,
               "install": True, "same_version_update": True, "uninstall": True,
               "data_retained": True, "schema": 3, "portable_launch": True,
+              "project_notes_and_recovery_retained": True,
               "space_and_unicode_paths": True, "python_removed_from_path": True}
     (work / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

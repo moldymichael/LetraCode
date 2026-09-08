@@ -8,6 +8,8 @@ from pathlib import Path
 
 import pytest
 
+from letracode import filesystem as fs
+
 from letracode.store import Store
 
 
@@ -470,6 +472,7 @@ def test_oversized_project_memory_can_be_archived_without_decoding_or_truncation
     assert not memory.exists()
 
 
+@pytest.mark.skipif(os.name == 'nt', reason='POSIX fork checkpoint injection; portable subprocess recovery is covered in test_filesystem')
 def test_interrupted_project_deletion_retains_archive_and_unavailable_project(tmp_path):
     import letracode.strand as strand_module
 

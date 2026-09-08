@@ -5,10 +5,36 @@ from pathlib import Path
 import subprocess
 import sys
 import tarfile
+import tomllib
 import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_release_metadata_uses_one_current_version():
+    from letracode import __version__
+    metadata = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    assert metadata["project"]["version"] == __version__ == "0.3.0"
+    assert f"Version:        {__version__}\n" in (ROOT / "packaging/letracode.spec").read_text()
+    assert f"LetraCode-{__version__}.tar.gz" in (ROOT / "packaging/build-rpm.sh").read_text()
+
+
+def test_portable_archive_preserves_binary_files_and_folder_layout(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("windows_release", ROOT / "packaging/build-windows.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    bundle = tmp_path / "Bundle with spaces"
+    (bundle / "_internal").mkdir(parents=True)
+    payload = b"MZ\x00\r\n\xffbinary"
+    (bundle / "LetraCode.exe").write_bytes(payload)
+    (bundle / "_internal/python311.dll").write_bytes(payload)
+    zipped = module.portable_archive(bundle, tmp_path, "0.3.0")
+    with zipfile.ZipFile(zipped) as archive:
+        assert set(archive.namelist()) == {
+            "LetraCode-0.3.0/LetraCode.exe", "LetraCode-0.3.0/_internal/python311.dll"}
+        assert all(archive.read(name) == payload for name in archive.namelist())
 
 
 def test_release_archives_include_both_platform_installers_and_are_reproducible(tmp_path):

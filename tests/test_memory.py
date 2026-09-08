@@ -6,6 +6,8 @@ import zipfile
 
 import pytest
 
+from letracode import filesystem as fs
+
 from letracode.store import Store
 
 
@@ -353,7 +355,7 @@ def test_missing_schema3_registry_fails_closed_without_recreating_defaults(tmp_p
 
 
 def test_root_migration_waits_for_existing_writer_and_holds_sqlite_lock(tmp_path, monkeypatch):
-    import fcntl
+    from letracode import filesystem as fs
     import shutil
     import threading
     import letracode.store as store_module
@@ -366,9 +368,9 @@ def test_root_migration_waits_for_existing_writer_and_holds_sqlite_lock(tmp_path
     with s.connection() as db:
         db.execute('PRAGMA user_version=2')
     attempted = threading.Event(); finished = threading.Event(); result = []
-    real_flock = fcntl.flock; real_class = store_module.MemoryFiles
+    real_flock = fs.flock; real_class = store_module.MemoryFiles
     def observed_flock(fd, operation):
-        if threading.current_thread().name == 'migrate-memory' and operation == fcntl.LOCK_EX:
+        if threading.current_thread().name == 'migrate-memory' and operation == fs.LOCK_EX:
             attempted.set()
         return real_flock(fd, operation)
     def check_schema_lock(*args, **kwargs):
@@ -383,7 +385,7 @@ def test_root_migration_waits_for_existing_writer_and_holds_sqlite_lock(tmp_path
             result.append(error)
         finally:
             finished.set()
-    monkeypatch.setattr(fcntl, 'flock', observed_flock)
+    monkeypatch.setattr(fs, 'flock', observed_flock)
     monkeypatch.setattr(store_module, 'MemoryFiles', check_schema_lock)
     worker = threading.Thread(target=migrate, name='migrate-memory')
     with legacy._operation():
@@ -440,9 +442,11 @@ def test_move_refuses_replaced_ancestor_even_when_new_file_has_identical_bytes(t
                     (m.root / 'A/note.md').write_text('same bytes')
         return real_digest(path)
     monkeypatch.setattr(m, '_entry_digest', replaced)
-    with pytest.raises(ValueError, match='changed|identity'):
+    with pytest.raises((ValueError, PermissionError)):
         m.move('A/note.md', 'B/note.md', expected)
-    if parent == 'A':
+    if os.name == 'nt':
+        assert not (tmp_path / 'external').exists(), 'Native Windows guard must prevent the ancestor rename'
+    elif parent == 'A':
         assert (tmp_path / 'external/note.md').read_text() == 'same bytes'
     else:
         assert not (tmp_path / 'external/note.md').exists()

@@ -4,7 +4,8 @@ Every ordinary directory guard retains ALL ancestor handles without
 FILE_SHARE_DELETE, preventing pathname substitution while an operation runs.
 CreateFileW opens the final component itself (OPEN_REPARSE_POINT); reparse
 points and hard-linked file writes are refused. File handles share deletion so
-our recovery journal retains the real inode even with an external editor open.
+our recovery journal retains the real inode. Snapshot handles deny write
+sharing: close a busy editor write handle before reading or saving.
 Renames use SetFileInformationByHandle with ReplaceIfExists=False, never an
 existence-check/replace sequence. OS byte-range locks coordinate processes.
 
@@ -23,6 +24,7 @@ from ctypes import wintypes as w
 import errno
 import msvcrt
 import os
+import sys
 from pathlib import Path
 import stat as stat_module
 from contextlib import contextmanager
@@ -47,6 +49,10 @@ class FileInfo(ctypes.Structure):
                 ('links', w.DWORD), ('index_high', w.DWORD), ('index_low', w.DWORD)]
 
 
+class FileIdInfo(ctypes.Structure):
+    _fields_ = [('volume', ctypes.c_ulonglong), ('identity', ctypes.c_ubyte * 16)]
+
+
 class RenameInfo(ctypes.Structure):
     _fields_ = [('replace', w.DWORD), ('root', w.HANDLE),
                 ('length', w.DWORD), ('name', w.WCHAR * 1)]
@@ -65,6 +71,8 @@ kernel.CloseHandle.argtypes = [w.HANDLE]
 kernel.CloseHandle.restype = w.BOOL
 kernel.GetFileInformationByHandle.argtypes = [w.HANDLE, ctypes.POINTER(FileInfo)]
 kernel.GetFileInformationByHandle.restype = w.BOOL
+kernel.GetFileInformationByHandleEx.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
+kernel.GetFileInformationByHandleEx.restype = w.BOOL
 kernel.SetFileInformationByHandle.argtypes = [w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD]
 kernel.SetFileInformationByHandle.restype = w.BOOL
 kernel.LockFileEx.argtypes = [w.HANDLE, w.DWORD, w.DWORD, w.DWORD, w.DWORD, ctypes.POINTER(Overlapped)]
@@ -89,8 +97,8 @@ def _native(path):
     return '\\\\?\\' + text
 
 
-def _handle(path, access=READ_ATTRIBUTES, *, share_delete=True, disposition=OPEN_EXISTING):
-    sharing = SHARE_READ | SHARE_WRITE | (SHARE_DELETE if share_delete else 0)
+def _handle(path, access=READ_ATTRIBUTES, *, share_delete=True, share_write=True, disposition=OPEN_EXISTING):
+    sharing = SHARE_READ | (SHARE_WRITE if share_write else 0) | (SHARE_DELETE if share_delete else 0)
     handle = kernel.CreateFileW(_native(path), access, sharing, None, disposition,
                                 BACKUP_SEMANTICS | OPEN_REPARSE_POINT, None)
     if handle == INVALID_HANDLE:
@@ -130,10 +138,18 @@ def _stat(handle):
         mode = stat_module.S_IFLNK | 0o777
     if info.attributes & READONLY:
         mode &= ~0o222
-    return os.stat_result((mode, (info.index_high << 32) | info.index_low, info.volume,
+    inode, volume = (info.index_high << 32) | info.index_low, info.volume
+    if sys.version_info >= (3, 12):
+        identity = FileIdInfo()
+        if kernel.GetFileInformationByHandleEx(handle, 18, ctypes.byref(identity), ctypes.sizeof(identity)):
+            inode, volume = int.from_bytes(identity.identity, 'little'), identity.volume
+        elif ctypes.get_last_error() not in (1, 50, 87):
+            _error()
+    return os.stat_result((mode, inode, volume,
                            info.links, 0, 0, (info.size_high << 32) | info.size_low,
                            atime / 1e9, mtime / 1e9, ctime / 1e9),
-                          {'st_atime_ns': atime, 'st_mtime_ns': mtime, 'st_ctime_ns': ctime})
+                          {'st_atime_ns': atime, 'st_mtime_ns': mtime, 'st_ctime_ns': ctime,
+                           'st_file_attributes': info.attributes})
 
 
 class Directory:
@@ -206,7 +222,10 @@ def open(path, flags, mode=0o777, *, dir_fd=None):
         return Directory(target, [_directory(target)])
     access = READ | WRITE if flags & os.O_RDWR else WRITE if flags & os.O_WRONLY else READ
     disposition = CREATE_NEW if flags & os.O_CREAT and flags & os.O_EXCL else OPEN_ALWAYS if flags & os.O_CREAT else OPEN_EXISTING
-    handle = _handle(target, access, disposition=disposition)
+    # Windows only guarantees updated timestamps once writer handles close.
+    # Deny write sharing during snapshots; a busy editor fails closed instead
+    # of supplying a potentially mixed read with unchanged timestamps.
+    handle = _handle(target, access, share_write=access != READ, disposition=disposition)
     try:
         info = _info(handle)
         if info.attributes & (REPARSE | DIRECTORY) or info.links != 1:

@@ -2,14 +2,13 @@
 import copy
 import hashlib
 import json
-import shlex
 import subprocess
-import sys
 import threading
 import time
 
 import pytest
 
+from tools.run_acceptance import python_command
 from letracode.budgeting import RequestUsage
 from letracode.store import Store
 from letracode.tools import ToolExecutor
@@ -73,7 +72,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
     store, chat, folder = coding_chat(tmp_path, instructions)
     source = folder / 'clamp.py'
     original = 'def clamp(value):\n    return value\n' + '# Unchanged supporting module documentation.\n' * 700
-    source.write_text(original)
+    source.write_bytes(original.encode('utf-8'))
     (folder / 'verify.py').write_text(
         'from clamp import clamp\n'
         'print("SAVED TEST EVIDENCE " * 600, flush=True)\n'
@@ -82,7 +81,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
         'print("ACCEPTANCE_PASS")\n')
     subprocess.run(['git', 'init', '--quiet', str(folder)], check=True, capture_output=True)
     subprocess.run(['git', '-C', str(folder), 'add', 'clamp.py', 'verify.py'], check=True, capture_output=True)
-    command = f'{shlex.quote(sys.executable)} -B verify.py'
+    command = python_command('-B', 'verify.py')
     command_args = {'command': command, 'cwd': str(folder), 'timeout': 5}
     snapshots = []
     observed_failures = []
@@ -256,7 +255,7 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
               f'Path({str(started)!r}).open("a").write("started\\n"); '
               'print("PARTIAL_COMMAND_EVIDENCE", flush=True); time.sleep(30); '
               f'Path({str(forbidden)!r}).write_text("unexpected continuation")')
-    command = f'{shlex.quote(sys.executable)} -B -c {shlex.quote(script)}'
+    command = python_command('-B', '-c', script)
     engine = CodingEngine(lambda index, messages: call('run_command', {
         'command': command, 'cwd': str(folder), 'timeout': 60}))
     worker = ConversationWorker(store, chat, engine, web_enabled=False)

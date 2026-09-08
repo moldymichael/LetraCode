@@ -6,6 +6,8 @@ import zipfile
 
 import pytest
 
+from letracode import filesystem as fs
+
 from letracode.store import Store
 
 
@@ -300,4 +302,8 @@ def test_destination_parent_swap_cannot_redirect_export_or_leave_staging_bytes(t
     with pytest.raises((ValueError, OSError)):
         export(store, chat, outside / 'evaluation.zip')
     assert not (store.directory / 'evaluation.zip').exists()
-    assert list(moved.iterdir()) == []
+    if fs.IS_WINDOWS:
+        assert not moved.exists(), 'Native Windows guard must prevent the ancestor rename'
+        assert list(outside.iterdir()) == []
+    else:
+        assert list(moved.iterdir()) == []

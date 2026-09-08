@@ -47,6 +47,15 @@ jobs:
           python-version: '3.11'
           architecture: x64
       - run: python -m pip install -r packaging/windows-requirements.txt .
+      - name: Install verified Inno Setup compiler
+        shell: pwsh
+        run: |
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $installer
+          $expected = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+          if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Inno Setup checksum mismatch' }
+          $process = Start-Process $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru -Wait
+          if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
       - name: Build self-contained Windows downloads
         run: python packaging/build-windows.py
       - name: Install, open, update, uninstall, retain data and open portable app
@@ -79,9 +88,13 @@ jobs:
     env:
       QT_QPA_PLATFORM: offscreen
     steps:
-      - run: dnf install -y git python3 python3-pyside6 python3-pypdf python3-pytest rpm-build redhat-rpm-config
+      - run: dnf install -y git python3 python3-pyside6 python3-pypdf python3-pytest rpm-build redhat-rpm-config shadow-utils util-linux
       - uses: actions/checkout@v4
-      - run: python3 -m pytest -q --junitxml=fedora-tests.xml
+      - name: Test as an ordinary desktop user
+        run: |
+          useradd --create-home letracode-test
+          chown -R letracode-test:letracode-test "$GITHUB_WORKSPACE"
+          runuser -u letracode-test -- python3 -m pytest -q --junitxml=fedora-tests.xml
       - run: python3 -m compileall -q letracode packaging
       - run: bash -n install.sh uninstall.sh packaging/build-rpm.sh
       - run: packaging/build-rpm.sh

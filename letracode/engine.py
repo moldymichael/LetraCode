@@ -570,6 +570,13 @@ class LocalEngine:
 
         self._raise_if_cancelled(cancel)
         if not saw_done:
+            # Pipe EOF can arrive just before the OS reports process exit.
+            # Briefly settle that race before classifying an incomplete stream.
+            if process.poll() is None:
+                try:
+                    process.wait(timeout=0.1)
+                except subprocess.TimeoutExpired:
+                    pass
             if process.poll() is not None:
                 raise EngineError(
                     f"The local model server exited during completion (code {process.returncode})"

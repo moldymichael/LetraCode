@@ -131,8 +131,11 @@ def build(output: Path, iscc: str | None = None) -> list[Path]:
         raise RuntimeError("Inno Setup did not produce the expected installer")
     artifacts = [installer, portable_archive(bundle, output, release_version)]
     checksum = output / f"LetraCode-{release_version}-windows-SHA256SUMS.txt"
-    checksum.write_text("".join(f"{hashlib.file_digest(path.open('rb'), 'sha256').hexdigest()}  {path.name}\n"
-                                  for path in artifacts), encoding="utf-8")
+    hashes = []
+    for path in artifacts:
+        with path.open("rb") as content:
+            hashes.append(f"{hashlib.file_digest(content, 'sha256').hexdigest()}  {path.name}\n")
+    checksum.write_text("".join(hashes), encoding="utf-8")
     return [*artifacts, checksum]
 
 
