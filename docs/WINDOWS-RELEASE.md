@@ -2,7 +2,7 @@
 
 This release brings the current Project files interface and schema-3 backend
 to Windows 10 version 1809 or newer and Windows 11 x64. The Windows setup executable includes Python, Qt/PySide6
-and PDF support. Installation is per user, with a Start Menu shortcut and
+and PDF support. The publication build bundles Python 3.13. Installation is per user, with a Start Menu shortcut and
 standard Windows uninstall. The portable ZIP uses the same per-user data
 location. Neither distribution includes llama.cpp or model weights.
 
