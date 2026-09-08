@@ -46,7 +46,9 @@ def command_argv(command):
     # Encoding the script avoids an additional layer of Windows argv quoting.
     script = (
         "$ProgressPreference = 'SilentlyContinue'; "
-        '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); '
+        # Direct construction avoids importing the New-Object utility module
+        # before every command. Windows PowerShell 5+ supports ::new().
+        '[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false); '
         '$OutputEncoding = [Console]::OutputEncoding; '
         '\n' + command + '\n'
         'if ($?) { exit 0 }; '

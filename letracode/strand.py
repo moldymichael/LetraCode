@@ -108,23 +108,29 @@ def _read_at(fd, name, max_bytes=MAX_FILE_BYTES, *, with_stat=False, for_replace
         if opened.st_size > max_bytes:
             raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
         if for_replacement:
-            fs.check_replacement_permissions(incoming.fileno())
+            permissions = fs.check_replacement_permissions(incoming.fileno())
         data = incoming.read(max_bytes + 1)
         if len(data) > max_bytes:
             raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
         after = fs.fstat(incoming.fileno())
         if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, opened.st_mode) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_mode):
             raise ValueError(f'File changed while reading: {name}')
+    if for_replacement:
+        return data, opened, permissions
     return (data, opened) if with_stat else data
 
 
-def _write_new(fd, name, data, *, mode=None):
+def _write_new(fd, name, data, *, mode=None, permissions=None):
     # Publish control records only when complete: a killed process must not
     # leave a partial final journal or completion marker that poisons recovery.
     staging = '.strand-stage-' + uuid.uuid4().hex
     try:
         out_fd = fs.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | fs.O_NOFOLLOW, 0o600, dir_fd=fd)
         with os.fdopen(out_fd, 'wb') as out:
+            if permissions is not None and fs.check_replacement_permissions(out.fileno()) != permissions:
+                # Check the empty staged file before writing potentially
+                # private content under a broader inherited Windows DACL.
+                raise PermissionError('Replacement has different Windows permissions; saving was refused to preserve its access controls')
             out.write(data)
             out.flush()
             if mode is not None:
@@ -332,9 +338,26 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
         captured = False
         published = False
         try:
-            _write_new(recovery, temporary, data, mode=mode)
+            _write_new(recovery, temporary, data, mode=mode,
+                       permissions=None if observed is None else observed[2])
             proposed_info = fs.stat(temporary, dir_fd=recovery, follow_symlinks=False)
             proposed_identity = [proposed_info.st_dev, proposed_info.st_ino]
+
+            def check_permissions(permissions):
+                if permissions is None:  # POSIX retains its existing mode policy.
+                    return
+                proposed_fd = fs.open(temporary, os.O_RDONLY | fs.O_NOFOLLOW, dir_fd=recovery)
+                try:
+                    info = fs.fstat(proposed_fd)
+                    if [info.st_dev, info.st_ino] != proposed_identity:
+                        raise ValueError('Staged file identity changed before saving')
+                    if fs.check_replacement_permissions(proposed_fd) != permissions:
+                        raise PermissionError('Replacement has different Windows permissions; saving was refused to preserve its access controls')
+                finally:
+                    fs.close(proposed_fd)
+
+            if observed is not None:
+                check_permissions(observed[2])
             check_cancel()
             # Reopen the ancestor chain and compare directory identity before commit.
             with safe_directory(path.parent) as fresh:
@@ -352,6 +375,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
                         (expected_entry_identity is not None and [captured_snapshot[1].st_dev, captured_snapshot[1].st_ino] != list(expected_entry_identity)) or
                         (mode is not None and stat.S_IMODE(captured_snapshot[1].st_mode) != mode)):
                     raise ValueError(f'File changed; reload to resolve the conflict: {path}')
+                check_permissions(captured_snapshot[2])
             check_cancel()
             try:
                 rename_noreplace(recovery, temporary, fd, path.name)

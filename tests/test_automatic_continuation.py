@@ -130,11 +130,12 @@ def test_repeated_successful_read_stops_without_treating_saved_ids_as_progress(t
 
 
 def test_completed_command_is_not_reexecuted_to_recover_its_result(tmp_path):
+    import sys
     from tools.run_acceptance import python_command
     store,chat,paths,prompt=fixture(tmp_path,1)
     marker=tmp_path/'command-count.txt'
     command = python_command('-c', f'from pathlib import Path; Path({str(marker)!r}).open("ab").write(b"x")')
-    engine=Repeated('run_command',{'command':command,'cwd':str(tmp_path),'timeout':5})
+    engine=Repeated('run_command',{'command':command,'cwd':str(tmp_path),'timeout':30 if sys.platform == 'win32' else 5})
     worker=ConversationWorker(store,chat,engine)
     approvals=[]
     worker.approval_needed.connect(lambda p:(approvals.append(p),p.decide(True)))

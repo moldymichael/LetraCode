@@ -21,7 +21,8 @@
 - [ ] Integration: run full Linux suite and Windows CI, fix all platform failures,
   review the whole change and inspect startup. Update user docs with real results.
 - [ ] Publish: merge verified code into main, tag0.3.0 and publish a GitHub release
-  with Windows download and installation instructions. Verify public artifacts.
+  with Windows download and installation instructions. Verify private downloads
+  using an authenticated account; preserve the repository's private visibility.
 
 Baseline: main b1d4e82,656tests passed on Linux. Prior Windows work resides in
 another dirty checkout and has not received native execution validation.

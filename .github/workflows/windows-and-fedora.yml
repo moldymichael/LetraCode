@@ -26,8 +26,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
           architecture: x64
       - run: python -m pip install . pytest pytest-timeout pytest-instafail
-      - name: Verify native guarded file publication before the full suite
-        run: python -m pytest tests/test_filesystem.py -q -x --timeout=60 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-preflight"
+      - name: Verify native file safeguards and locked Memory migration before the full suite
+        run: python -m pytest tests/test_filesystem.py tests/test_windows_migration.py tests/test_memory.py::test_root_migration_waits_for_existing_writer_and_holds_sqlite_lock tests/test_memory.py::test_migration_preserves_identity_projects_receipts_recovery_and_drafts -q -x --timeout=60 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-preflight"
       - run: python -m pytest -q --instafail --timeout=300 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-tests" --junitxml=windows-tests.xml
       - run: python -m compileall -q letracode packaging
       - run: python packaging/build-release.py

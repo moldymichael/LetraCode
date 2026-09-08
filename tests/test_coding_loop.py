@@ -3,6 +3,7 @@ import copy
 import hashlib
 import json
 import subprocess
+import sys
 import threading
 import time
 
@@ -30,20 +31,6 @@ def paired(messages):
 def call(name, arguments, ident='step'):
     return {'role': 'assistant', 'content': '', 'tool_calls': [{
         'id': ident, 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(arguments)}}]}
-
-
-def print_command_diagnostics(store, chat):
-    for row in store.messages(chat):
-        if row['role'] != 'tool':
-            continue
-        message = json.loads(row['payload'])['message']
-        if message['name'] != 'run_command':
-            continue
-        result = json.loads(message['content'])
-        details = {key: result.get(key) for key in
-                   ('exit_code', 'timed_out', 'cancelled', 'output_limit_reached', 'error')}
-        details['output_tail'] = result.get('output', '')[-300:]
-        print('COMMAND_DIAGNOSTICS:', json.dumps(details))
 
 
 class CodingEngine:
@@ -96,7 +83,8 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
     subprocess.run(['git', 'init', '--quiet', str(folder)], check=True, capture_output=True)
     subprocess.run(['git', '-C', str(folder), 'add', 'clamp.py', 'verify.py'], check=True, capture_output=True)
     command = python_command('-B', 'verify.py')
-    command_args = {'command': command, 'cwd': str(folder), 'timeout': 5}
+    command_timeout = 30 if sys.platform == 'win32' else 5
+    command_args = {'command': command, 'cwd': str(folder), 'timeout': command_timeout}
     snapshots = []
     observed_failures = []
 
@@ -127,7 +115,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
             return call('run_command', command_args, str(index))
         if index == 6:
             assert result['exit_code'] == 0 and 'ACCEPTANCE_PASS' in result['output']
-            return call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': 5}, str(index))
+            return call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': command_timeout}, str(index))
         if index == 7:
             assert result['exit_code'] == 0
             assert '-    return value' in result['output'] and '+    return min(10, max(0, value))' in result['output']
@@ -162,7 +150,6 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
 
     worker.approval_needed.connect(approve)
     worker.run()
-    print_command_diagnostics(store, chat)
     assert store.messages(chat)[-1]['content'] == 'Acceptance passed after two failed checks. The saved Git diff is ready for review.'
     assert observed_failures == ['NEGATIVE_BOUNDARY', 'UPPER_BOUNDARY']
     assert approvals == ['command', 'write', 'command', 'write', 'command', 'command']
@@ -183,7 +170,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
     outcomes = [json.loads(message['content']) for message in packed if message.get('name') == 'run_command']
     assert any(item.get('context_truncated') for item in outcomes)
     assert [item['exit_code'] for item in outcomes] == [1, 1, 0, 0]
-    assert all(item['cwd'] == str(folder) and item['timeout'] == 5 for item in outcomes)
+    assert all(item['cwd'] == str(folder) and item['timeout'] == command_timeout for item in outcomes)
     assert [item['command'] for item in outcomes] == [command, command, command, 'git diff -- clamp.py']
     assert store.messages(chat) == saved
     reopened = Store(tmp_path / 'data')
@@ -193,7 +180,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
                             threading.Event(), False, False, store=reopened, chat_id=chat)
     page = json.loads(executor.execute('read_tool_result', {'result_id': first_command['id'], 'max_chars': 16000}))
     recovered = json.loads(page['content'])
-    assert recovered['command'] == command and recovered['cwd'] == str(folder) and recovered['timeout'] == 5
+    assert recovered['command'] == command and recovered['cwd'] == str(folder) and recovered['timeout'] == command_timeout
     assert recovered['exit_code'] == 1 and 'NEGATIVE_BOUNDARY' in recovered['output']
     assert reopened.messages(chat) == saved
 
@@ -276,6 +263,8 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
     worker = ConversationWorker(store, chat, engine, web_enabled=False)
     watchers = []
     watched_start = []
+    stop_requested = []
+    readiness_timeout = 30 if sys.platform == 'win32' else 5
     read_seen = threading.Event()
     read = tools_module.os.read
 
@@ -299,7 +288,8 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
             pending.decide(allowed)
 
         def stop_started_command():
-            watched_start.append(read_seen.wait(5) and started.exists())
+            watched_start.append(read_seen.wait(readiness_timeout) and started.exists())
+            stop_requested.append(time.monotonic())
             worker.request_stop()
 
         watcher = threading.Thread(target=stop_started_command)
@@ -309,13 +299,14 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
     worker.approval_needed.connect(approve)
     begin = time.monotonic()
     worker.run()
-    print_command_diagnostics(store, chat)
-    print('COMMAND_ELAPSED_SECONDS:', time.monotonic() - begin)
     for watcher in watchers:
-        watcher.join(6)
+        watcher.join(readiness_timeout + 1)
         assert not watcher.is_alive()
     assert watched_start == [True]
-    assert time.monotonic() - begin < 8
+    # Shell startup is separate from cancellation responsiveness: once output
+    # is observed, stopping must still return promptly on every platform.
+    assert time.monotonic() - stop_requested[0] < 3
+    assert time.monotonic() - begin < readiness_timeout + 3
     assert engine.cancelled.wait(1)
     assert len(engine.requests) == 1
     assert started.read_text() == 'started\n'

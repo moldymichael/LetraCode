@@ -102,6 +102,10 @@ security.GetAclInformation.argtypes = [w.LPVOID, w.LPVOID, w.DWORD, ctypes.c_int
 security.GetAclInformation.restype = w.BOOL
 security.GetAce.argtypes = [w.LPVOID, w.DWORD, ctypes.POINTER(w.LPVOID)]
 security.GetAce.restype = w.BOOL
+security.IsValidSid.argtypes = [w.LPVOID]
+security.IsValidSid.restype = w.BOOL
+security.GetLengthSid.argtypes = [w.LPVOID]
+security.GetLengthSid.restype = w.DWORD
 
 
 kernel.CompareStringOrdinal.argtypes = [w.LPCWSTR, ctypes.c_int, w.LPCWSTR, ctypes.c_int, w.BOOL]
@@ -132,8 +136,8 @@ def _native(path):
     return '\\\\?\\' + text
 
 
-def _handle(path, access=READ_ATTRIBUTES, *, share_delete=True, share_write=True, disposition=OPEN_EXISTING):
-    sharing = SHARE_READ | (SHARE_WRITE if share_write else 0) | (SHARE_DELETE if share_delete else 0)
+def _handle(path, access=READ_ATTRIBUTES, *, share_delete=True, share_write=True, share_read=True, disposition=OPEN_EXISTING):
+    sharing = (SHARE_READ if share_read else 0) | (SHARE_WRITE if share_write else 0) | (SHARE_DELETE if share_delete else 0)
     handle = kernel.CreateFileW(_native(path), access, sharing, None, disposition,
                                 BACKUP_SEMANTICS | OPEN_REPARSE_POINT, None)
     if handle == INVALID_HANDLE:
@@ -207,7 +211,9 @@ class Directory:
 
 
 def _directory(path, *, share_delete=False):
-    handle = _handle(path, READ, share_delete=share_delete)
+    # Only the intentionally movable migration root is metadata-only. Ordinary
+    # readers keep GENERIC_READ so the exclusive rename handoff can exclude them.
+    handle = _handle(path, READ_ATTRIBUTES if share_delete else READ, share_delete=share_delete)
     try:
         info = _info(handle)
         if not info.attributes & DIRECTORY or info.attributes & REPARSE:
@@ -239,7 +245,9 @@ def safe_directory(path, create=False, *, allow_move=False):
             current /= windows_component(name)
             if create:
                 try:
-                    os.mkdir(_native(current), 0o700)
+                    # Use inherited ACLs consistently on every Python version.
+                    # Python 3.13 gives mode 0700 special, non-inherited ACLs.
+                    os.mkdir(_native(current))
                 except FileExistsError:
                     pass
             try:
@@ -306,7 +314,7 @@ def listdir(directory):
 
 
 def mkdir(path, mode=0o777, *, dir_fd=None):
-    return os.mkdir(_native(dir_fd.child(path)) if dir_fd is not None else path, mode)
+    return os.mkdir(_native(dir_fd.child(path)) if dir_fd is not None else path)
 
 
 def close(fd):
@@ -330,29 +338,32 @@ def fchmod(fd, mode):
 
 
 def check_replacement_permissions(fd):
-    """Refuse ACLs that a fresh file inheriting its directory cannot preserve.
+    """Validate a replaceable file and return its owner and ordered DACL entries.
 
-    Inspect the retained readable handle (GENERIC_READ includes READ_CONTROL),
+    Inspect the retained handle (both file GENERIC_READ and GENERIC_WRITE
+    include READ_CONTROL through their STANDARD_RIGHTS_READ/WRITE mappings),
     never a separately resolved pathname. Do not approximate custom access
-    controls using POSIX mode bits or replace them with inherited defaults.
+    controls using POSIX mode bits or assume inherited entries match a new file:
+    a file moved on the same volume can retain its old parent's permissions.
     GetSecurityInfo allocates the descriptor; its DACL/ACE pointers live until
     LocalFree. Only ordinary inherited allow/deny entries are supported.
     """
     refusal = 'File has custom or unreadable Windows permissions; saving was refused to preserve its access controls'
-    descriptor, dacl = w.LPVOID(), w.LPVOID()
-    result = security.GetSecurityInfo(msvcrt.get_osfhandle(fd), 1, 4,
-        None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    descriptor, owner, dacl = w.LPVOID(), w.LPVOID(), w.LPVOID()
+    result = security.GetSecurityInfo(msvcrt.get_osfhandle(fd), 1, 5,
+        ctypes.byref(owner), None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
     try:
         if result:
             raise PermissionError(refusal) from ctypes.WinError(result)
         control, revision = w.WORD(), w.DWORD()
         if (not descriptor or not security.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)) or
                 revision.value != 1 or not control.value & 0x4 or control.value & 0x1000 or
-                not dacl or not security.IsValidAcl(dacl)):
+                not dacl or not security.IsValidAcl(dacl) or not owner or not security.IsValidSid(owner)):
             raise PermissionError(refusal)
         details = AclSizeInfo()
         if not security.GetAclInformation(dacl, ctypes.byref(details), ctypes.sizeof(details), 2) or not details.count:
             raise PermissionError(refusal)
+        entries = []
         for index in range(details.count):
             ace = w.LPVOID()
             if not security.GetAce(dacl, index, ctypes.byref(ace)) or not ace:
@@ -360,6 +371,14 @@ def check_replacement_permissions(fd):
             header = AceHeader.from_address(ace.value)
             if header.size < ctypes.sizeof(AceHeader) or header.type not in (0, 1) or not header.flags & 0x10:
                 raise PermissionError(refusal)
+            entries.append(ctypes.string_at(ace, header.size))
+        # Ignore unused ACL allocation bytes; compare every complete ACE in
+        # order, including its flags, access mask and SID. Owner equality also
+        # preserves owner rights and resolved CREATOR_OWNER inheritance.
+        owner_size = security.GetLengthSid(owner)
+        if not owner_size:
+            raise PermissionError(refusal)
+        return ctypes.string_at(owner, owner_size), tuple(entries)
     finally:
         if descriptor:
             kernel.LocalFree(descriptor)
@@ -369,17 +388,23 @@ def unlink(path, *, dir_fd=None):
     return os.unlink(_native(dir_fd.child(path)) if dir_fd is not None else path)
 
 
-def _rename(src_fd, src, dst_fd, dst, *, replace=False, expected_identity=None):
+def _rename(src_fd, src, dst_fd, dst, *, replace=False, expected_identity=None, migration_lock=None):
     source, destination = src_fd.child(src), dst_fd.child(dst)
     # Source handle pins the actual entry through the atomic rename. All
     # ancestors are already held without delete sharing by the callers.
-    handle = _handle(source, DELETE | READ_ATTRIBUTES, share_delete=False)
+    handoff = migration_lock is not None
+    handle = _handle(source, DELETE | READ_ATTRIBUTES, share_delete=False,
+                     share_read=not handoff, share_write=not handoff)
     try:
         info = _stat(handle)
         if stat_module.S_ISLNK(info.st_mode) or (stat_module.S_ISREG(info.st_mode) and info.st_nlink != 1):
             raise ValueError(f'Unsafe linked rename source: {source}')
         if expected_identity is not None and (info.st_dev, info.st_ino) != tuple(expected_identity):
             raise ValueError('Directory identity changed before migration')
+        if handoff:
+            if replace or expected_identity is None or not stat_module.S_ISDIR(info.st_mode):
+                raise ValueError('Migration lock handoff requires the verified directory and a no-replace rename')
+            lock_identity = fstat(migration_lock[0])
         # SetFileInformationByHandle consumes a Win32 path. Supply its
         # terminating WCHAR as well as the byte count (excluding that NUL);
         # otherwise path conversion can read beyond the variable buffer.
@@ -389,14 +414,41 @@ def _rename(src_fd, src, dst_fd, dst, *, replace=False, expected_identity=None):
         record = RenameInfo.from_buffer(buffer)
         record.replace, record.root, record.length = int(replace), None, len(name)
         ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.name.offset, name, len(name))
-        if not kernel.SetFileInformationByHandle(handle, 3, buffer, size):
-            _error(str(destination))
+        lock_root = source
+        try:
+            if handoff:
+                # Windows refuses a directory rename while any descendant file
+                # is open, even with FILE_SHARE_DELETE. The exclusive directory
+                # handle now blocks every cooperating root reader; an existing
+                # reader/waiter would have prevented its acquisition above.
+                # Keep the lock file on disk and close only our owned handle.
+                os.close(migration_lock[0])
+                migration_lock[0] = None
+            if not kernel.SetFileInformationByHandle(handle, 3, buffer, size):
+                _error(str(destination))
+            lock_root = destination
+        finally:
+            if handoff and migration_lock[0] is None:
+                # Reopen the same inode before releasing the directory barrier,
+                # including after a refused rename. No other ordinary operation
+                # can enter the root during this brief lock handoff.
+                lock_handle = _handle(lock_root / '.write-lock', READ | WRITE)
+                try:
+                    reopened = _stat(lock_handle)
+                    if (not stat_module.S_ISREG(reopened.st_mode) or reopened.st_nlink != 1 or
+                            (reopened.st_dev, reopened.st_ino) != (lock_identity.st_dev, lock_identity.st_ino)):
+                        raise ValueError('Memory migration lock identity changed during directory rename')
+                    migration_lock[0] = msvcrt.open_osfhandle(lock_handle, os.O_RDWR | os.O_BINARY)
+                except BaseException:
+                    kernel.CloseHandle(lock_handle)
+                    raise
+                flock(migration_lock[0], LOCK_EX | LOCK_NB)
     finally:
         kernel.CloseHandle(handle)
 
 
-def rename_noreplace(src_fd, src, dst_fd, dst, *, expected_identity=None):
-    return _rename(src_fd, src, dst_fd, dst, expected_identity=expected_identity)
+def rename_noreplace(src_fd, src, dst_fd, dst, *, expected_identity=None, migration_lock=None):
+    return _rename(src_fd, src, dst_fd, dst, expected_identity=expected_identity, migration_lock=migration_lock)
 
 
 def replace(src, dst, *, src_dir_fd=None, dst_dir_fd=None):

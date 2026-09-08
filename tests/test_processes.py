@@ -34,6 +34,25 @@ def test_stop_kills_descendants_after_parent_exit(tmp_path):
 
 
 @pytest.mark.skipif(os.name != 'nt', reason='Native Windows job and console APIs')
+def test_windows_explicit_stop_has_unsuccessful_exit_code(tmp_path):
+    from letracode.processes import start_process, stop_process
+    ready = tmp_path / 'ready'
+    source = f'from pathlib import Path; import time; Path({str(ready)!r}).touch(); time.sleep(60)'
+    process = start_process([sys.executable, '-c', source])
+    try:
+        deadline = time.monotonic() + 20
+        while not ready.exists() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert ready.exists()
+        stopped_at = time.monotonic()
+        stop_process(process, timeout=1)
+        assert process.returncode not in (None, 0)
+        assert time.monotonic() - stopped_at < 3
+    finally:
+        stop_process(process)
+
+
+@pytest.mark.skipif(os.name != 'nt', reason='Native Windows job and console APIs')
 def test_windows_owned_process_has_no_console_window():
     from letracode.processes import start_process, stop_process
     source = 'import ctypes; print(ctypes.windll.kernel32.GetConsoleWindow(), flush=True)'

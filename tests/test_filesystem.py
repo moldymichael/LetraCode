@@ -318,6 +318,34 @@ def test_permission_refusal_preserves_original_source(tmp_path, monkeypatch, che
     assert source_files.snapshot(target)['raw'] == b'original\n'
 
 
+@pytest.mark.parametrize('changed_after_capture', [False, True])
+def test_replacement_permission_mismatch_keeps_original_source(tmp_path, monkeypatch, changed_after_capture):
+    from letracode import filesystem as fs, source_files
+    target = tmp_path / 'inherited-permissions.py'
+    target.write_bytes(b'original\n')
+    before = source_files.snapshot(target)
+    identity = target.stat().st_ino
+    original_checks = 0
+
+    def permissions(fd):
+        nonlocal original_checks
+        if fs.fstat(fd).st_ino == identity:
+            original_checks += 1
+            return 'same' if changed_after_capture and original_checks == 1 else 'restricted'
+        return 'same'
+
+    monkeypatch.setattr(fs, 'check_replacement_permissions', permissions)
+    with pytest.raises(PermissionError, match='permissions.*preserve'):
+        source_files.publish(target, b'changed\n', before['sha256'], mode=before['mode'])
+    assert original_checks == (2 if changed_after_capture else 1)
+    assert target.read_bytes() == b'original\n'
+    assert target.stat().st_ino == identity
+    assert source_files.snapshot(target)['raw'] == b'original\n'
+    if not changed_after_capture:
+        recovery = tmp_path / '.letracode-recovery'
+        assert not any(path.read_bytes() for path in recovery.rglob('*') if path.is_file())
+
+
 @pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows access control lists')
 @pytest.mark.parametrize('permission_kind', ['explicit', 'protected'])
 def test_windows_custom_acl_save_is_refused_without_changes(tmp_path, permission_kind):
@@ -337,6 +365,44 @@ def test_windows_custom_acl_save_is_refused_without_changes(tmp_path, permission
     subprocess.run(['icacls', str(target), '/save', str(after_acl), '/q'], check=True, capture_output=True)
     assert target.read_bytes() == b'original\n'
     assert target.stat().st_ino == identity
+    assert before_acl.read_bytes() == after_acl.read_bytes()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows inherited access control lists')
+def test_windows_moved_private_file_keeps_inherited_permissions(tmp_path):
+    from letracode import source_files
+    private, public = tmp_path / 'private', tmp_path / 'public'
+    private.mkdir()
+    public.mkdir()
+    account = subprocess.run(['whoami'], check=True, capture_output=True, text=True).stdout.strip()
+    subprocess.run(['icacls', str(private), '/inheritance:r', '/grant:r', account + ':(OI)(CI)F', '/q'],
+                   check=True, capture_output=True)
+    target = private / 'inherited-permissions.py'
+    target.write_bytes(b'private original\n')
+    target = target.rename(public / target.name)
+    before = source_files.snapshot(target)
+    identity = target.stat().st_ino
+    before_acl, after_acl = tmp_path / 'before.acl', tmp_path / 'after.acl'
+    subprocess.run(['icacls', str(target), '/save', str(before_acl), '/q'], check=True, capture_output=True)
+    with pytest.raises(PermissionError, match='permissions.*preserve'):
+        source_files.publish(target, b'changed\n', before['sha256'], mode=before['mode'])
+    subprocess.run(['icacls', str(target), '/save', str(after_acl), '/q'], check=True, capture_output=True)
+    assert target.read_bytes() == b'private original\n'
+    assert target.stat().st_ino == identity
+    assert before_acl.read_bytes() == after_acl.read_bytes()
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows inherited access control lists')
+def test_windows_ordinary_inherited_file_permissions_survive_save(tmp_path):
+    from letracode import source_files
+    target = tmp_path / 'ordinary.py'
+    target.write_bytes(b'original\n')
+    before = source_files.snapshot(target)
+    before_acl, after_acl = tmp_path / 'before.acl', tmp_path / 'after.acl'
+    subprocess.run(['icacls', str(target), '/save', str(before_acl), '/q'], check=True, capture_output=True)
+    source_files.publish(target, b'changed\n', before['sha256'], mode=before['mode'])
+    subprocess.run(['icacls', str(target), '/save', str(after_acl), '/q'], check=True, capture_output=True)
+    assert target.read_bytes() == b'changed\n'
     assert before_acl.read_bytes() == after_acl.read_bytes()
 
 

@@ -81,7 +81,7 @@ def stop_process(process, timeout=2.0):
     if sys.platform == 'win32':
         job = getattr(process, '_letracode_job', None)
         if job is not None:
-            job.close()
+            job.terminate()
         elif process.poll() is None:
             process.kill()
     else:
@@ -152,6 +152,7 @@ class _WindowsJob:
             'CreateJobObjectW': ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
             'SetInformationJobObject': ([wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD], wintypes.BOOL),
             'AssignProcessToJobObject': ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+            'TerminateJobObject': ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
             'OpenProcess': ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
             'CloseHandle': ([wintypes.HANDLE], wintypes.BOOL),
             'CreateToolhelp32Snapshot': ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
@@ -209,6 +210,16 @@ class _WindowsJob:
             raise OSError('Could not find the suspended child process thread')
         finally:
             self._kernel.CloseHandle(snapshot)
+
+    def terminate(self):
+        if self._handle:
+            try:
+                # Kill-on-close alone reports exit code zero on Windows.
+                # Explicit stops must not look like successful commands.
+                if not self._kernel.TerminateJobObject(self._handle, 1):
+                    raise ctypes.WinError(ctypes.get_last_error())
+            finally:
+                self.close()
 
     def close(self):
         if self._handle:

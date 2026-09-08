@@ -148,23 +148,26 @@ class Store:
         # Strand defaults. The whole-directory rename carries this same lock
         # inode; existing cooperating saves finish before migration proceeds.
         with safe_directory(root, allow_move=True) as directory:
-            lock = fs.open('.write-lock', os.O_RDWR | os.O_CREAT | fs.O_NOFOLLOW | fs.O_NONBLOCK,
-                           0o600, dir_fd=directory)
+            # Windows hands this owned handle through an exclusive directory
+            # barrier during the root rename, retaining the same lock inode.
+            lock = [fs.open('.write-lock', os.O_RDWR | os.O_CREAT | fs.O_NOFOLLOW | fs.O_NONBLOCK,
+                            0o600, dir_fd=directory)]
             try:
-                info = fs.fstat(lock)
+                info = fs.fstat(lock[0])
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise ValueError('Unsafe linked Memory migration lock')
-                fs.flock(lock, fs.LOCK_EX)
+                fs.flock(lock[0], fs.LOCK_EX)
                 # Lock order matches normal backup/deletion: Memory, SQLite.
                 with self.connection() as db:
                     db.execute('BEGIN IMMEDIATE')
                     current = db.execute('PRAGMA user_version').fetchone()[0]
                     effective = 3 if current == 3 else initial_version
-                    self._migrate_memory_tree_locked(effective, db, fs.fstat(directory))
+                    self._migrate_memory_tree_locked(effective, db, fs.fstat(directory), lock)
             finally:
-                fs.close(lock)
+                if lock[0] is not None:
+                    fs.close(lock[0])
 
-    def _migrate_memory_tree_locked(self, initial_version, migration_db, locked_root):
+    def _migrate_memory_tree_locked(self, initial_version, migration_db, locked_root, migration_lock):
         from .strand import rename_noreplace
         old, target = self.directory / 'strand', self.directory / 'Memory'
         marker = self.directory / 'memory-tree-migration.json'
@@ -199,7 +202,8 @@ class Store:
                 # recovery inodes, receipts, unknown files and deleted projects.
                 with safe_directory(old):
                     pass
-                options = {'expected_identity': (locked_root.st_dev, locked_root.st_ino)} if fs.IS_WINDOWS else {}
+                options = {'expected_identity': (locked_root.st_dev, locked_root.st_ino),
+                           'migration_lock': migration_lock} if fs.IS_WINDOWS else {}
                 rename_noreplace(directory, 'strand', directory, 'Memory', **options)
                 fs.fsync(directory)
         self.memory = MemoryFiles(target, legacy=record['legacy'], migration_locked=True)

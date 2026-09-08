@@ -7,6 +7,7 @@ import copy
 import hashlib
 import json
 import subprocess
+import sys
 import threading
 
 from tools.run_acceptance import python_command
@@ -228,7 +229,8 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
     sentinel.write_bytes(b'untouched sentinel\x00\xff')
     staged_before = git('diff', '--cached', '--binary')
     command = python_command('-B', 'verify.py')
-    args = {'command': command, 'cwd': str(folder), 'timeout': 5}
+    command_timeout = 30 if sys.platform == 'win32' else 5
+    args = {'command': command, 'cwd': str(folder), 'timeout': command_timeout}
     verification = []
     final = 'Verified clamp after negative and upper boundary failures. The final diff is ready for review.'
 
@@ -262,7 +264,7 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
         green = yield tool_call('run_command', args)
         assert green['exit_code'] == 0 and 'ACCEPTANCE_PASS' in green['output']
         verification.append(green)
-        diff = yield tool_call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': 5})
+        diff = yield tool_call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': command_timeout})
         assert '-    return value' in diff['output'] and '+    return min(10, max(0, value))' in diff['output']
         catalog = yield tool_call('list_tool_results', {'limit': 20})
         oldest_check = next(item for item in catalog['results'] if item['name'] == 'run_command')
@@ -307,13 +309,6 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
 
     worker.approval_needed.connect(scripted_fixture_approval)
     worker.run()
-    for _, message in saved_tools(store.messages(chat)):
-        if message['name'] == 'run_command':
-            result = json.loads(message['content'])
-            details = {key: result.get(key) for key in
-                       ('exit_code', 'timed_out', 'cancelled', 'output_limit_reached', 'error')}
-            details['output_tail'] = result.get('output', '')[-300:]
-            print('COMMAND_DIAGNOSTICS:', json.dumps(details))
     rows = assert_finished(store, chat, engine, objective, final, 32)
     assert len(retained_check_ids) == 1
     assert approvals == ['command', 'write', 'command', 'write', 'command', 'command']

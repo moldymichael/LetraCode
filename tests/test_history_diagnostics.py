@@ -1,5 +1,6 @@
 """Damaged history stays preserved and cannot authorize a stale Undo."""
 import json
+import os
 import zipfile
 
 import pytest
@@ -116,10 +117,23 @@ def test_retained_descriptor_edits_remain_preserved_and_report_exact_path(tmp_pa
     strand = Store(tmp_path / 'data').strand
     current = strand.path('global')
     current.write_bytes(b'Original')
+    before = strand.snapshot('global')['sha256']
     with current.open('r+b', buffering=0) as editor:
-        saved = strand.replace('global', 'New', strand.snapshot('global')['sha256'])
-        editor.write(b'External')
+        if os.name == 'nt':
+            # A Windows writer blocks a stable snapshot and directory move.
+            # Refuse the save until it closes; retain the exact original.
+            with pytest.raises(PermissionError):
+                strand.replace('global', 'New', before)
+            assert current.read_bytes() == b'Original'
+        else:
+            saved = strand.replace('global', 'New', before)
+            editor.write(b'External')
+    if os.name == 'nt':
+        saved = strand.replace('global', 'New', before)
     retained = current.parent / '.strand-recovery' / current.name / (saved['id'] + '.before')
+    if os.name == 'nt':
+        with retained.open('r+b', buffering=0) as editor:
+            editor.write(b'External')
     raw, inode = retained.read_bytes(), retained.stat().st_ino
     with pytest.raises(ValueError) as error:
         strand.snapshot('global')

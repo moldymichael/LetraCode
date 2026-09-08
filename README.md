@@ -37,6 +37,8 @@ retaining the current Project files interface, schema-3 data and recovery histor
 ## Install on Windows 10/11 (64-bit)
 
 Windows 10 version 1809 or newer, or Windows 11, is required.
+The repository and downloads are private; sign in to a GitHub account with
+repository access to download the release.
 
 1. Open the [LetraCode 0.3.0 downloads](https://github.com/moldymichael/LetraCode/releases/tag/v0.3.0).
 2. Download **LetraCode-0.3.0-windows-x64-setup.exe** and double-click it.

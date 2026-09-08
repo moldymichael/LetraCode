@@ -1,5 +1,6 @@
 import copy
 import json
+import sys
 import threading
 from pathlib import Path
 
@@ -10,6 +11,7 @@ from letracode.worker import ConversationWorker, conversation_messages
 
 
 class ScriptedEngine:
+    write_target = Path.cwd() / 'letracode-never-write-test'
     class Config:
         context_size = 8192
         max_tokens = 1024
@@ -25,7 +27,7 @@ class ScriptedEngine:
             assert 'denied' in messages[-1]['content'].lower()
             on_delta('The action was denied. No file was changed.')
             return {'role':'assistant','content':'The action was denied. No file was changed.'}
-        return {'role':'assistant','content':'','tool_calls':[{'id':'call_1','type':'function','function':{'name':'write_file','arguments':json.dumps({'path':str(Path('/tmp/letracode-never-write-test').absolute()),'content':'bad','expected_sha256':None})}}]}
+        return {'role':'assistant','content':'','tool_calls':[{'id':'call_1','type':'function','function':{'name':'write_file','arguments':json.dumps({'path':str(self.write_target),'content':'bad','expected_sha256':None})}}]}
     def cancel(self):
         pass
 
@@ -34,7 +36,9 @@ def test_worker_saves_denial_and_stops_without_another_model_request(tmp_path):
     s = Store(tmp_path / 'data')
     c = s.create_chat('Tools')
     s.add_message(c,'user','Try the action')
-    w = ConversationWorker(s, c, ScriptedEngine())
+    engine = ScriptedEngine()
+    engine.write_target = tmp_path / 'denied.txt'
+    w = ConversationWorker(s, c, engine)
     w.approval_needed.connect(lambda pending: pending.decide(False))
     w.run()
     messages = s.messages(c)
@@ -692,7 +696,7 @@ def test_worker_refreshes_source_context_before_each_model_request(tmp_path, mut
                 else:
                     script = f'from pathlib import Path; Path({str(source)!r}).write_text({after!r}); raise SystemExit(7)'
                     name, args = 'run_command', {'command': python_command('-c', script),
-                                                'cwd': str(folder), 'timeout': 5}
+                                                'cwd': str(folder), 'timeout': 30 if sys.platform == 'win32' else 5}
                 return {'role': 'assistant', 'content': '', 'tool_calls': [{
                     'id': 'change', 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}]}
             if mutation == 'failed_command':
