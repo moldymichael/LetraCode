@@ -37,6 +37,17 @@ def test_registry_rejects_duplicate_alias_and_live_destination(tmp_path):
         memory.core()
 
 
+def test_registry_save_rejects_duplicate_destination_before_publishing(tmp_path):
+    memory = Store(tmp_path / 'data').memory
+    meta, before = memory._metadata()
+    row = next(row for row in meta['files'].values() if row.get('legacy_scope') == 'identity')
+    duplicate = dict(row); duplicate.pop('legacy_scope')
+    meta['files']['a' * 32] = duplicate
+    with pytest.raises(ValueError, match='Duplicate live Memory destination'):
+        memory._save_metadata(meta, before)
+    assert memory.registry_path.read_bytes() == before
+
+
 @pytest.mark.parametrize('change', [
     {'operation': 'execute'}, {'source': '.memory.json'}, {'destination': '../outside'},
     {'status': 'approved'}, {'sha256': 'bad'}, {'inode': ['1', 2]},

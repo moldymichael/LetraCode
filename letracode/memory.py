@@ -153,29 +153,33 @@ class MemoryFiles(StrandFiles):
         if row['path'] not in row['history_paths']:
             raise ValueError('Current Memory path is absent from history identity')
 
+    def _validate_metadata(self, meta):
+        if not isinstance(meta, dict) or type(meta.get('version')) is not int or meta['version'] != 1 or not isinstance(meta.get('files'), dict):
+            raise ValueError('Unsupported registry format')
+        aliases, destinations = set(), set()
+        for ident, row in meta['files'].items():
+            self._validate_file_record(ident, row)
+            if row.get('legacy_scope') is not None:
+                alias = (row['legacy_scope'], row.get('project_id'))
+                if alias in aliases:
+                    raise ValueError('Duplicate Memory legacy alias')
+                aliases.add(alias)
+            if not row['deleted']:
+                if row['path'] in destinations:
+                    raise ValueError('Duplicate live Memory destination')
+                destinations.add(row['path'])
+
     def _metadata(self):
         raw = safe_read(self.registry_path, MAX_RECEIPT_BYTES)
         try:
             meta = json.loads(raw)
-            if not isinstance(meta, dict) or type(meta.get('version')) is not int or meta['version'] != 1 or not isinstance(meta.get('files'), dict):
-                raise ValueError('Unsupported registry format')
-            aliases, destinations = set(), set()
-            for ident, row in meta['files'].items():
-                self._validate_file_record(ident, row)
-                if row.get('legacy_scope') is not None:
-                    alias = (row['legacy_scope'], row.get('project_id'))
-                    if alias in aliases:
-                        raise ValueError('Duplicate Memory legacy alias')
-                    aliases.add(alias)
-                if not row['deleted']:
-                    if row['path'] in destinations:
-                        raise ValueError('Duplicate live Memory destination')
-                    destinations.add(row['path'])
+            self._validate_metadata(meta)
             return meta, raw
         except (TypeError, KeyError, ValueError) as error:
             raise ValueError(f'Memory registry is unavailable at {self.registry_path}: {error}. Existing files are preserved.') from error
 
     def _save_metadata(self, meta, before):
+        self._validate_metadata(meta)
         safe_write(self.registry_path, json.dumps(meta, ensure_ascii=False, indent=2).encode(),
                    None if before is None else digest(before), max_bytes=MAX_RECEIPT_BYTES)
 
@@ -726,7 +730,20 @@ class MemoryFiles(StrandFiles):
                 after[ident] = changed
         if files_after is not None:
             before = {ident: copy.deepcopy(meta['files'].get(ident)) for ident in files_after}
-            after = files_after
+            after = copy.deepcopy(files_after)
+        # The destination was checked absent on disk. Records left behind by
+        # an external removal belong to the old file, never its replacement.
+        # Retire them in the same journaled update, retaining all history.
+        for ident, row in meta['files'].items():
+            if ident not in after and not row['deleted'] and (
+                    row['path'] == destination or row['path'].startswith(destination + '/')):
+                if row.get('project_id') != project_id:
+                    raise ValueError('Destination registry crosses project ownership')
+                before[ident] = copy.deepcopy(row)
+                after[ident] = dict(row, deleted=True)
+        candidate = copy.deepcopy(meta)
+        candidate['files'].update(after)
+        self._validate_metadata(candidate)
         record = {'id': uuid.uuid4().hex, 'date': datetime.now(timezone.utc).isoformat(timespec='seconds'),
             'operation': operation, 'sequence': self._next_sequence(), 'project_id': project_id, 'source': source, 'destination': destination,
             'sha256': expected, 'inode': [info.st_dev, info.st_ino], 'kind': 'folder' if stat.S_ISDIR(info.st_mode) else 'file',
@@ -755,7 +772,14 @@ class MemoryFiles(StrandFiles):
                     (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1)):
                 record['status'] = 'aborted'; self._write_operation(record, prepared)
                 raise ValueError('Memory entry identity changed during operation; no entry was moved')
-            rename_noreplace(src, old.name, dst, target.name)
+            try:
+                rename_noreplace(src, old.name, dst, target.name)
+            except FileExistsError:
+                # Atomic NOREPLACE failed without moving the guarded source.
+                # Retain both entries, but finish this journal before a caller
+                # retries: two present names are otherwise ambiguous on restart.
+                record['status'] = 'aborted'; self._write_operation(record, prepared)
+                raise
             os.fsync(src); os.fsync(dst)
         if self._entry_digest(target) != expected:
             raise ValueError(f'Memory entry changed during operation; conflict retained at {target}')
@@ -775,8 +799,11 @@ class MemoryFiles(StrandFiles):
             return self._relocate(temporary, storage, self._entry_digest(self.root / temporary),
                                   project_id, 'create', files_after={})
 
-    def create_file(self, relative, text='', project_id=None):
-        if not isinstance(text, str) or len(text.encode('utf-8')) > MAX_FILE_BYTES:
+    def create_file(self, relative, text='', project_id=None, *, max_bytes=MAX_FILE_BYTES):
+        # Legacy SQLite exports may explicitly preserve larger opaque text.
+        # Ordinary editor/tool calls retain the normal bounded write limit.
+        if (type(max_bytes) is not int or max_bytes < 0 or not isinstance(text, str)
+                or len(text.encode('utf-8')) > max_bytes):
             raise ValueError('Invalid or oversized Memory text')
         storage = self._storage(relative, project_id); target = self._checked_storage(storage)
         if target.suffix.lower() not in ('.md', '.txt', '.markdown'):
@@ -785,7 +812,7 @@ class MemoryFiles(StrandFiles):
             with safe_directory(target.parent):
                 pass
             temporary = '.trash/create-' + uuid.uuid4().hex
-            safe_write(self.root / temporary, text.encode('utf-8'), None)
+            safe_write(self.root / temporary, text.encode('utf-8'), None, max_bytes=max_bytes)
             ident = uuid.uuid4().hex
             row = {'path': storage, 'project_id': project_id, 'always_active': False,
                 'history_paths': [storage], 'recovery_paths': [], 'deleted': False}
@@ -888,7 +915,14 @@ class MemoryFiles(StrandFiles):
             meta, _ = self._metadata()
             if any(meta['files'].get(ident) != row for ident, row in record.get('files_after', {}).items()):
                 raise ValueError('A later Memory change exists; operation cannot be undone')
-            for row in record.get('files_after', {}).values():
+            retired = {ident for ident, row in record.get('files_after', {}).items()
+                       if record['operation'] != 'delete' and row['deleted'] and
+                       record['files_before'].get(ident) is not None and
+                       not record['files_before'][ident]['deleted'] and
+                       record['files_before'][ident]['path'] == row['path']}
+            for ident, row in record.get('files_after', {}).items():
+                if ident in retired:
+                    continue
                 self._check_old_recovery(row)
                 current_path = self._checked_storage(row['path'])
                 if os.path.lexists(current_path.parent):
@@ -901,7 +935,8 @@ class MemoryFiles(StrandFiles):
             if record['operation'] == 'create':
                 prefix = f".projects/{record['project_id']}/" if record.get('project_id') else ''
                 return self.delete(record['destination'][len(prefix):], record['sha256'], record.get('project_id'))
-            before = copy.deepcopy(record.get('files_before', {}))
+            before = {ident: copy.deepcopy(row) for ident, row in record.get('files_before', {}).items()
+                      if ident not in retired}
             # Preserve knowledge of every historical receipt path and retained
             # recovery location even when reversing a user move.
             for ident, row in before.items():

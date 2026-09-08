@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .continuation import interrupted_outcome
 from .memory import MemoryFiles
-from .strand import BACKUP_CHUNK_BYTES, StrandFiles, backup_tree, digest, safe_directory, safe_read, safe_write
+from .strand import BACKUP_CHUNK_BYTES, MAX_FILE_BYTES, StrandFiles, backup_tree, digest, safe_directory, safe_read, safe_write
 
 
 def data_home() -> Path:
@@ -314,6 +314,52 @@ class Store:
             return
         with self.connection() as db:
             db.execute('UPDATE projects SET ' + ','.join(f'{k}=?' for k in fields) + ' WHERE id=?', (*fields.values(), ident))
+
+    def ensure_project_files(self, ident) -> Path:
+        """Export the former context field once, retaining the SQLite original.
+
+        Memory already lives in this tree. Use its durable create operation so
+        the remaining legacy field gets the same history and backup protection.
+        A failed marker commit can retry without replacing any existing file.
+        """
+        with self.memory._operation():
+            rows = self.rows('SELECT current_context FROM projects WHERE id=?', (ident,))
+            if not rows:
+                raise ValueError('Unknown project')
+            folder = self.memory.root_for(ident)
+            key = 'project_files_migrated:' + ident
+            if self.setting(key, False):
+                return folder
+            text = rows[0]['current_context']
+            name = None
+            if text:
+                original = text.encode('utf-8')
+                suffix = 0
+                while True:
+                    label = '' if suffix == 0 else ' (legacy)' if suffix == 1 else f' (legacy {suffix})'
+                    name = f'Current Context{label}.md'
+                    if os.path.lexists(folder / name):
+                        # Only reuse safely readable identical bytes after an
+                        # interrupted publication. Never overwrite a collision.
+                        try:
+                            if safe_read(folder / name, max_bytes=len(original)) == original:
+                                break
+                        except (OSError, ValueError, RuntimeError):
+                            pass
+                        suffix += 1
+                        continue
+                    try:
+                        self.memory.create_file(name, text, ident, max_bytes=max(MAX_FILE_BYTES, len(original)))
+                        break
+                    except FileExistsError:
+                        suffix += 1
+            self.set_setting(key, {'current_context': name})
+            return folder
+
+    def project_for_context(self, ident):
+        self.ensure_project_files(ident)
+        project = self.project(ident)
+        return {**project, 'current_context': ''} if project else None
 
     def delete_project(self, ident):
         """Archive the actual memory inode before deleting database ownership.

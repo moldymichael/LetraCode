@@ -1,5 +1,11 @@
 # Current implementation state
 
+The September 8 **0.2.1 Project files update** is implemented and installed. It
+replaces the three context tabs while preserving the schema-3 Memory recovery
+backend and the reliability/evaluation features below. See
+[the update and verification record](PROJECT-FILES-UPDATE.md). The latest full
+suite is **656 passed**; the earlier counts below are historical.
+
 The evaluation export and user-controlled Memory update uses branch
 `codex/evaluation-memory`, based on reliability commit `7863707`.
 See [migration, privacy and pre-install checks](EVALUATION-MEMORY.md) for its

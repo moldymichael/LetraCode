@@ -217,7 +217,7 @@ def test_history_identifies_user_files_instead_of_internal_recovery_paths(app, t
     dialog.close()
 
 
-def test_main_window_memory_action_opens_tree_and_refreshes_legacy_pane(app, tmp_path, monkeypatch):
+def test_main_window_files_action_opens_tree_and_refreshes_files(app, tmp_path, monkeypatch):
     from letracode.memory_ui import MemoryDialog
     from letracode.ui import MainWindow
     store = Store(tmp_path / 'data')
@@ -229,8 +229,9 @@ def test_main_window_memory_action_opens_tree_and_refreshes_legacy_pane(app, tmp
         assert dialog.save_current()
         return 0
     monkeypatch.setattr(MemoryDialog, 'exec', edit)
-    window.memory_button.click()
-    assert window.context_editors['memory'].toPlainText() == 'Edited in Memory tree'
+    window.files_panel.manage_button.click()
+    assert store.memory.file_snapshot(legacy_path)['text'] == 'Edited in Memory tree'
+    assert window.files_panel._select_path(store.memory.root_for() / legacy_path)
     window.close()
 
 
@@ -254,19 +255,24 @@ def test_intentionally_deleted_legacy_memory_does_not_block_chat(app, tmp_path, 
     window.close()
 
 
-def test_deletion_preserves_conflicting_legacy_pane_draft(app, tmp_path):
+def test_deletion_preserves_conflicting_file_editor_draft(app, tmp_path):
     from letracode.ui import MainWindow
     store = Store(tmp_path / 'data'); window = MainWindow(store)
-    window.context_editors['memory'].setPlainText('Unsaved pane draft')
+    from letracode.memory_ui import MemoryDialog
+    dialog = MemoryDialog(store)
+    dialog.select_path(store.strand.path('global').relative_to(store.memory.root_for()).as_posix())
+    dialog.editor.setPlainText('Unsaved pane draft')
     path = store.strand.path('global').relative_to(store.memory.root_for()).as_posix()
     before = store.memory.snapshot_entry(path)
     store.memory.delete(path, before['sha256'])
-    assert window.save_editors() is False
+    assert dialog.save_current() is False
+    dialog.close()
+    assert window.save_editors()
     assert store.setting('strand_draft_global_global')['text'] == 'Unsaved pane draft'
     window.close()
 
 
-def test_tree_alias_draft_is_not_autosaved_or_discarded_by_quick_pane(app, tmp_path, monkeypatch):
+def test_tree_alias_draft_is_not_autosaved_or_discarded_by_chat(app, tmp_path, monkeypatch):
     from letracode.memory_ui import MemoryDialog
     from letracode.ui import MainWindow
     store = Store(tmp_path / 'data'); window = MainWindow(store)
@@ -279,7 +285,6 @@ def test_tree_alias_draft_is_not_autosaved_or_discarded_by_quick_pane(app, tmp_p
         return 0
     monkeypatch.setattr(MemoryDialog, 'exec', draft)
     window.edit_memory()
-    assert window.context_editors['memory'].isReadOnly()
     window.composer.setPlainText('Independent conversation draft')
     assert window.save_editors()
     assert store.memory.file_snapshot(path)['text'] == ''
@@ -295,7 +300,7 @@ def test_tree_alias_draft_is_not_autosaved_or_discarded_by_quick_pane(app, tmp_p
 
 
 @pytest.mark.parametrize('tree_draft', [False, True])
-def test_generic_remember_undo_refreshes_alias_pane_or_preserves_pending_tree_draft(app, tmp_path, tree_draft):
+def test_generic_remember_undo_refreshes_files_or_preserves_pending_tree_draft(app, tmp_path, tree_draft):
     import json
     from PySide6.QtCore import QUrl
     from letracode.memory_ui import MemoryFileEditorState
@@ -317,7 +322,7 @@ def test_generic_remember_undo_refreshes_alias_pane_or_preserves_pending_tree_dr
         assert 'draft' in window.context_hint.text().lower()
     else:
         assert store.memory.file_snapshot(relative)['text'] == ''
-        assert window.context_editors['memory'].toPlainText() == ''
+        assert window.files_panel._select_path(store.memory.root_for() / relative)
         assert window.save_editors()
     window.close()
 

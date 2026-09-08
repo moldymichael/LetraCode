@@ -160,30 +160,33 @@ class MemoryFileEditorState:
 
 
 class MemoryDialog(QDialog):
-    def __init__(self, store, project_id=None, parent=None):
+    def __init__(self, store, project_id=None, parent=None, *, editor_only=False):
         super().__init__(parent)
         self.store = store
+        self.editor_only = editor_only
         self.state = None
         self.selected_snapshot = None
         self.items = {}
-        self.setWindowTitle('Memory folders — LetraCode')
-        self.resize(960, 680)
+        self.setWindowTitle('Files, saved drafts & history — LetraCode')
+        self.resize(760, 560) if editor_only else self.resize(960, 680)
+        if editor_only:
+            self.setWindowTitle('Edit file — LetraCode')
         layout = QVBoxLayout(self)
         note = QLabel('Organize ordinary Markdown and text files in your own folders. '
             'Only files marked always active are automatically included; other files can be listed, searched and read when relevant. '
             'Use Save file to apply edits. Navigation and Close keep unsaved drafts separately.')
         note.setWordWrap(True); layout.addWidget(note)
-        self.scope = QComboBox(); self.scope.addItem('Global Memory', None)
+        self.scope = QComboBox(); self.scope.addItem('Shared files', None)
         if project_id:
-            self.scope.addItem('This project’s Memory', project_id)
+            self.scope.addItem('Project files', project_id)
         layout.addWidget(self.scope)
         splitter = QSplitter(); layout.addWidget(splitter, 1)
-        browser = QWidget(); left = QVBoxLayout(browser); left.setContentsMargins(0, 0, 8, 0)
-        self.tree = QTreeWidget(); self.tree.setHeaderLabels(['Memory', 'Active'])
+        self.browser = browser = QWidget(); left = QVBoxLayout(browser); left.setContentsMargins(0, 0, 8, 0)
+        self.tree = QTreeWidget(); self.tree.setHeaderLabels(['File', 'Active'])
         self.tree.setColumnWidth(0, 240); left.addWidget(self.tree, 1)
-        for label, callback in [('New folder…', self.create_folder), ('New file…', self.create_file),
+        for label, callback in [('New folder…', self.create_folder), ('New note…', self.create_file),
                                 ('Rename / move…', self.move_selected), ('Delete…', self.delete_selected),
-                                ('Refresh tree', self.refresh_tree), ('Open Memory folder', self.open_folder)]:
+                                ('Refresh tree', self.refresh_tree), ('Open files folder', self.open_folder)]:
             button = QPushButton(label); button.clicked.connect(callback); left.addWidget(button)
         splitter.addWidget(browser)
         pane = QWidget(); right = QVBoxLayout(pane); right.setContentsMargins(8, 0, 0, 0)
@@ -192,7 +195,7 @@ class MemoryDialog(QDialog):
         self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         right.addWidget(self.path_label)
         self.editor = QPlainTextEdit(); right.addWidget(self.editor, 1)
-        self.always_active = QCheckBox('Always active for this Memory scope')
+        self.always_active = QCheckBox('Always include this file in context')
         self.always_active.setToolTip('Save file applies this choice. Project files are included only in that project.')
         right.addWidget(self.always_active)
         row = QHBoxLayout()
@@ -211,11 +214,25 @@ class MemoryDialog(QDialog):
         self.learning_grant.setToolTip('Only the existing learning-file grant. Other memory writes require review; saved changes retain Undo.')
         self.learning_grant.toggled.connect(lambda enabled: store.set_setting('strand_learning_grant', enabled))
         layout.addWidget(self.learning_grant)
+        self.detail_widgets = (note, self.scope, self.browser, self.always_active,
+                               self.history, self.undo_button, self.learning_grant)
+        self.details_toggle = QPushButton('History & file settings…')
+        self.details_toggle.setCheckable(True)
+        self.details_toggle.setVisible(editor_only)
+        self.details_toggle.toggled.connect(self.set_details_visible)
+        layout.addWidget(self.details_toggle)
+        if editor_only:
+            self.set_details_visible(False)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         buttons.rejected.connect(self.reject); layout.addWidget(buttons)
         self.tree.currentItemChanged.connect(self.change_file)
         self.scope.currentIndexChanged.connect(self.change_scope)
         self.change_scope()
+
+    def set_details_visible(self, visible):
+        for widget in self.detail_widgets:
+            widget.setVisible(visible)
+        self.details_toggle.setText('Hide history & file settings' if visible else 'History & file settings…')
 
     @property
     def project_id(self):
@@ -319,7 +336,7 @@ class MemoryDialog(QDialog):
         self.editor.clear(); self.editor.setReadOnly(True)
         self.always_active.setChecked(False); self.always_active.setEnabled(False)
         self.save_button.setEnabled(False)
-        self.path_label.setText('Select a memory file, or create a folder or file.')
+        self.path_label.setText('Select a file, or create a folder or note.')
         if item:
             path = item.data(0, Qt.ItemDataRole.UserRole)
             self.path_label.setText(path)
@@ -384,7 +401,7 @@ class MemoryDialog(QDialog):
         return True
 
     def new_path(self, title, default=''):
-        path, ok = QInputDialog.getText(self, title, 'Path within this Memory tree (for example, Research/notes.md):', text=default)
+        path, ok = QInputDialog.getText(self, title, 'Path within this folder (for example, Research/notes.md):', text=default)
         return path if ok and path else None
 
     def parent_path(self):
@@ -397,7 +414,7 @@ class MemoryDialog(QDialog):
 
     def create_folder(self, path=None):
         if not isinstance(path, str):
-            path = self.new_path('New Memory folder', self.parent_path())
+            path = self.new_path('New folder', self.parent_path())
         if not path:
             return False
         try:
@@ -428,7 +445,7 @@ class MemoryDialog(QDialog):
         if not path or not self.selected_snapshot:
             return False
         if not isinstance(destination, str):
-            destination = self.new_path('Rename or move in this Memory tree', path)
+            destination = self.new_path('Rename or move file', path)
         if not destination:
             return False
         try:

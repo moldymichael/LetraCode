@@ -14,16 +14,16 @@ from PySide6.QtGui import QAction, QDesktopServices, QFontDatabase, QIcon, QKeyS
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QSplitter, QTabWidget, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
+    QSplitter, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget)
 
 from . import __version__
-from .dialogs import ApprovalDialog, LinksDialog, ModelDialog
+from .dialogs import ApprovalDialog, ModelDialog
 from .engine import EngineConfig, LocalEngine
 from .worker import ConversationWorker
 from .store import message_status
-from .strand_ui import MemoryEditorState, StrandDialog
 from .memory_ui import MemoryDialog
+from .project_files import ProjectFilesPanel
 
 
 def assistant_html(text, font):
@@ -65,7 +65,6 @@ class MainWindow(QMainWindow):
         self.approval_dialog = None
         self.loading = False
         self.selection_ready = False
-        self.memory_state = None
         self.closing_when_stopped = False
         config_data = self.store.setting('engine',{})
         valid_fields = {f.name for f in dataclasses.fields(EngineConfig)}
@@ -191,35 +190,13 @@ class MainWindow(QMainWindow):
 
         self.context_panel = QWidget(); context = QVBoxLayout(self.context_panel)
         context.setContentsMargins(8,12,12,12)
-        context_title = QLabel('Context and Memory')
+        context_title = QLabel('Project files')
         font = context_title.font(); font.setBold(True); context_title.setFont(font)
         context.addWidget(context_title)
-        self.context_hint = QLabel('Shared with every chat in this project.\nEdits save automatically.')
+        self.context_hint = QLabel('Ordinary files and folders, shared across this project’s chats.')
         self.context_hint.setWordWrap(True); context.addWidget(self.context_hint)
-        tabs = QTabWidget()
-        self.context_editors = {}
-        fields = [('Memory','memory','Durable facts, decisions and preferences.'),('Current Context','current_context','What you are working on now, open questions and next steps.'),('Instructions','instructions','How the AI should work with this project.')]
-        for label,key,placeholder in fields:
-            edit = QPlainTextEdit(); edit.setPlaceholderText(placeholder)
-            edit.textChanged.connect(self.schedule_save)
-            tabs.addTab(edit,label); tabs.setTabToolTip(tabs.count()-1,'Current Context' if key=='current_context' else label)
-            self.context_editors[key] = edit
-        context.addWidget(tabs,1)
-        self.memory_reload = QPushButton('Reload memory file')
-        self.memory_reload.setToolTip('Use the external file version. Copy any unsaved editor text first; Reload discards that draft.')
-        self.memory_reload.clicked.connect(self.reload_memory)
-        context.addWidget(self.memory_reload)
-        self.memory_button = QPushButton('Memory folders…')
-        self.memory_button.clicked.connect(self.edit_memory)
-        self.strand_button = self.memory_button  # Compatibility for busy-state handling.
-        context.addWidget(self.memory_button)
-        self.links_summary = QLabel(); self.links_summary.setWordWrap(True); context.addWidget(self.links_summary)
-        self.links_button = QPushButton(QIcon.fromTheme('insert-link'),'Linked files & folders…')
-        self.links_button.clicked.connect(self.manage_links)
-        context.addWidget(self.links_button)
-        self.open_project_button = QPushButton(QIcon.fromTheme('folder-open'),'Open linked folder')
-        self.open_project_button.clicked.connect(self.open_project_folder)
-        context.addWidget(self.open_project_button)
+        self.files_panel = ProjectFilesPanel(self.store, self)
+        context.addWidget(self.files_panel, 1)
         self.splitter.addWidget(self.context_panel)
         self.splitter.setSizes([240,700,320])
         self.splitter.setStretchFactor(1,1)
@@ -246,13 +223,15 @@ class MainWindow(QMainWindow):
         self.action(chat,'Search chats',lambda:self.search.setFocus(),'Ctrl+K')
         self.action(chat,'Find in conversation…',self.find_in_chat,'Ctrl+F')
         view = self.menuBar().addMenu('&View')
-        self.show_context_action = self.action(view,'Project context',lambda checked:self.context_panel.setVisible(checked))
+        self.show_context_action = self.action(view,'Project files',lambda checked:self.context_panel.setVisible(checked))
         self.show_context_action.setCheckable(True); self.show_context_action.setChecked(True)
         self.action(view,'Zoom in',lambda:self.transcript.zoomIn(),'Ctrl++')
         self.action(view,'Zoom out',lambda:self.transcript.zoomOut(),'Ctrl+-')
         settings = self.menuBar().addMenu('&Settings')
         self.mutation_actions.append(self.action(settings,'Model Setup…',self.model_setup))
-        self.mutation_actions.append(self.action(settings,'Memory folders…',self.edit_memory))
+        self.mutation_actions.append(self.action(settings,'Files, saved drafts & history…',self.edit_memory))
+        self.instructions_action = self.action(settings,'Project instructions…',self.edit_instructions)
+        self.mutation_actions.append(self.instructions_action)
         self.action(settings,'Unload model from memory',self.unload_model)
         help_menu = self.menuBar().addMenu('&Help')
         self.action(help_menu,'Getting started',self.getting_started)
@@ -309,25 +288,12 @@ class MainWindow(QMainWindow):
         chat = self.store.chat(chat_id) if chat_id else None
         self.chat_title.setText(chat['title'] if chat else project['title'] if project else 'A little room to think.')
         self.composer.setPlainText(chat['draft'] if chat else self.store.setting('unbound_draft_' + (project_id or 'global'),''))
-        for key,edit in self.context_editors.items():
-            edit.setPlainText(project.get(key,'') if project else '')
-            edit.setEnabled(project is not None or key == 'memory')
-        self.memory_state = MemoryEditorState(self.store, 'project' if project else 'global', project_id)
-        self.context_editors['memory'].setPlainText(self.memory_state.text)
-        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
-        self.links_button.setEnabled(project is not None)
-        self.open_project_button.setEnabled(project is not None)
-        self.context_hint.setText(self.memory_state.error or (('Project memory' if project else 'Global memory') + ' · edits save automatically.\n' + str(self.memory_state.snapshot['path'])))
-        self.refresh_links()
+        self.files_panel.set_project(project_id)
+        self.instructions_action.setEnabled(project is not None and not self.worker)
         self.loading = False
         self.selection_ready = True
         self.store.set_setting('last_chat',chat_id)
         self.render_chat()
-
-    def refresh_links(self):
-        links = self.store.links(self.project_id) if self.project_id else []
-        missing = sum(not Path(p).exists() for p in links)
-        self.links_summary.setText(f'{len(links)} linked file/folder' + ('s' if len(links)!=1 else '') + (f' · {missing} unavailable' if missing else ''))
 
     def schedule_save(self):
         if not self.loading:
@@ -341,60 +307,29 @@ class MainWindow(QMainWindow):
             self.store.set_draft(self.chat_id,self.composer.toPlainText())
         else:
             self.store.set_setting('unbound_draft_' + (self.project_id or 'global'),self.composer.toPlainText())
-        if self.project_id:
-            self.store.update_project(self.project_id,**{key:edit.toPlainText() for key,edit in self.context_editors.items() if key != 'memory'})
-        if self.memory_state:
-            ok = self.memory_state.save(self.context_editors['memory'].toPlainText())
-            self.context_editors['memory'].setReadOnly(not self.memory_state.available)
-            if not ok:
-                self.context_hint.setText(self.memory_state.error)
-                self.statusBar().showMessage('Memory conflict · external file preserved; editor draft saved separately' if self.memory_state.available else 'Memory unavailable · repair the file, then Reload memory file')
-                return False
-            self.loading = True
-            if self.context_editors['memory'].toPlainText() != self.memory_state.text:
-                self.context_editors['memory'].setPlainText(self.memory_state.text)
-            self.loading = False
         return True
 
-    def reload_memory(self):
-        if not self.memory_state or self.worker:
-            return
-        ok = self.memory_state.reload(self.context_editors['memory'].toPlainText())
-        self.loading = True
-        self.context_editors['memory'].setPlainText(self.memory_state.text)
-        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
-        self.loading = False
-        self.context_hint.setText('Reloaded memory from ' + str(self.memory_state.snapshot['path']) if ok else self.memory_state.error)
-
-    def edit_strand(self):
-        if self.worker:
-            return
-        self.save_editors()
-        dialog = StrandDialog(self.store, self.project_id, self)
-        dialog.exec()
-        # The dialog can resolve this pane's saved conflict. Reopen the state
-        # instead of reviving a stale buffer after a deliberate resolution.
-        self.memory_state = MemoryEditorState(self.store, 'project' if self.project_id else 'global', self.project_id)
-        self.loading = True
-        self.context_editors['memory'].setPlainText(self.memory_state.text)
-        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
-        self.loading = False
-        self.context_hint.setText(self.memory_state.error or str(self.memory_state.snapshot['path']))
-
     def edit_memory(self):
-        if self.worker:
+        if not self.worker:
+            self.save_editors()
+            self.files_panel.manage_files()
+
+    def edit_instructions(self):
+        if self.worker or self.project_id is None:
             return
-        self.save_editors()
-        dialog = MemoryDialog(self.store, self.project_id, self)
-        dialog.exec()
-        # Reopen the compatibility pane after tree edits, moves or resolutions.
-        # A removed alias remains unavailable instead of being recreated.
-        self.memory_state = MemoryEditorState(self.store, 'project' if self.project_id else 'global', self.project_id)
-        self.loading = True
-        self.context_editors['memory'].setPlainText(self.memory_state.text)
-        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
-        self.loading = False
-        self.context_hint.setText(self.memory_state.error or str(self.memory_state.snapshot['path']))
+        project = self.store.project(self.project_id)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Project instructions')
+        dialog.resize(640, 440)
+        layout = QVBoxLayout(dialog)
+        note = QLabel('How the assistant should work in this project. Files remain project evidence.')
+        note.setWordWrap(True); layout.addWidget(note)
+        editor = QPlainTextEdit(project['instructions']); layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.store.update_project(self.project_id, instructions=editor.toPlainText())
 
     def new_chat(self, checked=False):
         if self.worker:
@@ -465,7 +400,6 @@ class MainWindow(QMainWindow):
             return
         self.chat_id = None; self.project_id = None
         self.selection_ready = False
-        self.memory_state = None
         self.show_selection(None,None); self.refresh_tree()
         if archive:
             self.statusBar().showMessage('Project deleted · memory archived at ' + str(archive['path']))
@@ -473,18 +407,6 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self,'Project deleted · recovery record warning',archive['warning'])
         elif kind == 'project':
             self.statusBar().showMessage('Project deleted · no Memory files were present; Memory was not archived')
-
-    def manage_links(self):
-        if self.project_id and not self.worker:
-            LinksDialog(self.store,self.project_id,self).exec(); self.refresh_links()
-
-    def open_project_folder(self):
-        if not self.project_id:
-            return
-        links = self.store.links(self.project_id)
-        if links:
-            path = Path(links[0]); path = path if path.is_dir() else path.parent
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def model_setup(self):
         if self.worker:
@@ -508,7 +430,7 @@ class MainWindow(QMainWindow):
             self.model_setup()
             if not self.engine_config.model_path or not self.engine_config.executable:
                 return
-        # Save the unbound draft and resolve memory conflicts before selecting
+        # Save the unbound conversation draft before selecting
         # a new chat, whose composer would otherwise start empty.
         if self.save_editors() is False:
             return
@@ -542,13 +464,10 @@ class MainWindow(QMainWindow):
     def set_busy(self,busy):
         for widget in (self.tree,self.search,self.new_chat_button,self.new_project_button,self.model_button,self.composer,self.send_button,self.retry_button,self.mode,self.computer,self.internet,self.actions):
             widget.setEnabled(not busy)
-        for edit in self.context_editors.values():
-            edit.setEnabled(not busy and (self.project_id is not None or edit is self.context_editors['memory']))
-        self.strand_button.setEnabled(not busy)
-        self.memory_reload.setEnabled(not busy)
-        self.links_button.setEnabled(not busy and self.project_id is not None)
+        self.files_panel.set_busy(busy)
         for action in self.mutation_actions:
             action.setEnabled(not busy)
+        self.instructions_action.setEnabled(not busy and self.project_id is not None)
         self.stop_button.setEnabled(busy)
 
     def queue_render(self):
@@ -563,7 +482,7 @@ class MainWindow(QMainWindow):
         messages = self.store.messages(self.chat_id) if self.chat_id else []
         chunks = []
         if not messages:
-            chunks.append('<h2>What are we working on?</h2><p>Start a conversation, or create a project for work you want to return to.</p><p><b>Projects remember the context you give them.</b><br>Link your files and edit Memory, Current Context and Instructions. Every chat in that project can use them.</p><p><b>You control computer access.</b><br>Review commands, file edits and outgoing web requests before they run.</p>')
+            chunks.append('<h2>What are we working on?</h2><p>Start a conversation, or create a project for work you want to return to.</p><p><b>Projects remember the context you give them.</b><br>Add existing files and folders, or create a note in Project files. Every chat in that project can use them. Set project instructions in Settings.</p><p><b>You control computer access.</b><br>Review commands, file edits and outgoing web requests before they run.</p>')
             if not self.engine_config.model_path:
                 chunks.append('<p><a href="letracode:setup">Choose your local model →</a></p>')
         for message in messages:
@@ -666,23 +585,23 @@ class MainWindow(QMainWindow):
                 return
             try:
                 receipt = self.store.strand.receipt(ident)
-                affected = self.memory_state and (receipt['scope'], receipt.get('project_id')) == (self.memory_state.scope, self.memory_state.project_id)
-                if self.memory_state and receipt.get('project_id') == self.memory_state.project_id:
-                    # Generic remember uses a stable file identity; the quick
-                    # pane may address that same file through a legacy alias.
-                    current_path = self.store.strand.path(self.memory_state.scope, self.memory_state.project_id)
-                    affected = affected or str(current_path) == receipt.get('path')
-                if affected:
-                    text = self.context_editors['memory'].toPlainText()
-                    if self.memory_state.tree_draft or text != self.memory_state.snapshot['text']:
-                        self.memory_state.keep_draft(text)
-                        self.context_hint.setText('Your editor draft is kept separately. Save or Reload it in Memory folders before undoing a saved change.'
-                            if self.memory_state.tree_draft else 'Your editor draft is kept separately. Save or Reload memory file before undoing a saved change.')
-                        return
+                # A saved editor draft must survive task Undo unchanged. The
+                # file dialog includes missing paths and legacy aliases as well.
+                dialog = MemoryDialog(self.store, receipt.get('project_id'), self)
+                dialog.scope.setCurrentIndex(dialog.scope.findData(receipt.get('project_id')))
+                root = self.store.memory.root_for(receipt.get('project_id'))
+                try:
+                    relative = Path(receipt['path']).relative_to(root).as_posix()
+                    blocked = relative in dialog.saved_drafts()
+                except (KeyError, ValueError):
+                    blocked = bool(dialog.saved_drafts())
+                dialog.deleteLater()
+                if blocked:
+                    self.context_hint.setText('Your editor draft is kept separately. Save or Reload it in Files, saved drafts & history before undoing this change.')
+                    return
                 self.store.strand.undo(ident)
                 self.store.add_message(self.chat_id, 'notice', 'Memory save undone. Previous file contents restored.')
-                if affected:
-                    self.reload_memory()
+                self.files_panel.refresh()
                 self.render_chat()
             except (OSError, ValueError, RuntimeError) as error:
                 QMessageBox.warning(self, 'Memory could not be undone', str(error))
@@ -759,7 +678,7 @@ class MainWindow(QMainWindow):
         self.text_dialog('Engine log',path.read_text(encoding='utf-8',errors='replace')[-100000:] if path.exists() else 'The local engine has not written a log yet.')
 
     def getting_started(self):
-        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\nOn Fedora, the installer installs the system Qt dependency. Install the inference engine with:\n  sudo dnf install llama-cpp\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Current Context, Instructions and the quick Memory pane save automatically. Use Memory folders to organize Markdown and text files in nested folders; its Save file button applies edits and always-active choices. Navigation and Close keep tree drafts separately. Only always-active files are included automatically; other Memory is available to list, search and read when relevant.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
+        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\nOn Fedora, the installer installs the system Qt dependency. Install the inference engine with:\n  sudo dnf install llama-cpp\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Use Project files to add existing files and folders, create notes and folders, and open or edit files. Save file applies note edits; navigation and Close keep unsaved note drafts separately. Files, saved drafts & history provides recovery and Undo. Shared files are available across projects. Always-active notes are included automatically; other notes are available to list, search and read when relevant. Set Project instructions in Settings.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
 
     def closeEvent(self,event):
         if self.worker:

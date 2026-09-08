@@ -1,5 +1,5 @@
 Name:           letracode
-Version:        0.1.1
+Version:        0.2.1
 Release:        1%{?dist}
 Summary:        Private local AI conversations with project context
 License:        MIT
@@ -29,7 +29,7 @@ install -d %{buildroot}%{_bindir}
 cat > %{buildroot}%{_bindir}/letracode <<'EOF'
 #!/bin/sh
 export PYTHONPATH="%{_datadir}/letracode${PYTHONPATH:+:$PYTHONPATH}"
-exec %{_bindir}/python3 -m letracode "$@"
+exec %{_bindir}/python3 -P -m letracode "$@"
 EOF
 chmod 0755 %{buildroot}%{_bindir}/letracode
 
@@ -41,7 +41,7 @@ install -Dm0644 packaging/io.letracode.LetraCode.metainfo.xml \
     %{buildroot}%{_metainfodir}/io.letracode.LetraCode.metainfo.xml
 
 %check
-PYTHONPATH=%{buildroot}%{_datadir}/letracode %{_bindir}/python3 -m letracode --version
+PYTHONPATH=%{buildroot}%{_datadir}/letracode %{_bindir}/python3 -P -m letracode --version
 
 %files
 %license %{_licensedir}/%{name}/LICENSE
@@ -53,6 +53,9 @@ PYTHONPATH=%{buildroot}%{_datadir}/letracode %{_bindir}/python3 -m letracode --v
 %{_metainfodir}/io.letracode.LetraCode.metainfo.xml
 
 %changelog
+* Tue Sep 08 2026 LetraCode contributors - 0.2.1-1
+- File-first project interface with existing Memory recovery support
+
 * Sat Sep 05 2026 LetraCode contributors - 0.1.1-1
 - Remove unavailable python3-docx dependency; include bounded DOCX text reader
 

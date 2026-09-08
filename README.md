@@ -16,12 +16,17 @@ bodies are replaced by hashes and omission markers. Review conversation prose
 and notes before sharing; free-text secrets cannot all be detected automatically.
 An evaluation bundle is not a restorable backup.
 
-**Settings → Memory folders…** opens an ordinary Markdown/text directory tree.
-Create your own folders and files, rename or move them, and save edits explicitly.
-Mark individual files **Always active** to include them in prompts. Other Memory
-files remain available through listing, searching, and reading tools. Global and
-project trees have separate scope. The quick Memory pane retains its existing
-autosave behavior; tree drafts remain separate until Save or Reload.
+**Project files** puts your notes, folders and linked originals in one visible
+tree. Create notes and folders, attach existing files, or open them in your usual
+application. Text edits use explicit Save; external changes are checked before
+saving, and unsaved drafts and saved-change history remain recoverable.
+Project instructions live in a separate optional dialog.
+
+Existing Memory files stay in place. The former Current Context field is copied
+once to `Current Context.md`, preserving the original database value for recovery.
+A name collision gets a separate legacy filename. These notes become ordinary
+files available to the assistant's file tools. Existing always-active choices
+remain unchanged; advanced file settings and history remain accessible.
 
 Existing Strand files and their hidden recovery/history data migrate to `Memory`;
 your Strand identity remains your own configuration. Read the [migration and
@@ -31,14 +36,14 @@ Windows development checkout has not been integrated.
 
 ## Install on Fedora KDE
 
-1. Download `LetraCode-0.1.1.run`.
+1. Download `LetraCode-0.2.1.run`.
 2. Open Dolphin, go to Downloads, right-click an empty area, and choose
    **Open Terminal Here** (Konsole).
 3. Run:
 
    ```bash
-   chmod +x LetraCode-0.1.1.run
-   ./LetraCode-0.1.1.run
+   chmod +x LetraCode-0.2.1.run
+   ./LetraCode-0.2.1.run
    ```
 
 The installer shows the Fedora packages it needs, then uses `sudo dnf install`.
@@ -46,7 +51,7 @@ It installs only for your user. Start **LetraCode** from KDE's application
 launcher, or run `~/.local/bin/letracode` in Konsole.
 
 If you downloaded the source archive instead, extract it, open Konsole in the
-extracted `LetraCode-0.1.1` folder, and run `./install.sh`.
+extracted `LetraCode-0.2.1` folder, and run `./install.sh`.
 
 Version 0.1.1 fixes the Fedora 44 installation failure caused by the unavailable
 `python3-docx` package. It requires only `python3`, `python3-pyside6`, and

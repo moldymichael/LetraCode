@@ -148,6 +148,42 @@ def test_same_path_recreated_has_new_identity_and_independent_undo(tmp_path):
     assert m.file_snapshot('note.md')['text'] == 'new identity'
 
 
+def test_recreate_externally_removed_project_file_retires_old_identity(tmp_path):
+    store = Store(tmp_path / 'data'); project = store.create_project('Project')
+    m = store.memory
+    original = m.replace('project', 'Original project note', m.snapshot('project', project)['sha256'], project)
+    old_id = m.file_snapshot('Memory.md', project)['file_id']
+    m.path('project', project).unlink()
+    created = m.create_file('Memory.md', 'New project note', project)
+    reopened = Store(store.directory).memory
+    assert reopened.alias_deleted('project', project)
+    snapshot = reopened.file_snapshot('Memory.md', project)
+    assert snapshot['file_id'] != old_id and snapshot['text'] == 'New project note'
+    saved = reopened.replace_file('Memory.md', 'Edited new note', snapshot['sha256'], project)
+    reopened.undo(saved['id'])
+    assert reopened.file_snapshot('Memory.md', project)['text'] == 'New project note'
+    with pytest.raises(ValueError):
+        reopened.undo(original['id'])
+    assert (reopened.root / '.receipts' / (original['id'] + '.json')).exists()
+    assert created['status'] == 'saved'
+
+
+def test_move_into_externally_removed_destination_and_undo_keeps_old_identity_retired(tmp_path):
+    store = Store(tmp_path / 'data'); m = store.memory
+    m.create_file('destination.md', 'Former destination')
+    stale_id = m.file_snapshot('destination.md')['file_id']
+    (m.root / 'destination.md').unlink()
+    m.create_file('source.md', 'Moving note')
+    moved = m.move('source.md', 'destination.md', m.file_snapshot('source.md')['sha256'])
+    m = Store(store.directory).memory
+    assert m.file_snapshot('destination.md')['text'] == 'Moving note'
+    m.undo(moved['id'])
+    assert m.file_snapshot('source.md')['text'] == 'Moving note'
+    assert not (m.root / 'destination.md').exists()
+    meta = json.loads(m.registry_path.read_text())
+    assert meta['files'][stale_id]['deleted'] is True
+
+
 def test_tree_history_uses_sequences_and_cannot_undo_stale_create_by_matching_bytes(tmp_path):
     m = Store(tmp_path / 'data').memory
     created = m.create_file('note.md', 'original')

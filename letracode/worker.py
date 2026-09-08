@@ -436,7 +436,7 @@ class ConversationWorker(QThread):
             if pending:
                 raise RunHalted('unknown_outcome', 'A saved action has no recorded outcome. It may have run. Reconcile it before another action; automatic replay is blocked.')
 
-            project = self.store.project(chat['project_id']) if chat['project_id'] else None
+            project = self.store.project_for_context(chat['project_id']) if chat['project_id'] else None
             roots = self.store.links(chat['project_id']) if project else []
             query = '\n'.join(row['content'] for row in required if row['role'] == 'user')
             tools = []

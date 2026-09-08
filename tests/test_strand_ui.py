@@ -10,13 +10,31 @@ from letracode.store import Store
 from letracode.ui import MainWindow
 
 
+def file_dialog(store, project=None):
+    """Open an existing legacy file through the explicit file editor."""
+    from letracode.memory_ui import MemoryDialog
+    dialog = MemoryDialog(store, project)
+    dialog.scope.setCurrentIndex(dialog.scope.findData(project))
+    scope = 'project' if project else 'global'
+    relative = store.strand.path(scope, project).relative_to(store.memory.root_for(project)).as_posix()
+    # Missing aliases with no draft need an explicit state to inspect their
+    # unavailable condition; the normal file browser does not recreate them.
+    if not dialog.select_path(relative):
+        from letracode.memory_ui import MemoryFileEditorState
+        dialog.state = MemoryFileEditorState(store, relative, project)
+        dialog.show_state()
+    return dialog
+
+
 def test_global_memory_is_editable_and_external_correction_is_not_overwritten(tmp_path):
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data'); chat = store.create_chat('Global')
     w = MainWindow(store); w.select_chat(chat)
-    assert w.context_editors['memory'].isEnabled()
-    w.context_editors['memory'].setPlainText('User preference')
-    w.save_editors()
+    dialog = file_dialog(store)
+    assert not dialog.editor.isReadOnly()
+    dialog.editor.setPlainText('User preference')
+    assert dialog.save_current()
+    dialog.close()
     path = Path(store.strand.snapshot('global')['path'])
     assert path.read_text() == 'User preference'
     path.write_text('External correction', encoding='utf-8')
@@ -30,14 +48,19 @@ def test_conflicted_memory_draft_survives_close_and_reopen(tmp_path):
     store = Store(tmp_path / 'data'); project = store.create_project('Novel')
     chat = store.create_chat('Planning', project)
     w = MainWindow(store); w.select_chat(chat)
-    w.context_editors['memory'].setPlainText('Local unsaved change')
+    dialog = file_dialog(store, project)
+    dialog.editor.setPlainText('Local unsaved change')
     path = Path(store.strand.snapshot('project', project)['path'])
     path.write_text('External edit wins', encoding='utf-8')
-    assert w.save_editors() is False
+    assert dialog.save_current() is False
+    dialog.close()
+    assert w.save_editors()
     assert path.read_text() == 'External edit wins'
     w.close()
     again = MainWindow(Store(tmp_path / 'data')); again.select_chat(chat)
-    assert again.context_editors['memory'].toPlainText() == 'Local unsaved change'
+    reopened = file_dialog(again.store, project)
+    assert reopened.editor.toPlainText() == 'Local unsaved change'
+    reopened.close()
     assert path.read_text() == 'External edit wins'
     again.close()
 
@@ -69,7 +92,9 @@ def test_visible_memory_receipt_can_undo_and_refresh_editor(tmp_path):
     ident = receipt.get('receipt_id', receipt.get('id'))
     w.open_link(QUrl(f'letracode:undo-memory/{ident}'))
     assert 'Saved preference' not in store.strand.snapshot('global')['text']
-    assert 'Saved preference' not in w.context_editors['memory'].toPlainText()
+    dialog = file_dialog(store)
+    assert 'Saved preference' not in dialog.editor.toPlainText()
+    dialog.close()
     w.close()
 
 
@@ -109,11 +134,12 @@ def test_model_markdown_cannot_create_internal_undo_controls():
     assert doc.find('Official').charFormat().anchorHref() == 'https://example.org'
 
 
-def test_autosave_keeps_memory_cursor_and_editor_undo(tmp_path):
+def test_chat_autosave_leaves_file_cursor_and_editor_undo_untouched(tmp_path):
     from PySide6.QtGui import QTextCursor
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data'); w = MainWindow(store)
-    editor = w.context_editors['memory']
+    dialog = file_dialog(store)
+    editor = dialog.editor
     editor.setPlainText('First word')
     cursor = editor.textCursor(); cursor.movePosition(QTextCursor.MoveOperation.End)
     editor.setTextCursor(cursor); editor.insertPlainText(' added')
@@ -122,52 +148,64 @@ def test_autosave_keeps_memory_cursor_and_editor_undo(tmp_path):
     w.save_editors()
     assert editor.textCursor().position() == position
     assert editor.document().isUndoAvailable()
+    assert store.strand.snapshot('global')['text'] == ''
+    dialog.close()
     w.close()
 
 
-def test_dialog_resolution_does_not_revive_old_pane_draft(tmp_path, monkeypatch):
-    from letracode.strand_ui import StrandDialog
+def test_dialog_resolution_does_not_revive_old_file_draft(tmp_path, monkeypatch):
+    from letracode.memory_ui import MemoryDialog
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data'); w = MainWindow(store)
-    w.context_editors['memory'].setPlainText('Stale pane draft')
+    dialog = file_dialog(store)
+    dialog.editor.setPlainText('Stale file draft')
     Path(store.strand.snapshot('global')['path']).write_text('External correction')
-    assert w.save_editors() is False
+    assert dialog.save_current() is False
+    dialog.close()
     def resolve(dialog):
-        dialog.scope.setCurrentIndex(dialog.scope.findData('global'))
+        relative = store.strand.path('global').relative_to(store.memory.root_for()).as_posix()
+        dialog.select_path(relative)
         dialog.reload_current()
         dialog.editor.setPlainText('Resolved user version')
         assert dialog.save_current()
+        dialog.close()
         return 0
-    monkeypatch.setattr(StrandDialog, 'exec', resolve)
-    w.edit_strand()
-    assert w.context_editors['memory'].toPlainText() == 'Resolved user version'
+    monkeypatch.setattr(MemoryDialog, 'exec', resolve)
+    w.edit_memory()
+    assert store.strand.snapshot('global')['text'] == 'Resolved user version'
     assert store.setting('strand_draft_global_global') is None
     assert w.save_editors()
     w.close()
 
 
-def test_retry_preserves_conflicting_memory_and_does_not_add_a_turn(tmp_path, monkeypatch):
+def test_retry_preserves_conflicting_file_draft_and_external_original(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data'); chat = store.create_chat('Global')
     store.add_message(chat, 'user', 'An earlier request')
     w = MainWindow(store); w.select_chat(chat)
-    w.context_editors['memory'].setPlainText('Pending local correction')
+    dialog = file_dialog(store)
+    dialog.editor.setPlainText('Pending local correction')
     path = Path(store.strand.snapshot('global')['path']); path.write_text('External correction')
-    before = store.messages(chat)
-    monkeypatch.setattr(w, 'start_worker', lambda:None)
+    assert not dialog.save_current()
+    dialog.close()
+    observed = []
+    monkeypatch.setattr(w, 'start_worker', lambda: observed.append(True))
     w.retry_reply()
-    assert store.messages(chat) == before
+    assert observed == [True]
+    assert len(store.messages(chat)) == 2
     assert path.read_text() == 'External correction'
     assert store.setting('strand_draft_global_global')['text'] == 'Pending local correction'
     w.close()
 
 
-def test_retry_saves_pending_memory_before_starting_the_next_turn(tmp_path, monkeypatch):
+def test_retry_uses_explicitly_saved_file_before_starting_the_next_turn(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data'); chat = store.create_chat('Global')
     store.add_message(chat, 'user', 'An earlier request')
     w = MainWindow(store); w.select_chat(chat)
-    w.context_editors['memory'].setPlainText('Corrected before retry')
+    dialog = file_dialog(store)
+    dialog.editor.setPlainText('Corrected before retry')
+    assert dialog.save_current(); dialog.close()
     observed = []
     monkeypatch.setattr(w, 'start_worker', lambda:observed.append(store.strand.snapshot('global')['text']))
     w.retry_reply()
@@ -177,41 +215,36 @@ def test_retry_saves_pending_memory_before_starting_the_next_turn(tmp_path, monk
 
 
 @pytest.mark.parametrize('scope', ['global', 'project'])
-def test_first_send_memory_conflict_preserves_unsent_draft_after_reopen(tmp_path, monkeypatch, scope):
+def test_first_send_preserves_separate_conflicting_file_draft_after_reopen(tmp_path, monkeypatch, scope):
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data')
     project = store.create_project('Novel') if scope == 'project' else None
     w = MainWindow(store); w.show_selection(None, project)
     w.engine_config.model_path = str(tmp_path / 'unused.gguf')
     w.engine_config.executable = str(tmp_path / 'unused-server')
-    monkeypatch.setattr(w, 'start_worker', lambda:pytest.fail('Conflicted send started inference'))
+    monkeypatch.setattr(w, 'start_worker', lambda: None)
     draft = '  An unsent first question\nwith another line.  '
     w.composer.setPlainText(draft)
-    w.context_editors['memory'].setPlainText('Local memory draft')
+    dialog = file_dialog(store, project)
+    dialog.editor.setPlainText('Local memory draft')
     path = Path(store.strand.snapshot(scope, project)['path'])
     path.write_text('External memory correction', encoding='utf-8')
-
+    assert not dialog.save_current()
+    dialog.close()
     w.send()
-
-    assert w.composer.toPlainText() == draft
-    assert store.chats() == []
+    assert [message['content'] for message in store.messages(w.chat_id)] == [draft.strip()]
     assert path.read_text() == 'External memory correction'
     w.close()
-    again = MainWindow(Store(tmp_path / 'data')); again.show_selection(None, project)
-    assert again.composer.toPlainText() == draft
-    assert again.context_editors['memory'].toPlainText() == 'Local memory draft'
-    again.reload_memory()
-    again.engine_config.model_path = str(tmp_path / 'unused.gguf')
-    again.engine_config.executable = str(tmp_path / 'unused-server')
-    monkeypatch.setattr(again, 'start_worker', lambda:None)
-    again.send()
-    assert [message['content'] for message in store.messages(again.chat_id)] == [draft.strip()]
-    assert path.read_text() == 'External memory correction'
-    again.close()
+    again = MainWindow(Store(tmp_path / 'data'))
+    dialog = file_dialog(again.store, project)
+    assert dialog.editor.toPlainText() == 'Local memory draft'
+    assert dialog.reload_current()
+    assert dialog.editor.toPlainText() == 'External memory correction'
+    dialog.close(); again.close()
 
 
 @pytest.mark.parametrize('scope', ['global', 'project'])
-def test_successful_first_send_saves_memory_and_clears_only_sent_draft(tmp_path, monkeypatch, scope):
+def test_successful_first_send_uses_saved_memory_and_clears_only_sent_draft(tmp_path, monkeypatch, scope):
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data')
     project = store.create_project('Novel') if scope == 'project' else None
@@ -221,7 +254,9 @@ def test_successful_first_send_saves_memory_and_clears_only_sent_draft(tmp_path,
     w.engine_config.executable = str(tmp_path / 'unused-server')
     monkeypatch.setattr(w, 'start_worker', lambda:None)
     w.composer.setPlainText('My first question')
-    w.context_editors['memory'].setPlainText('Memory for the first question')
+    dialog = file_dialog(store, project)
+    dialog.editor.setPlainText('Memory for the first question')
+    assert dialog.save_current(); dialog.close()
 
     w.send()
 
@@ -235,14 +270,13 @@ def test_successful_first_send_saves_memory_and_clears_only_sent_draft(tmp_path,
     w.close()
 
 
-def test_memory_disappearing_during_first_chat_creation_keeps_transferred_draft(tmp_path, monkeypatch):
+def test_memory_disappearing_during_first_chat_creation_does_not_recreate_file(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data'); w = MainWindow(store)
     w.engine_config.model_path = str(tmp_path / 'unused.gguf')
     w.engine_config.executable = str(tmp_path / 'unused-server')
-    monkeypatch.setattr(w, 'start_worker', lambda:pytest.fail('Unavailable memory started inference'))
+    monkeypatch.setattr(w, 'start_worker', lambda: None)
     w.composer.setPlainText('Keep this first question')
-    w.context_editors['memory'].setPlainText('Memory before it disappears')
     path = Path(store.strand.snapshot('global')['path'])
     create_chat = store.create_chat
     def remove_memory_after_creation(*args):
@@ -250,17 +284,10 @@ def test_memory_disappearing_during_first_chat_creation_keeps_transferred_draft(
         path.unlink()
         return chat
     monkeypatch.setattr(store, 'create_chat', remove_memory_after_creation)
-
     w.send()
-
-    assert w.composer.toPlainText() == 'Keep this first question'
-    assert store.chat(w.chat_id)['draft'] == 'Keep this first question'
-    assert store.messages(w.chat_id) == []
+    assert [row['content'] for row in store.messages(w.chat_id)] == ['Keep this first question']
     assert not path.exists()
     w.close()
-    again = MainWindow(Store(tmp_path / 'data'))
-    assert again.composer.toPlainText() == 'Keep this first question'
-    again.close()
 
 
 @pytest.mark.parametrize('damage', ['missing', 'inaccessible', 'malformed'])
@@ -324,45 +351,37 @@ def test_unavailable_last_project_memory_does_not_block_app_or_other_chats(tmp_p
     store.add_message(affected, 'user', 'Still readable history')
     store.set_setting('last_chat', affected)
     path = Path(store.strand.snapshot('project', damaged)['path'])
-    if damage == 'missing':
-        path.unlink()
-    elif damage == 'inaccessible':
-        path.chmod(0)
-    else:
-        path.write_bytes(b'\xff malformed memory')
+    if damage == 'missing': path.unlink()
+    elif damage == 'inaccessible': path.chmod(0)
+    else: path.write_bytes(b'\xff malformed memory')
     w = None
     try:
         w = MainWindow(Store(tmp_path / 'data'))
         assert w.chat_id == affected
         assert 'Still readable history' in w.transcript.toPlainText()
-        assert w.context_editors['memory'].isReadOnly()
-        assert str(path) in w.context_hint.text()
-        assert 'unavailable' in w.context_hint.text().lower()
-        w.context_editors['current_context'].setPlainText('Project context remains editable')
-        w.composer.setPlainText('Keep this affected draft')
-        w.save_editors()
+        dialog = file_dialog(w.store, damaged)
+        assert dialog.editor.isReadOnly()
+        assert 'unavailable' in dialog.message.text().lower()
+        dialog.close()
+        w.composer.setPlainText('Keep this affected draft'); w.save_editors()
         w.select_chat(unrelated)
-        assert not w.context_editors['memory'].isReadOnly()
-        w.context_editors['memory'].setPlainText('Healthy memory')
-        w.composer.setPlainText('Unrelated draft')
-        assert w.save_editors()
+        dialog = file_dialog(w.store, healthy)
+        assert not dialog.editor.isReadOnly()
+        dialog.editor.setPlainText('Healthy memory'); assert dialog.save_current(); dialog.close()
+        w.composer.setPlainText('Unrelated draft'); assert w.save_editors()
         assert store.strand.snapshot('project', healthy)['text'] == 'Healthy memory'
         assert store.chat(unrelated)['draft'] == 'Unrelated draft'
         w.select_chat(affected)
         assert w.composer.toPlainText() == 'Keep this affected draft'
-        assert w.context_editors['current_context'].toPlainText() == 'Project context remains editable'
-        if damage == 'inaccessible':
-            path.chmod(0o600)
+        if damage == 'inaccessible': path.chmod(0o600)
         path.write_text('Externally repaired memory', encoding='utf-8')
-        w.reload_memory()
-        assert not w.context_editors['memory'].isReadOnly()
-        assert w.context_editors['memory'].toPlainText() == 'Externally repaired memory'
-        assert w.save_editors()
+        dialog = file_dialog(w.store, damaged)
+        assert not dialog.editor.isReadOnly()
+        assert dialog.editor.toPlainText() == 'Externally repaired memory'
+        dialog.close()
     finally:
-        if path.exists():
-            path.chmod(0o600)
-        if w:
-            w.close()
+        if path.exists(): path.chmod(0o600)
+        if w: w.close()
 
 
 def test_strand_dialog_unavailable_memory_is_readonly_and_reload_recovers(tmp_path):
@@ -642,12 +661,13 @@ def test_memory_receipt_link_blocks_undo_with_pending_affected_memory(tmp_path):
     message = {'role':'tool', 'name':'remember', 'tool_call_id':'saved', 'content':json.dumps(receipt)}
     store.add_message(chat, 'tool', message['content'], payload={'message':message})
     w = MainWindow(store); w.select_chat(chat)
-    w.context_editors['memory'].setPlainText('Pending local draft')
+    dialog = file_dialog(store)
+    dialog.editor.setPlainText('Pending local draft'); dialog.close()
     try:
         w.open_link(QUrl(f'letracode:undo-memory/{receipt["id"]}'))
         assert 'Saved memory' in store.strand.snapshot('global')['text']
-        assert w.context_editors['memory'].toPlainText() == 'Pending local draft'
-        assert store.setting(w.memory_state.key)['text'] == 'Pending local draft'
+        assert dialog.editor.toPlainText() == 'Pending local draft'
+        assert store.setting(dialog.state.key)['text'] == 'Pending local draft'
         assert len(store.messages(chat)) == 1
         assert 'Save' in w.context_hint.text() and 'Reload' in w.context_hint.text()
     finally:
@@ -663,12 +683,13 @@ def test_memory_receipt_link_does_not_save_an_unrelated_scope_draft(tmp_path):
     message = {'role':'tool', 'name':'remember', 'tool_call_id':'saved', 'content':json.dumps(receipt)}
     store.add_message(chat, 'tool', message['content'], payload={'message':message})
     w = MainWindow(store); w.select_chat(chat)
-    w.context_editors['memory'].setPlainText('Pending project draft')
+    dialog = file_dialog(store, project)
+    dialog.editor.setPlainText('Pending project draft'); dialog.close()
     try:
         w.open_link(QUrl(f'letracode:undo-memory/{receipt["id"]}'))
         assert store.strand.snapshot('global')['text'] == ''
         assert store.strand.snapshot('project', project)['text'] == 'Saved project memory'
-        assert w.context_editors['memory'].toPlainText() == 'Pending project draft'
+        assert dialog.editor.toPlainText() == 'Pending project draft'
     finally:
         w.close()
 

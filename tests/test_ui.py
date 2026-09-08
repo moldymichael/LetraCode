@@ -13,13 +13,14 @@ def test_native_project_context_and_draft_survive_reopen(tmp_path):
     c = s.create_chat('First chat',p)
     w = MainWindow(s)
     w.select_chat(c)
-    w.context_editors['memory'].setPlainText('A durable fact')
+    s.memory.create_file('Fact.md', 'A durable fact', project_id=p)
     w.composer.setPlainText('An unfinished question')
     w.save_editors()
     w.close()
     again = MainWindow(Store(tmp_path / 'data'))
     again.select_chat(c)
-    assert again.context_editors['memory'].toPlainText() == 'A durable fact'
+    assert again.files_panel._select_path(s.memory.root_for(p) / 'Fact.md')
+    assert s.memory.file_snapshot('Fact.md', project_id=p)['text'] == 'A durable fact'
     assert again.composer.toPlainText() == 'An unfinished question'
     assert again.styleSheet() == ''
     again.close()
@@ -142,7 +143,7 @@ def test_blocked_project_deletion_keeps_selection_context_and_draft(tmp_path, mo
     chat = store.create_chat('Keep this chat', project)
     w = MainWindow(store); w.show_selection(None, project); w.refresh_tree()
     w.composer.setPlainText('Keep this unsent draft')
-    w.context_editors['memory'].setPlainText('Keep this memory')
+    store.update_project(project, memory='Keep this memory')
     monkeypatch.setattr(QMessageBox, 'question', lambda *args:QMessageBox.StandardButton.Yes)
     warnings = []
     monkeypatch.setattr(QMessageBox, 'warning', lambda parent, title, message:warnings.append(message))
@@ -154,9 +155,9 @@ def test_blocked_project_deletion_keeps_selection_context_and_draft(tmp_path, mo
 
     assert w.project_id == project
     assert w.selection_ready
-    assert w.memory_state.project_id == project
+    assert w.files_panel.project_id == project
     assert w.composer.toPlainText() == 'Keep this unsent draft'
-    assert w.context_editors['memory'].toPlainText() == 'Keep this memory'
+    assert store.strand.snapshot('project', project)['text'] == 'Keep this memory'
     assert store.project(project) is not None and store.chat(chat) is not None
     assert store.setting('unbound_draft_' + project) == 'Keep this unsent draft'
     assert warnings and 'Memory changed' in warnings[0]
@@ -168,7 +169,7 @@ def test_project_deletion_explains_archive_and_shows_recovery_location(tmp_path,
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data'); project = store.create_project('Delete this project')
     w = MainWindow(store); w.show_selection(None, project); w.refresh_tree()
-    w.context_editors['memory'].setPlainText('Archive this memory')
+    store.update_project(project, memory='Archive this memory')
     confirmations = []
     def confirm(parent, title, message, *args):
         confirmations.append(message)
