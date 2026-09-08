@@ -1,7 +1,7 @@
 # Windows release 0.3.0
 
 This release brings the current Project files interface and schema-3 backend
-to Windows 10/11 x64. The Windows setup executable includes Python, Qt/PySide6
+to Windows 10 version 1809 or newer and Windows 11 x64. The Windows setup executable includes Python, Qt/PySide6
 and PDF support. Installation is per user, with a Start Menu shortcut and
 standard Windows uninstall. The portable ZIP uses the same per-user data
 location. Neither distribution includes llama.cpp or model weights.
@@ -26,9 +26,10 @@ retained recovery files still detect edits after a save.
 Windows data and guarded editable files must be on a local drive. UNC/network
 shares, device paths, junctions, symbolic links and directories explicitly
 configured for case-sensitive Windows filenames are refused by guarded storage.
-Read-only files must be made writable before saving. Files with custom or
-protected access-control lists remain readable, but saving is refused to
-preserve those permissions. File data and recovery
+Read-only files must be made writable before saving. Files with custom,
+protected or differing inherited access-control lists remain readable, but
+saving is refused when replacement cannot retain the same owner and permissions.
+The empty staged file is checked before writing content. File data and recovery
 records are flushed. Windows has no supported
 unprivileged equivalent of Linux directory fsync, so power-loss durability of
 directory entries follows Windows/filesystem guarantees. Existing collision,
@@ -49,7 +50,25 @@ window from Unicode paths containing spaces, and checks updates, uninstall,
 retained chats/notes/history and portable startup without Python on PATH.
 Its artifacts contain desktop screenshots and a lifecycle report.
 
-Final results and the verified release run are recorded here before publishing.
+The application source at `8d4149c9937312a3c5d5c2c9957d88733847eea3` passed
+[the complete Windows and Fedora verification run](https://github.com/moldymichael/LetraCode/actions/runs/34277778599)
+on September 8, 2026:
+
+- Windows Python 3.11: **704 passed, 20 skipped**, 451.55 seconds.
+- Windows Python 3.13: **704 passed, 20 skipped**, 468.65 seconds.
+- Windows Python 3.14: **704 passed, 20 skipped**, 469.85 seconds.
+- Fedora 44: **709 passed, 15 skipped**, 83.10 seconds; RPM/source builds passed.
+- Local Fedora offscreen run: **709 passed, 15 skipped**, 45.12 seconds,
+  with six existing Python 3.14 process-fork deprecation warnings.
+- Native installer/portable lifecycle: **passed**. Screenshots and the report
+  confirm startup, same-version update, uninstall, schema-3 chats/notes/history
+  retention, running-app protection and Unicode paths without Python on PATH.
+
+Skips cover host-specific behavior; native Windows filesystem, ACL, process and
+legacy migration checks ran on Windows. Independent review found no remaining
+blocking issues. Compilation and diff checks passed. Release documentation was
+then finalized; the publication build runs the same required checks again.
+
 The Windows CI host is Windows Server 2022; these tests do not claim a manual
 run on every Windows 10/11 edition or real-model quality. Inference behavior is
 tested with scripted local peers, while model and hardware compatibility depend
@@ -57,3 +76,4 @@ on the separately selected llama.cpp build and GGUF model.
 
 The installer is unsigned. Download it from the repository's versioned GitHub
 release and compare its SHA-256 checksum if Windows asks about its publisher.
+The repository and release downloads remain private and require repository access.
