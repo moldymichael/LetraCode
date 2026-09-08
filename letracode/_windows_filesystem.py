@@ -303,8 +303,11 @@ def _rename(src_fd, src, dst_fd, dst, *, replace=False, expected_identity=None):
             raise ValueError(f'Unsafe linked rename source: {source}')
         if expected_identity is not None and (info.st_dev, info.st_ino) != tuple(expected_identity):
             raise ValueError('Directory identity changed before migration')
-        name = str(destination).encode('utf-16-le')
-        size = max(ctypes.sizeof(RenameInfo), RenameInfo.name.offset + len(name))
+        # SetFileInformationByHandle consumes a Win32 path. Supply its
+        # terminating WCHAR as well as the byte count (excluding that NUL);
+        # otherwise path conversion can read beyond the variable buffer.
+        name = _native(destination).encode('utf-16-le')
+        size = max(ctypes.sizeof(RenameInfo), RenameInfo.name.offset + len(name) + ctypes.sizeof(w.WCHAR))
         buffer = ctypes.create_string_buffer(size)
         record = RenameInfo.from_buffer(buffer)
         record.replace, record.root, record.length = int(replace), None, len(name)

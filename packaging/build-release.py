@@ -41,6 +41,7 @@ def release_files() -> list[Path]:
     files.extend((ROOT / "docs").rglob("*.md"))
     files.extend((ROOT / "tools").glob("*.py"))
     files.extend((ROOT / ".github/workflows").glob("*.yml"))
+    files.extend((ROOT / "packaging/licenses").rglob("*.txt"))
     files.extend(ROOT / "packaging" / name for name in (
         "build-windows.py", "windows-launcher.py", "windows.iss",
         "windows-requirements.txt", "smoke-windows.py",

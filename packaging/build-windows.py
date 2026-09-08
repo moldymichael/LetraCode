@@ -62,6 +62,7 @@ def write_licenses(bundle: Path) -> None:
     """Keep wheel license texts and source pointers alongside replaceable DLLs."""
     licenses = bundle / "licenses"
     licenses.mkdir()
+    shutil.copytree(ROOT / "packaging/licenses/Qt", licenses / "Qt")
     notes = [
         "LetraCode includes Python, Qt for Python (PySide6/Shiboken), pypdf and the PyInstaller bootloader.",
         "The bundled Qt DLLs remain separate files in _internal and can be replaced with compatible builds.",

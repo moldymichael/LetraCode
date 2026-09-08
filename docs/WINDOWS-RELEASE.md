@@ -1,0 +1,55 @@
+# Windows release 0.3.0
+
+This release brings the current Project files interface and schema-3 backend
+to Windows 10/11 x64. The Windows setup executable includes Python, Qt/PySide6
+and PDF support. Installation is per user, with a Start Menu shortcut and
+standard Windows uninstall. The portable ZIP uses the same per-user data
+location. Neither distribution includes llama.cpp or model weights.
+
+Application files and user data have separate locations. Updating replaces the
+application; uninstall removes the application and shortcut. Both retain chats,
+settings, ordinary project notes and hidden recovery history. User data defaults
+to `%LOCALAPPDATA%\letracode`; an explicit `--data-dir` selects another local
+folder. The existing Linux installation and live data were preserved during
+development and release verification.
+
+## Storage and process behavior
+
+The existing save, history, conflict, backup and Undo algorithms use an explicit
+filesystem boundary. Linux keeps its descriptor-relative implementation.
+Windows retains native handles for directory ancestors, rejects reparse points,
+hardlinks and ambiguous Windows path aliases, and uses non-overwriting moves
+and cross-process locks. Native identities match Python's file identities
+across supported versions. Read snapshots refuse a conflicting open writer;
+retained recovery files still detect edits after a save.
+
+Windows data and guarded editable files must be on a local drive. UNC/network
+shares, device paths, junctions and symbolic links are refused by guarded
+storage. File data and recovery records are flushed. Windows has no supported
+unprivileged equivalent of Linux directory fsync, so power-loss durability of
+directory entries follows Windows/filesystem guarantees. Existing collision,
+interruption and recovery checks remain in place.
+
+Approved commands use PowerShell on Windows and Bash on Linux. The approval
+shows the shell and command. Windows Job Objects own the engine and command
+process trees, stop descendants on cancellation/timeout, and close them if the
+app exits. A packaged app temporarily restores the normal Windows DLL lookup
+when launching external programs so llama.cpp can load its own DLLs.
+
+## Verification
+
+Release verification runs in the repository's Windows and Fedora workflow.
+Windows source jobs exercise Python 3.11, 3.13 and 3.14. A separate native
+Windows job builds the actual installer and portable ZIP, opens a real Qt
+window from Unicode paths containing spaces, and checks updates, uninstall,
+retained chats/notes/history and portable startup without Python on PATH.
+Its artifacts contain desktop screenshots and a lifecycle report.
+
+Final results and the verified release run are recorded here before publishing.
+The Windows CI host is Windows Server 2022; these tests do not claim a manual
+run on every Windows 10/11 edition or real-model quality. Inference behavior is
+tested with scripted local peers, while model and hardware compatibility depend
+on the separately selected llama.cpp build and GGUF model.
+
+The installer is unsigned. Download it from the repository's versioned GitHub
+release and compare its SHA-256 checksum if Windows asks about its publisher.

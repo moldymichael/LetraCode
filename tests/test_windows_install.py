@@ -229,6 +229,7 @@ def test_installer_refuses_application_symlink(installer, locations, tmp_path, a
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Needs native Windows PowerShell, Python, venv and COM")
+@pytest.mark.timeout(300)
 def test_native_powershell_install_update_launch_and_uninstall(tmp_path):
     source = tmp_path / "Source With Spaces é 日本語"
     shutil.copytree(ROOT, source, ignore=shutil.ignore_patterns(".git", "__pycache__", ".pytest_cache", ".venv", "venv", "*.egg-info", "dist", "build"))

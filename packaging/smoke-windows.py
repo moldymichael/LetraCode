@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 from ctypes import wintypes
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -44,7 +45,7 @@ def native_window(process_id: int):
     return windows
 
 
-def launch_and_close(executable: Path, data: Path, work: Path, stage: str, env: dict) -> None:
+def launch_and_close(executable: Path, data: Path, work: Path, stage: str, env: dict, while_running=None) -> None:
     # No offscreen plugin: require an actual native Windows top-level window.
     child = subprocess.Popen([str(executable), "--data-dir", str(data)], cwd=work, env=env)
     try:
@@ -74,6 +75,8 @@ def launch_and_close(executable: Path, data: Path, work: Path, stage: str, env: 
             raise RuntimeError(f"{stage}: application crashed after opening")
         from PIL import ImageGrab
         ImageGrab.grab(all_screens=True).save(work / f"{stage}.png")
+        if while_running is not None:
+            while_running(child)
         user32 = ctypes.WinDLL("user32", use_last_error=True)
         user32.PostMessageW.argtypes = (wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
         if not user32.PostMessageW(window, 0x0010, 0, 0):  # WM_CLOSE
@@ -112,6 +115,31 @@ def run_installer(executable: Path, work: Path, log_name: str, *extra: str) -> N
         raise RuntimeError(f"{executable.name} exited {result.returncode}; see {work / log_name}")
 
 
+def installation_hashes(app: Path) -> dict:
+    result = {}
+    for path in app.rglob("*"):
+        if path.is_file():
+            with path.open("rb") as content:
+                result[path.relative_to(app).as_posix()] = hashlib.file_digest(content, "sha256").hexdigest()
+    return result
+
+
+def verify_running_app_protected(child, installer: Path, app: Path, work: Path) -> None:
+    before = installation_hashes(app)
+    for executable, stage, arguments in (
+        (installer, "blocked-update", [f"/DIR={app}"]),
+        (app / "unins000.exe", "blocked-uninstall", []),
+    ):
+        result = subprocess.run([str(executable), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+            f"/LOG={work / (stage + '.log')}", *arguments], cwd=work, timeout=45)
+        if result.returncode == 0:
+            raise RuntimeError(f"{stage}: installer accepted changes while the app was running")
+        if child.poll() is not None or not any(title == "LetraCode" for _, title in native_window(child.pid)):
+            raise RuntimeError(f"{stage}: the installer interrupted the open application")
+        if installation_hashes(app) != before:
+            raise RuntimeError(f"{stage}: a refused operation changed installed application files")
+
+
 def smoke(installer: Path, portable: Path, work: Path) -> dict:
     if sys.platform != "win32":
         raise RuntimeError("The installer smoke test requires native Windows")
@@ -142,7 +170,8 @@ def smoke(installer: Path, portable: Path, work: Path) -> dict:
     version = json.loads((app / "version.json").read_text(encoding="utf-8"))["version"]
     if version != installed_version:
         raise RuntimeError("Installer and bundled application versions differ")
-    launch_and_close(app / "LetraCode.exe", data, work, "installed-window", env)
+    launch_and_close(app / "LetraCode.exe", data, work, "installed-window", env,
+                     while_running=lambda child: verify_running_app_protected(child, installer, app, work))
     # Seed real chat rows and ordinary project/recovery files after the packaged
     # application has initialized its own current schema.
     with sqlite3.connect(data / "letracode.sqlite3") as db:
@@ -194,6 +223,7 @@ def smoke(installer: Path, portable: Path, work: Path) -> dict:
               "install": True, "same_version_update": True, "uninstall": True,
               "data_retained": True, "schema": 3, "portable_launch": True,
               "project_notes_and_recovery_retained": True,
+              "running_app_blocks_update_and_uninstall": True,
               "space_and_unicode_paths": True, "python_removed_from_path": True}
     (work / "report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     return report

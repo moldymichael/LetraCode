@@ -39,3 +39,6 @@ include = ["letracode*"]
 
 [tool.setuptools.package-data]
 letracode = ["assets/*.svg"]
+
+[tool.pytest.ini_options]
+markers = ["timeout(seconds): override the Windows CI test deadline for dependency installation"]

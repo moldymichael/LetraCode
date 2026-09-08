@@ -1,10 +1,18 @@
 # Current implementation state
 
-The September 8 **0.2.1 Project files update** is implemented and installed. It
+The **0.3.0 Windows release** adds a self-contained Windows x64 installer and
+portable download to the current app. Windows uses native file handles and
+process jobs; Fedora retains its existing filesystem and process behavior.
+Both keep schema 3 and the Project files interface. See the
+[Windows release verification record](WINDOWS-RELEASE.md) for platform checks,
+installer behavior and remaining boundaries. This release does not replace the
+separately installed Linux app during development.
+
+The September 8 **0.2.1 Project files update** was implemented and installed. It
 replaces the three context tabs while preserving the schema-3 Memory recovery
 backend and the reliability/evaluation features below. See
 [the update and verification record](PROJECT-FILES-UPDATE.md). The latest full
-suite is **656 passed**; the earlier counts below are historical.
+suite at that milestone was **656 passed**; the earlier counts below are historical.
 
 The evaluation export and user-controlled Memory update uses branch
 `codex/evaluation-memory`, based on reliability commit `7863707`.
@@ -20,9 +28,10 @@ The original `45092f1` checkout is older; application version 0.1.1 does not
 identify this baseline. Existing worktrees and live app data are preserved.
 
 The stack is Python 3.11+, PySide6/Qt, SQLite schema **3**, ordinary user-owned
-Memory directories and managed local llama.cpp inference. Linux filesystem primitives
-are required. Windows support is not implemented. There is one configured model
-with Instant/Thinking modes; model roles and platform changes remain decisions.
+Memory directories and managed local llama.cpp inference. Guarded storage uses
+Linux descriptor-relative operations or native Windows handles. There is one
+configured model with Instant/Thinking modes; multiple model roles remain a
+future decision.
 
 Existing capabilities include persistent chats/projects/drafts, guarded source
 edits, file hashes, retained recovery inodes, conflict-aware memory saves and

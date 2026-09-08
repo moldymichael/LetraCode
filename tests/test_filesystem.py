@@ -213,3 +213,33 @@ def test_windows_busy_editor_blocks_save_without_losing_bytes(tmp_path):
         fs.close(fd)
     assert Store(store.directory).memory.snapshot('global')['text'] == 'External save through retained handle'
     assert target.read_bytes() == b'External save through retained handle'
+
+
+def test_guarded_move_publishes_complete_unicode_name(tmp_path):
+    from letracode import filesystem as fs
+    destination = tmp_path / 'Recovered 日本語 é'
+    destination.mkdir()
+    (tmp_path / 'staging').write_bytes(b'complete')
+    with fs.safe_directory(tmp_path) as source, fs.safe_directory(destination) as target:
+        fs.rename_noreplace(source, 'staging', target, 'complete proposed 日本語 é.md')
+        assert fs.stat('complete proposed 日本語 é.md', dir_fd=target, follow_symlinks=False).st_size == 8
+    assert not (tmp_path / 'staging').exists()
+    assert (destination / 'complete proposed 日本語 é.md').read_bytes() == b'complete'
+
+
+def test_windows_ordinal_names_do_not_alias_private_memory(tmp_path, monkeypatch):
+    from letracode import filesystem as fs
+    from letracode.store import Store
+    memory = Store(tmp_path / 'data').memory
+    memory.create_file('Straße.md', 'private unselected notes')
+    (memory.root / 'Strasse.md').write_text('public reviewed notes', encoding='utf-8')
+    monkeypatch.setattr(fs, 'IS_WINDOWS', True)
+    reviewed = memory.file_snapshot('Strasse.md')
+    assert reviewed['file_id'] is None
+    memory.set_active('Strasse.md', True, reviewed['sha256'],
+                      expected_file_id=reviewed['file_id'],
+                      expected_entry_identity=reviewed['entry_identity'])
+    assert memory.file_snapshot('Straße.md')['always_active'] is False
+    context = memory.core()
+    assert 'public reviewed notes' in context
+    assert 'private unselected notes' not in context
