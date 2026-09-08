@@ -17,6 +17,7 @@ from .pause_context import payload as row_payload, resolve_intent
 from .continuation import RunHalted, RunLimits, RunProgress, interrupted_outcome
 from .evidence import evidence_state, request_exposure, source_evidence, summary as evidence_summary
 from .tools import ApprovalRequest, SAVED_READ_TOOLS, TOOL_SCHEMAS, ToolExecutor
+from .store import now
 
 
 class PendingApproval:
@@ -261,8 +262,22 @@ class ConversationWorker(QThread):
         self._cancel_thread = None
         self._check_dispatch = None
         self._approval_halted = None
+        self._approvals = []
+        config = getattr(engine, 'config', None)
+        self.run_configuration = {
+            'model_name': Path(getattr(config, 'model_path', '')).name,
+            'engine_name': Path(getattr(config, 'executable', '')).name,
+            'thinking': bool(thinking), 'mode': 'Thinking' if thinking else 'Instant',
+            'web_enabled': bool(web_enabled), 'computer_enabled': bool(computer_enabled),
+            'use_tools': bool(use_tools),
+        }
+        for key in ('context_size', 'max_tokens', 'gpu_layers', 'threads', 'temperature'):
+            value = getattr(config, key, None)
+            if type(value) in (int, float):
+                self.run_configuration[key] = value
 
     def ask(self, request):
+        decision = {'kind': request.kind, 'title': request.title, 'requested_at': now()}
         pending = PendingApproval(request)
         self.pending = pending
         self.status.emit('Waiting for your approval…')
@@ -279,7 +294,10 @@ class ConversationWorker(QThread):
                 # owns the saved input cursor. Carry the halt back to its batch
                 # pairing path instead of letting a stale approval authorize it.
                 self._approval_halted = error
+                self._approvals.append({**decision, 'decided_at': now(), 'decision': 'stale_input'})
                 return False
+        self._approvals.append({**decision, 'decided_at': now(), 'decision': (
+            'cancelled' if self.cancel_event.is_set() else 'approved' if pending.approved else 'denied')})
         return pending.approved and not self.cancel_event.is_set()
 
     def request_stop(self):
@@ -334,7 +352,8 @@ class ConversationWorker(QThread):
         name = call.get('function', {}).get('name', '')
         tool_message = {'role': 'tool', 'tool_call_id': call.get('id', ''), 'name': name, 'content': result}
         title = f'{name}\n\nArguments:\n{json.dumps(args, ensure_ascii=False, indent=2)}\n\nResult:\n{result}'
-        data = {'message': tool_message, 'arguments': args}
+        data = {'message': tool_message, 'arguments': args, 'approvals': self._approvals}
+        self._approvals = []
         try:
             data['source_evidence'] = source_evidence(name, json.loads(result))
         except (TypeError, ValueError) as error:
@@ -520,7 +539,8 @@ class ConversationWorker(QThread):
                     draft = ''
                     request_record = self.run_record()
                     message_id = self.store.add_message(self.chat_id, 'assistant', '', status='streaming',
-                        payload={'continuation': request_record, 'source_exposure_pending': exposure})
+                        payload={'continuation': request_record, 'source_exposure_pending': exposure,
+                                 'run_configuration': self.run_configuration})
                     self.changed.emit()
                     last_save = 0.0
 
@@ -539,7 +559,7 @@ class ConversationWorker(QThread):
                     response_id = message_id
                     data = {'message': reply, 'pause_context_closed': False,
                             'continuation': request_record, 'source_exposure': exposure,
-                            'request_completed': True}
+                            'request_completed': True, 'run_configuration': self.run_configuration}
                     self.store.update_message(message_id, draft, payload=data)
                     message_id = None
                     if prior_exposure != source_signature(self.store.messages(self.chat_id), 'exposed_ranges'):

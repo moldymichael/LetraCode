@@ -234,6 +234,7 @@ class MainWindow(QMainWindow):
         file = self.menuBar().addMenu('&File')
         self.mutation_actions = [self.action(file,'New &chat',self.new_chat,'Ctrl+N'), self.action(file,'New &project…',self.new_project,'Ctrl+Shift+N')]
         self.action(file,'&Export chat as Markdown…',self.export_chat,'Ctrl+Shift+E')
+        self.action(file,'Export Evaluation…',self.export_evaluation)
         self.action(file,'Back up chats, Strand and source backups…',self.backup)
         self.action(file,'Open data folder',lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.directory))))
         file.addSeparator(); self.action(file,'&Quit',self.close,'Ctrl+Q')
@@ -686,6 +687,24 @@ class MainWindow(QMainWindow):
         if ok and text and not self.transcript.find(text):
             cursor = self.transcript.textCursor(); cursor.movePosition(cursor.MoveOperation.Start); self.transcript.setTextCursor(cursor)
             self.transcript.find(text)
+
+    def export_evaluation(self):
+        if not self.chat_id:
+            return
+        notes, accepted = QInputDialog.getMultiLineText(self, 'Export Evaluation',
+            'Optional short notes for the evaluator (up to 8,000 characters):\n'
+            'The ZIP includes this saved conversation with privacy omissions.\n'
+            'Review transcript prose and notes before sharing.')
+        if not accepted:
+            return
+        name, _ = QFileDialog.getSaveFileName(self, 'Export Evaluation',
+            str(Path.home() / 'LetraCode-evaluation.zip'), 'ZIP archive (*.zip)')
+        if name:
+            try:
+                self.store.export_evaluation(self.chat_id, Path(name), notes)
+                self.statusBar().showMessage('Evaluation ZIP saved · review before sharing')
+            except (OSError, ValueError, sqlite3.Error) as error:
+                QMessageBox.warning(self, 'Evaluation export failed', str(error))
 
     def export_chat(self):
         if not self.chat_id:

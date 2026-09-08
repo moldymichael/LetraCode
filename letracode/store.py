@@ -412,6 +412,10 @@ class Store:
         with self.connection() as db:
             db.execute('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', (key, json.dumps(value, ensure_ascii=False)))
 
+    def export_evaluation(self, chat_id, destination, notes=''):
+        from .evaluation import export_evaluation
+        return export_evaluation(self, chat_id, destination, notes)
+
     def export_markdown(self, chat_id):
         chat = self.chat(chat_id)
         chunks = [f"# {chat['title']}\n"]
