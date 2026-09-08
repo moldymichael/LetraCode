@@ -15,28 +15,32 @@
 
 ## Component 1: Evaluation export
 
-- [ ] Add failing ZIP, chronological transcript/actions/errors/evidence, missing metadata, privacy and no-mutation tests in `tests/test_evaluation.py`.
-- [ ] Implement `letracode/evaluation.py`, Store wrapper, and **Export Evaluation…** UI with optional notes. Use one consistent read transaction; preserve saved ordering and distinguish missing historical metadata from recorded values.
-- [ ] Add tests and minimal future-run configuration/approval metadata in worker; retain actual runtime mode rather than current settings at export time.
-- [ ] Run focused exporter/worker tests and review privacy projection; commit Export Evaluation independently when practical.
+- [x] Add failing ZIP, chronological transcript/actions/errors/evidence, missing metadata, privacy and no-mutation tests in `tests/test_evaluation.py`.
+- [x] Implement `letracode/evaluation.py`, Store wrapper, and **Export Evaluation…** UI with optional notes. Use one consistent read transaction; preserve saved ordering and distinguish missing historical metadata from recorded values.
+- [x] Add tests and minimal future-run configuration/approval metadata in worker; retain actual runtime mode rather than current settings at export time.
+- [x] Run focused exporter/worker tests and review privacy projection; commit Export Evaluation independently when practical.
 
 ## Component 2: Memory tree
 
-- [ ] Add migration, CRUD/nesting, active files/retrieval, stale conflicts, Undo/recovery, backup, project isolation and unsafe path tests.
-- [ ] Implement `letracode/memory.py` using guarded storage and retain complete legacy history/recovery during root migration; adapt Store initialization, backup and project deletion.
-- [ ] Add `letracode/memory_ui.py` with tree, explicit saves, folder/file CRUD, activation and history; retain drafts on conflicts and navigation.
-- [ ] Generalize tools/context integration and visible infrastructure wording. Preserve legacy reviewed-save authority; file selection does not grant new write permission.
-- [ ] Run focused tests, review recovery/privacy boundaries, then full offscreen suite, compilation and whitespace checks.
-- [ ] Document migration map, limitations, exact pre-install manual checks, and observed verification; commit Memory folders separately.
+- [x] Add migration, CRUD/nesting, active files/retrieval, stale conflicts, Undo/recovery, backup, project isolation and unsafe path tests.
+- [x] Implement `letracode/memory.py` using guarded storage and retain complete legacy history/recovery during root migration; adapt Store initialization, backup and project deletion.
+- [x] Add `letracode/memory_ui.py` with tree, explicit saves, folder/file CRUD, activation and history; retain drafts on conflicts and navigation.
+- [x] Generalize tools/context integration and visible infrastructure wording. Preserve legacy reviewed-save authority; file selection does not grant new write permission.
+- [x] Run focused tests, review recovery/privacy boundaries, then full offscreen suite, compilation and whitespace checks.
+- [x] Document migration map, limitations, exact pre-install manual checks, and observed verification; commit Memory folders separately.
 
 ## Verification commands
 
 ```bash
 QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_evaluation.py tests/test_evaluation_runtime.py
-QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_memory.py tests/test_memory_ui.py tests/test_memory_integration.py
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_evaluation.py tests/test_evaluation_runtime.py tests/test_memory.py tests/test_memory_validation.py tests/test_memory_integration.py tests/test_memory_ui.py
 QT_QPA_PLATFORM=offscreen python3 -m pytest -q
 python3 -m compileall -q letracode
 git diff --check
 ```
 
 Passing scripted-engine tests establish application behavior, not real-model quality. No installation or live assistant session is part of implementation verification.
+
+## Observed completion verification
+
+Export committed independently as `bc9e77a`: 16 focused tests and the staged 510-test full suite passed. Final combined feature run: 131 passed in 3.94s. Final full suite: 625 passed in 36.76s with the same 10 Python 3.14 fork deprecation warnings as the 494-test baseline. Compilation and whitespace checks passed. Independent review findings around stable identities, mixed history ordering, migration locks, parent-directory swaps and recovery were addressed with focused regressions. No live data, installation, original dirty anchor checkout, or separate Windows branch was modified.

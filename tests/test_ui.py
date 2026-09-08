@@ -180,7 +180,7 @@ def test_project_deletion_explains_archive_and_shows_recovery_location(tmp_path,
     assert 'archiv' in confirmations[0].lower()
     assert store.project(project) is None
     assert w.project_id is None and w.chat_id is None
-    archived = list((store.directory / 'strand' / '.deleted-projects' / project).glob('*.md'))
+    archived = list((store.memory.root / '.deleted-projects' / project).glob('*.md'))
     assert len(archived) == 1
     assert str(archived[0]) in w.statusBar().currentMessage()
     w.close()
@@ -208,7 +208,7 @@ def test_project_deletion_surfaces_archive_record_warning_after_success(tmp_path
     assert store.project(project) is None
     assert w.project_id is None
     assert warnings and 'Recovery record write blocked' in warnings[0]
-    archive = next((store.directory / 'strand' / '.deleted-projects' / project).glob('*.md'))
+    archive = next((store.memory.root / '.deleted-projects' / project).glob('*.md'))
     assert str(archive) in w.statusBar().currentMessage()
     w.close()
 

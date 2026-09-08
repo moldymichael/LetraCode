@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import copy
+import fcntl
 import os
 import sqlite3
 import stat
@@ -13,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .continuation import interrupted_outcome
+from .memory import MemoryFiles
 from .strand import BACKUP_CHUNK_BYTES, StrandFiles, backup_tree, digest, safe_directory, safe_read, safe_write
 
 
@@ -88,9 +91,12 @@ class Store:
         self.path = self.directory / 'letracode.sqlite3'
         if self.path.is_symlink() or (self.path.exists() and self.path.stat().st_nlink != 1):
             raise ValueError('Unsafe linked database')
+        initializing = self.directory / 'memory-initialization.json'
+        if not self.path.exists() and not os.path.lexists(initializing):
+            safe_write(initializing, json.dumps({'version': 1, 'status': 'prepared'}).encode(), None)
         with self.connection() as db:
             version = db.execute('PRAGMA user_version').fetchone()[0]
-            if version > 2:
+            if version > 3:
                 raise RuntimeError('This database belongs to a newer LetraCode. Please upgrade the app.')
             if version == 0:
                 db.executescript('''
@@ -118,14 +124,96 @@ class Store:
         self.path.chmod(0o600)
         if version == 1:
             self._migrate_memory()
+        self._migrate_memory_tree(version)
+        self.strand = self.memory
+
+    def _migrate_memory_tree(self, initial_version):
+        old, target = self.directory / 'strand', self.directory / 'Memory'
+        marker = self.directory / 'memory-tree-migration.json'
+        initialization = safe_read(self.directory / 'memory-initialization.json', 4096)
+        creating = initialization is not None and json.loads(initialization).get('status') == 'prepared'
+        if not os.path.lexists(old) and not os.path.lexists(target) and creating:
+            if safe_read(marker, 4096) is None:
+                safe_write(marker, json.dumps({'version': 1, 'source': 'strand', 'destination': 'Memory',
+                    'legacy': False, 'status': 'prepared'}).encode(), None)
+            with safe_directory(target, create=True):
+                pass
+        root = old if os.path.lexists(old) else target
+        if not os.path.lexists(root):
+            raise ValueError('Memory directory is missing; restore it before opening. No defaults were created.')
+        # Retain and lock the existing root descriptor without initializing
+        # Strand defaults. The whole-directory rename carries this same lock
+        # inode; existing cooperating saves finish before migration proceeds.
+        with safe_directory(root) as directory:
+            lock = os.open('.write-lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                           0o600, dir_fd=directory)
+            try:
+                info = os.fstat(lock)
+                if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                    raise ValueError('Unsafe linked Memory migration lock')
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                # Lock order matches normal backup/deletion: Memory, SQLite.
+                with self.connection() as db:
+                    db.execute('BEGIN IMMEDIATE')
+                    current = db.execute('PRAGMA user_version').fetchone()[0]
+                    effective = 3 if current == 3 else initial_version
+                    self._migrate_memory_tree_locked(effective, db)
+            finally:
+                os.close(lock)
+
+    def _migrate_memory_tree_locked(self, initial_version, migration_db):
+        from .strand import rename_noreplace
+        old, target = self.directory / 'strand', self.directory / 'Memory'
+        marker = self.directory / 'memory-tree-migration.json'
+        if initial_version == 3:
+            if not os.path.lexists(target):
+                raise ValueError('Memory directory is missing; restore it from backup. No defaults were created.')
+            self.memory = MemoryFiles(target, initialize=False, migration_locked=True)
+            return
+        old_exists, target_exists = os.path.lexists(old), os.path.lexists(target)
+        if old_exists and target_exists:
+            raise ValueError('Memory migration conflict: both strand and Memory directories exist. Neither was overwritten.')
+        prior = safe_read(marker, 4096)
+        if target_exists and prior is None:
+            raise ValueError('Memory migration conflict: destination Memory already exists. Existing files are preserved.')
+        initialization = safe_read(self.directory / 'memory-initialization.json', 4096)
+        is_initializing = initialization is not None and json.loads(initialization).get('status') == 'prepared'
+        if not old_exists and not target_exists and initial_version != 0 and not is_initializing:
+            raise ValueError('Legacy Strand memory is missing. Restore it before migration; no defaults were created.')
+        if prior is None:
+            if initial_version not in (0, 1):
+                self._migration_backup()
+            record = {'version': 1, 'source': 'strand', 'destination': 'Memory',
+                      'legacy': old_exists, 'status': 'prepared'}
+            safe_write(marker, json.dumps(record).encode(), None)
         else:
-            self.strand = StrandFiles(self.directory / 'strand')
+            record = json.loads(prior)
+            if record.get('version') != 1 or record.get('destination') != 'Memory':
+                raise ValueError('Memory migration record is invalid; existing files are preserved')
+        if old_exists:
+            with safe_directory(self.directory) as directory:
+                # Move the entire ordinary tree, including opaque history,
+                # recovery inodes, receipts, unknown files and deleted projects.
+                with safe_directory(old):
+                    pass
+                rename_noreplace(directory, 'strand', directory, 'Memory')
+                os.fsync(directory)
+        self.memory = MemoryFiles(target, legacy=record['legacy'], migration_locked=True)
+        migration_db.execute('PRAGMA user_version=3')
+        migration_db.commit()
+        previous = safe_read(marker, 4096)
+        record['status'] = 'complete'
+        safe_write(marker, json.dumps(record).encode(), digest(previous))
+        if initialization is not None and is_initializing:
+            safe_write(self.directory / 'memory-initialization.json', json.dumps({'version': 1, 'status': 'complete'}).encode(), digest(initialization))
 
     def _migration_backup(self):
         directory = self.directory / 'migration-backups'
         with safe_directory(directory, create=True):
             pass
-        destination = directory / f'v1-{uuid.uuid4().hex}.sqlite3'
+        with self.connection() as db:
+            version = db.execute('PRAGMA user_version').fetchone()[0]
+        destination = directory / f'v{version}-{uuid.uuid4().hex}.sqlite3'
         safe_write(destination, b'', None)
         with self.connection() as source:
             target = sqlite3.connect(destination)
@@ -241,8 +329,13 @@ class Store:
             row = db.execute('SELECT id,title FROM projects WHERE id=?', (ident,)).fetchone()
             if row is None:
                 return None
+            entries = self.memory.entries(ident)
+            primary = self.strand.path('project', ident).relative_to(self.memory.root_for(ident)).as_posix()
+            if any(entry['path'] != primary for entry in entries):
+                return self._delete_project_tree(db, dict(row))
             archive = self._prepare_project_archive(row)
             moved = False
+            registry_before = registry_after = None
             try:
                 if archive is not None:
                     original, destination = Path(archive['original_path']), Path(archive['path'])
@@ -260,10 +353,22 @@ class Store:
                             pass
                         else:
                             raise ValueError('Project memory changed during deletion')
+                registry, registry_raw = self.memory._metadata()
+                updated = copy.deepcopy(registry)
+                for entry in updated['files'].values():
+                    if entry.get('project_id') == ident:
+                        entry['deleted'] = True
+                self.memory._save_metadata(updated, registry_raw)
+                registry_before, registry_after = registry, updated
                 db.execute('DELETE FROM projects WHERE id=?', (ident,))
                 db.commit()
             except BaseException as error:
                 db.rollback()
+                if registry_before is not None:
+                    current, current_raw = self.memory._metadata()
+                    if current != registry_after:
+                        raise ValueError('Project deletion failed and Memory metadata changed; retained files and registry need reconciliation.') from error
+                    self.memory._save_metadata(registry_before, current_raw)
                 if moved:
                     try:
                         with safe_directory(destination.parent) as source, safe_directory(original.parent) as target:
@@ -281,6 +386,28 @@ class Store:
             if archive is not None:
                 self._finish_project_archive(archive, 'deleted')
             return archive
+
+    def _delete_project_tree(self, db, project):
+        ident = project['id']
+        source = f'.projects/{ident}'
+        target = '.trash/deleted-project-' + uuid.uuid4().hex
+        before = self.memory._entry_digest(self.memory.root / source)
+        receipt = self.memory._relocate(source, target, before, ident, 'delete')
+        try:
+            db.execute('DELETE FROM projects WHERE id=?', (ident,))
+            db.commit()
+        except BaseException as error:
+            db.rollback()
+            try:
+                self.memory.undo(receipt['id'])
+            except (OSError, ValueError) as recovery_error:
+                raise ValueError(f'Project deletion failed. Memory is preserved at {self.memory.root / target}; '
+                                 'the current memory path was not overwritten. Inspect its operation history before retrying.') from recovery_error
+            raise error
+        return {'project_id': ident, 'title': project['title'], 'date': now(),
+                'path': str(self.memory.root / target), 'original_path': str(self.memory.root / source),
+                'record_path': str(self.memory._operation_path(receipt['id'])), 'status': 'deleted',
+                'operation_id': receipt['id']}
 
     def _prepare_project_archive(self, project):
         from .strand import recover_file
@@ -464,7 +591,7 @@ class Store:
                 with zipfile.ZipFile(stage, 'w', zipfile.ZIP_DEFLATED) as archive:
                     archive.write(copy, 'letracode.sqlite3')
                     archive.writestr('letracode.json', json.dumps(exported, ensure_ascii=False, indent=2))
-                    copy_entries(archive, 'strand/', entries)
+                    copy_entries(archive, 'Memory/', entries)
                     source_backups = self.directory / 'file-backups'
                     # lexists also detects a broken link so it is refused,
                     # rather than silently omitting a redirected backup root.
@@ -473,9 +600,9 @@ class Store:
                             copy_entries(archive, 'file-backups/', retained)
                     archive.writestr('RESTORE.txt',
                         'Close LetraCode. Keep a copy of the current data folder. Extract the complete archive, '
-                        'including strand/ and its hidden .history/, .receipts/, .deleted-projects/ and recovery '
+                        'including Memory/ and its hidden .history/, .receipts/, .deleted-projects/ and recovery '
                         'directories, plus file-backups/, into a NEW empty data folder.\n'
-                        'Included: the SQLite database, a readable JSON export, ordinary Strand notes/manifests, '
+                        'Included: the SQLite database, a readable JSON export, ordinary Memory notes/manifests, '
                         'retained memory/history/recovery bytes, and app-owned pre-edit source copies in file-backups/. '
                         'Excluded: linked original source trees, GGUF model weights, temporary runtime files, logs '
                         'and migration-backups/ database snapshots.\n'
@@ -483,9 +610,9 @@ class Store:
                         'destinations to isolated test locations. A copied database retains the original links and settings. '
                         'For a safe test, use sqlite3 /new/folder/letracode.sqlite3 "DELETE FROM links;" and review settings '
                         'before launch. Never point a restored test at the original sources.\n'
-                        'Then run letracode --data-dir /new/folder. Ordinary Strand files remain editable there; '
+                        'Then run letracode --data-dir /new/folder. Ordinary Memory files remain editable there; '
                         'Undo uses the restored private history. The JSON export legacy project memory column is empty '
-                        'because strand/memory/ is authoritative. Oversized or undecodable preserved files are copied '
+                        'because Memory/ is authoritative. Oversized or undecodable preserved files are copied '
                         'as opaque bytes; active memory parsing limits still apply.\n'
                         'Inspect a file-backups/ copy as bytes or in a suitable editor. Its UUID-prefixed basename '
                         'preserves the source filename; a saved tool result may identify the original path. Copy a '

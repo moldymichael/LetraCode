@@ -285,7 +285,7 @@ def recover_file(path: Path):
 
 
 def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_bytes=MAX_FILE_BYTES,
-               transaction_id=None, namespace='.strand-recovery', mode=None, cancel=None):
+               transaction_id=None, namespace='.strand-recovery', mode=None, cancel=None, expected_entry_identity=None):
     """Preserve the displaced inode, validate it, then publish without replacement.
 
     Advisory locks cannot coordinate ordinary editors. Every move uses Linux
@@ -307,6 +307,9 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
     with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace) as recovery:
         _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
         observed = _read_at(fd, path.name, max_bytes, with_stat=True)
+        if expected_entry_identity is not None and (observed is None or
+                [observed[1].st_dev, observed[1].st_ino] != list(expected_entry_identity)):
+            raise ValueError('File identity changed; reload to review the replacement before saving')
         original = None if observed is None else observed[0]
         current_hash = None if original is None else digest(original)
         if current_hash != expected_sha256:
@@ -320,6 +323,8 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
         published = False
         try:
             _write_new(recovery, temporary, data, mode=mode)
+            proposed_info = os.stat(temporary, dir_fd=recovery, follow_symlinks=False)
+            proposed_identity = [proposed_info.st_dev, proposed_info.st_ino]
             check_cancel()
             # Reopen the ancestor chain and compare directory identity before commit.
             with safe_directory(path.parent) as fresh:
@@ -334,6 +339,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
                 os.fsync(recovery)
                 captured_snapshot = _read_at(recovery, previous, max_bytes, with_stat=True)
                 if (captured_snapshot is None or captured_snapshot[0] != original or
+                        (expected_entry_identity is not None and [captured_snapshot[1].st_dev, captured_snapshot[1].st_ino] != list(expected_entry_identity)) or
                         (mode is not None and stat.S_IMODE(captured_snapshot[1].st_mode) != mode)):
                     raise ValueError(f'File changed; reload to resolve the conflict: {path}')
             check_cancel()
@@ -347,6 +353,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
             if captured:
                 _finish_recovery(recovery, ident, 'saved', expected_sha256)
                 _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
+            return proposed_identity
         except Exception as error:
             # Restore only into an absent name, preserving any later external
             # creation. Never delete a captured inode: editors may still own it.
@@ -466,7 +473,7 @@ class StrandFiles:
             return self._change(scope, updated, expected_sha256, project_id, origin, text, ident, date)
 
     def _change(self, scope, text, expected_sha256, project_id, origin, saved_text,
-                ident=None, date=None, undo_of=None):
+                ident=None, date=None, undo_of=None, expected_entry_identity=None):
         if len(text.encode('utf-8')) > MAX_FILE_BYTES:
             raise ValueError(f'Memory file is too large (size limit {MAX_FILE_BYTES} bytes)')
         before = self.snapshot(scope, project_id)
@@ -484,14 +491,17 @@ class StrandFiles:
                    'after_sha256': digest(text.encode('utf-8')), 'status': 'prepared',
                    # The root operation lock serializes allocation across Store
                    # instances. Prepared failures also reserve their sequence.
-                   'sequence': max((row.get('sequence', 0) for row in self._receipt_records()), default=0) + 1,
+                   'sequence': self._next_sequence(),
                    'write_id': ident}
         if undo_of:
             receipt['undo_of'] = undo_of
         safe_write(backup, before['text'].encode('utf-8'), None)
         prepared = json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8')
         safe_write(receipt_path, prepared, None, max_bytes=MAX_RECEIPT_BYTES)
-        safe_write(path, text.encode('utf-8'), expected_sha256, transaction_id=ident)
+        options = {'expected_entry_identity': expected_entry_identity} if expected_entry_identity is not None else {}
+        published_identity = safe_write(path, text.encode('utf-8'), expected_sha256, transaction_id=ident, **options)
+        if published_identity is not None:
+            receipt['entry_identity'] = published_identity
         receipt['status'] = 'saved'
         try:
             safe_write(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2).encode('utf-8'),
@@ -501,6 +511,15 @@ class StrandFiles:
             # recovered from its matching write journal after a disk failure.
             return self.receipt(ident)
         return receipt
+
+    def _next_sequence(self):
+        return max((row.get('sequence', 0) for row in self._receipt_records()), default=0) + 1
+
+    def _receipt_destination(self, record):
+        path = self.path(record['scope'], record.get('project_id'))
+        if record['relative_path'] != path.relative_to(self.root).as_posix():
+            raise ValueError('Invalid receipt destination')
+        return path
 
     def receipt(self, receipt_id):
         if not isinstance(receipt_id, str) or not re.fullmatch(r'[a-f0-9]{32}', receipt_id):
@@ -516,8 +535,8 @@ class StrandFiles:
             for key in ('scope', 'id', 'relative_path', 'date', 'origin', 'saved_text'):
                 if not isinstance(record.get(key), str):
                     raise ValueError(f'Invalid or missing receipt {key}')
-            path = self.path(record['scope'], record.get('project_id'))
-            if record['id'] != receipt_id or record['relative_path'] != path.relative_to(self.root).as_posix():
+            path = self._receipt_destination(record)
+            if record['id'] != receipt_id:
                 raise ValueError('Invalid receipt destination')
             if record.get('status') not in ('prepared', 'saved'):
                 raise ValueError('Invalid receipt status')
@@ -600,10 +619,13 @@ class StrandFiles:
         uncertain.sort(key=lambda row: (row['date'], row['id']), reverse=True)
         return ordered + uncertain, ordered[0]['id'] if ordered else None, remaining
 
+    def _receipt_group_key(self, row):
+        return row['relative_path']
+
     def _undo_history(self, records):
         groups = {}
         for row in records:
-            groups.setdefault(row['relative_path'], []).append(row)
+            groups.setdefault(self._receipt_group_key(row), []).append(row)
         for group in groups.values():
             saved = [row for row in group if row['status'] == 'saved']
             sequenced = sorted((row for row in saved if 'sequence' in row), key=lambda row: row['sequence'], reverse=True)
@@ -663,7 +685,7 @@ class StrandFiles:
             if record['status'] != 'saved':
                 raise ValueError('Unconfirmed write cannot be undone')
             history = self._undo_history([row for row in self._receipt_records()
-                if row['relative_path'] == record['relative_path']])
+                if self._receipt_group_key(row) == self._receipt_group_key(record)])
             selected = next(row for row in history if row['id'] == receipt_id)
             if selected['undo_error']:
                 raise ValueError(selected['undo_error'])

@@ -90,7 +90,7 @@ def test_real_source_edit_backup_is_recoverable_without_originals(tmp_path):
     assert original.read_text() == 'Revised chapter\n'
 
 
-@pytest.mark.parametrize('tree', ['strand', 'file-backups'])
+@pytest.mark.parametrize('tree', ['Memory', 'file-backups'])
 @pytest.mark.parametrize('kind', ['symlink', 'hardlink', 'directory-link', 'fifo'])
 def test_malformed_retained_entries_abort_without_replacing_backup(tmp_path, tree, kind):
     store = Store(tmp_path / 'data')
@@ -269,7 +269,7 @@ def test_memory_save_waits_for_sqlite_and_strand_snapshot_without_deadlock(tmp_p
     assert finished.is_set(), 'Strand/SQLite lock ordering deadlocked the worker'
     assert results and 'error' not in results[0]
     with zipfile.ZipFile(destination) as archive:
-        assert archive.read(f'strand/memory/projects/{project}.md') == b''
+        assert archive.read(f'Memory/.projects/{project}/Memory.md') == b''
         assert json.loads(archive.read('letracode.json'))['messages'] == []
     assert 'Worker saved fact' in worker_store.project(project)['memory']
     assert len(worker_store.messages(chat)) == 1

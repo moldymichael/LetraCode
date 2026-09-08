@@ -235,18 +235,18 @@ def test_ordinary_files_are_authoritative_and_scoped(tmp_path):
     first = store.create_project('First')
     second = store.create_project('Second')
     strand = store.strand
-    for relative in ('identity/strand.md', 'identity/preferences.md', 'memory/global.md',
-                     'learning/programming.md', f'memory/projects/{first}.md'):
+    for relative in (strand.path('identity').relative_to(strand.root).as_posix(), 'identity/preferences.md', 'memory/global.md',
+                     'learning/programming.md', f'.projects/{first}/Memory.md'):
         assert (strand.root / relative).is_file()
     store.update_project(first, memory='First project secret')
     assert store.project(first)['memory'] == 'First project secret'
     assert store.project(second)['memory'] == ''
     with store.connection() as db:
         assert db.execute('SELECT memory FROM projects WHERE id=?', (first,)).fetchone()[0] == ''
-    (strand.root / f'memory/projects/{first}.md').write_text('External correction')
+    (strand.root / f'.projects/{first}/Memory.md').write_text('External correction')
     assert store.project(first)['memory'] == 'External correction'
-    assert 'External correction' in strand.context(first, 'correction', 2000)
-    assert 'External correction' not in strand.context(second, '', 2000)
+    assert 'External correction' in strand.search('correction', project_id=first)[0]['text']
+    assert not strand.search('correction', project_id=second)
 
 
 def test_receipt_and_undo_survive_restart_and_preserve_external_edits(tmp_path):
@@ -356,9 +356,8 @@ def test_context_and_pages_are_bounded_and_signal_partial_coverage(tmp_path):
     old = strand.snapshot('global')
     strand.replace('global', ('General notes.\n' * 1000) + '\nRareword is relevant.\n', old['sha256'])
     context = strand.context(None, 'Rareword', 800)
-    assert len(context) <= 800
-    assert 'partial' in context.lower()
-    assert 'Rareword is relevant' in context
+    assert context == '', 'Unselected memory is retrieved explicitly, not injected automatically'
+    assert 'Rareword is relevant' in strand.search('Rareword')[0]['text']
     page = strand.read_page('global', offset=0, max_chars=100)
     assert len(page['text']) == 100
     assert page['next_offset'] == 100
@@ -566,10 +565,9 @@ def test_unavailable_project_context_is_explicit_and_does_not_hide_global_memory
     good = store.create_project('Working memory')
     store.strand.path('project', bad).unlink()
     store.strand.path('global').write_text('Global preference remains usable')
-    context = store.strand.context(bad, '', 2000)
-    assert 'project memory unavailable' in context.lower()
-    assert 'Global preference remains usable' in context
-    assert 'unavailable' not in store.strand.context(good, '', 2000)
+    assert store.project(bad)['memory_error']
+    assert 'Global preference remains usable' in store.memory.search('preference')[0]['text']
+    assert 'memory_error' not in store.project(good)
     for budget in (1, 20, 55, 60, 100):
         assert len(store.strand.context(bad, '', budget)) <= budget
 

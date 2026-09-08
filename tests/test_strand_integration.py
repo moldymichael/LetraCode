@@ -19,10 +19,14 @@ def test_identity_and_corrected_memory_reach_global_and_separate_projects(tmp_pa
     a, b = store.create_project('Draft A'), store.create_project('Draft B')
     store.update_project(a, memory='Mara has a blue bicycle.')
     store.update_project(b, memory='Mara has a red bicycle.')
+    for project in (a, b):
+        snap = store.memory.file_snapshot('Memory.md', project)
+        store.memory.set_active('Memory.md', True, snap['sha256'], project)
     def context(project):
         return build_context(store.project(project) if project else None, [], 'Mara bicycle', strand=store.strand, provenance='Local llama.cpp; configured model: fixture.gguf')
     global_context, context_a, context_b = context(None), context(a), context(b)
-    assert all('Strand' in text and 'fixture.gguf' in text for text in (global_context, context_a, context_b))
+    assert all('LetraCode' in text and 'fixture.gguf' in text for text in (global_context, context_a, context_b))
+    assert all('You are Strand' not in text for text in (global_context, context_a, context_b))
     assert 'blue bicycle' in context_a and 'red bicycle' not in context_a
     assert 'red bicycle' in context_b and 'blue bicycle' not in context_b
     assert 'blue bicycle' not in global_context and 'red bicycle' not in global_context
@@ -36,6 +40,9 @@ def test_core_instructions_are_never_silently_cut(tmp_path):
     store = Store(tmp_path / 'data')
     snap = store.strand.snapshot('preferences')
     store.strand.replace('preferences', 'An essential rule. ' * 1000, snap['sha256'])
+    from pathlib import Path
+    snap = store.memory.snapshot('preferences')
+    store.memory.set_active(Path(snap['path']).relative_to(store.memory.root).as_posix(), True, snap['sha256'])
     with pytest.raises(ValueError, match='(?i)(identity|core|budget|preferences)'):
         build_context(None, [], 'hello', budget=3000, strand=store.strand)
 

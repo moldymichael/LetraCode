@@ -577,7 +577,7 @@ def test_worker_exposes_saved_reads_when_computer_and_web_are_disabled(tmp_path)
     class Offline(ScriptedEngine):
         def complete(self,messages,tools,*args,**kwargs):
             names={tool['function']['name'] for tool in tools}
-            assert names=={'read_tool_result','read_memory','list_tool_results'}
+            assert names=={'read_tool_result','read_memory','list_tool_results','list_memory','search_memory'}
             return {'role':'assistant','content':'Offline history available.'}
     store=Store(tmp_path/'data');chat=store.create_chat('Offline')
     store.add_message(chat,'user','Review saved evidence')
@@ -632,8 +632,11 @@ def test_worker_rereads_strand_files_and_reports_configured_model_filename(tmp_p
             self.systems.append(messages[0]['content'])
             return {'role':'assistant','content':'Read current context.'}
     store=Store(tmp_path/'data');chat=store.create_chat('Fresh identity')
-    identity=store.strand.root/'identity/strand.md'
+    from pathlib import Path
+    identity=Path(store.memory.snapshot('identity')['path'])
     identity.write_text('Identity correction FIRST',encoding='utf-8')
+    relative=identity.relative_to(store.memory.root).as_posix()
+    store.memory.set_active(relative, True, store.memory.file_snapshot(relative)['sha256'])
     engine=IdentityReader()
     engine.config=type('Config',(),{'context_size':32768,'max_tokens':1024,'model_path':'/models/configured-model.gguf'})()
     store.add_message(chat,'user','Read current identity')
@@ -803,12 +806,17 @@ def test_fallback_budget_crosses_optional_context_plateau_without_cutting_core_o
             return {'role': 'assistant', 'content': 'The intact request fits.'}
 
     store = Store(tmp_path / 'data')
-    chat = store.create_chat('Optional context plateau')
-    (store.strand.root / 'memory/global.md').write_text('Optional memory. ' * 170)
+    project = store.create_project('Optional context plateau')
+    chat = store.create_chat('Optional context plateau', project)
+    # Reference memory is now opt-in. Linked source excerpts still exercise
+    # optional-context plateaus without making dormant Memory implicit core.
+    source = tmp_path / 'reference.txt'
+    source.write_text('Optional source word. ' * 130)
+    store.link(project, source)
     prompt = 'Please analyze this passage: ' + 'word ' * word_count
     store.add_message(chat, 'user', prompt)
-    identity = (store.strand.root / 'identity/strand.md').read_text().strip()
-    preferences = (store.strand.root / 'identity/preferences.md').read_text().strip()
+    identity = store.memory.snapshot('identity')['text'].strip()
+    preferences = store.memory.snapshot('preferences')['text'].strip()
     built = []
     build_context = worker_module.build_context
 

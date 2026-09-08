@@ -452,12 +452,12 @@ class ConversationWorker(QThread):
             reply_size = self.engine.config.max_tokens
             if reply_size + 128 >= context_size:
                 raise ContextOverflowError('The reserved reply leaves no room for core instructions and the user request.')
-            self.status.emit('Reading fresh Strand and project context…')
+            self.status.emit('Reading current Memory and project context…')
             retrieval_budget = min(20000, int((context_size - reply_size - 128) * 1.3))
             model_path = getattr(self.engine.config, 'model_path', '')
             provenance = (f'Local model file: {Path(model_path).name if model_path else "not configured"}. '
                           f'Context: {context_size} tokens; maximum response: {reply_size} tokens. '
-                          'Strand identity is editable application context; it does not change model weights.')
+                          'Memory is editable user context; it does not change model weights.')
             executor = ToolExecutor(roots, self.store.directory, self.ask, self.cancel_event,
                 self.web_enabled, self.computer_enabled, store=self.store, chat_id=self.chat_id)
             self.engine.start(self.cancel_event, self.status.emit)

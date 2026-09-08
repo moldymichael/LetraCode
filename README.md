@@ -7,6 +7,28 @@ your computer. There is no cloud inference, account, or telemetry.
 For the development baseline, current capabilities and verification boundaries,
 see [Current implementation state](docs/CURRENT-STATE.md).
 
+## Evaluation export and Memory folders
+
+**File → Export Evaluation…** saves the selected conversation as a portable ZIP
+with a readable transcript, ordered action/evidence records, recorded run
+settings, optional notes, and an explanatory README. Private source/Memory tool
+bodies are replaced by hashes and omission markers. Review conversation prose
+and notes before sharing; free-text secrets cannot all be detected automatically.
+An evaluation bundle is not a restorable backup.
+
+**Settings → Memory folders…** opens an ordinary Markdown/text directory tree.
+Create your own folders and files, rename or move them, and save edits explicitly.
+Mark individual files **Always active** to include them in prompts. Other Memory
+files remain available through listing, searching, and reading tools. Global and
+project trees have separate scope. The quick Memory pane retains its existing
+autosave behavior; tree drafts remain separate until Save or Reload.
+
+Existing Strand files and their hidden recovery/history data migrate to `Memory`;
+your Strand identity remains your own configuration. Read the [migration and
+pre-install checks](docs/EVALUATION-MEMORY.md) before upgrading an existing data
+folder. This update uses the Linux reliability implementation; the separate
+Windows development checkout has not been integrated.
+
 ## Install on Fedora KDE
 
 1. Download `LetraCode-0.1.1.run`.
@@ -63,8 +85,8 @@ Installed application files live separately in
 `${XDG_DATA_HOME:-~/.local/share}/letracode-app`, so updates and uninstall do not
 delete your conversations.
 
-Choose **File → Back up chats, Strand and source backups** while the app is open. Save the
-snapshot ZIP to your backup drive. It contains a SQLite snapshot, human-readable JSON, Strand notes and retained
+Choose **File → Back up chats, Memory and source backups** while the app is open. Save the
+snapshot ZIP to your backup drive. It contains a SQLite snapshot, human-readable JSON, Memory files and retained
 recovery history, app-owned pre-edit source backups, and a restore guide.
 Linked originals, model weights, logs and migration snapshots are excluded.
 See the consistency boundary in [the reliability report](docs/RELIABILITY-VERIFICATION.md). To remove the application while

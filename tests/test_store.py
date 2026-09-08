@@ -57,7 +57,7 @@ def test_backup_is_recoverable_and_does_not_copy_linked_source(tmp_path):
         export = json.loads(z.read('letracode.json'))
         assert export['messages'][0]['content'] == 'Hello'
         z.extract('letracode.sqlite3', tmp_path / 'restore')
-        assert 'strand/identity/strand.md' in z.namelist()
+        assert s.memory.path('identity').relative_to(s.directory).as_posix() in z.namelist()
         assert not any('large-source' in name for name in z.namelist())
     db = sqlite3.connect(tmp_path / 'restore/letracode.sqlite3')
     assert db.execute('select title from projects').fetchone()[0] == 'Work'
@@ -77,7 +77,11 @@ def legacy_fixture(directory):
     with store.connection() as db:
         db.execute('UPDATE projects SET memory=? WHERE id=?', ('Preserve the legacy memory', ident))
         db.execute('PRAGMA user_version=1')
-    shutil.rmtree(directory / 'strand', ignore_errors=True)
+    # Construct a real schema-1 fixture, without the new Memory registry.
+    for name in ('strand', 'Memory', '.strand-recovery', 'migration-backups'):
+        shutil.rmtree(directory / name, ignore_errors=True)
+    for name in ('memory-tree-migration.json', 'memory-initialization.json'):
+        (directory / name).unlink(missing_ok=True)
     return ident
 
 
@@ -87,7 +91,7 @@ def test_v1_memory_migrates_once_with_consistent_original_backup(tmp_path):
     store = Store(directory)
     assert store.project(ident)['memory'] == 'Preserve the legacy memory'
     with store.connection() as db:
-        assert db.execute('PRAGMA user_version').fetchone()[0] == 2
+        assert db.execute('PRAGMA user_version').fetchone()[0] == 3
         assert db.execute('SELECT memory FROM projects').fetchone()[0] == ''
     backups = list((directory / 'migration-backups').glob('*.sqlite3'))
     assert len(backups) == 1
@@ -95,7 +99,7 @@ def test_v1_memory_migrates_once_with_consistent_original_backup(tmp_path):
         assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
         assert db.execute('PRAGMA user_version').fetchone()[0] == 1
         assert db.execute('SELECT memory FROM projects').fetchone()[0] == 'Preserve the legacy memory'
-    memory = directory / 'strand/memory/projects' / f'{ident}.md'
+    memory = store.strand.path('project', ident)
     memory.write_text('User edits after migration')
     assert Store(directory).project(ident)['memory'] == 'User edits after migration'
     assert len(list((directory / 'migration-backups').glob('*.sqlite3'))) == 1
@@ -155,7 +159,7 @@ def test_partial_migration_failure_retains_prepared_files_and_reuses_them_on_ret
         restored = Store(directory)
         assert restored.project(first)['memory'] == 'Preserve the legacy memory'
         assert restored.project('second')['memory'] == 'Second legacy note'
-        assert prepared.stat().st_ino == prepared_inode, 'Retry must reuse the prepared file, including any open editor descriptor'
+        assert restored.strand.path('project', first).stat().st_ino == prepared_inode, 'Retry must reuse the prepared file, including any open editor descriptor'
         editor.write(b'External edit through a descriptor opened before retry')
         editor.truncate()
         editor.flush()
@@ -275,7 +279,7 @@ def test_backup_restores_memory_receipts_and_safe_future_manifests(tmp_path):
     destination = tmp_path / 'backup.zip'
     original.backup(destination)
     with zipfile.ZipFile(destination) as archive:
-        assert 'strand/development/models/example.json' in archive.namelist()
+        assert 'Memory/development/models/example.json' in archive.namelist()
         assert not any(name.endswith('.gguf') for name in archive.namelist())
         guide = archive.read('RESTORE.txt').decode().lower()
         assert 'retarget' in guide and 'linked' in guide

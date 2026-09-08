@@ -36,10 +36,12 @@ def schema(name, description, properties, required):
 
 STRING = {'type':'string'}
 MEMORY_SCOPE = {'type':'string','enum':['global','project','learning']}
-SAVED_READ_TOOLS = ('read_memory', 'read_tool_result', 'list_tool_results')
+SAVED_READ_TOOLS = ('read_memory', 'list_memory', 'search_memory', 'read_tool_result', 'list_tool_results')
 TOOL_SCHEMAS = [
-    schema('read_memory','Read ordinary Strand memory for this chat scope. Pages are partial; follow next_offset. Project means the active project, never another project.', {'scope':MEMORY_SCOPE,'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['scope']),
-    schema('remember','Save a user-requested memory or proposed learning update. Use project for story/project facts, global for shared preferences, learning for correctable programming evidence. Shows destination and text for review unless learning has an explicit grant. No source/identity writes or training.', {'scope':MEMORY_SCOPE,'text':STRING}, ['scope','text']),
+    schema('read_memory','Read Memory by relative path in global or current project scope. Follow next_offset. Omit path only for a legacy scope file.', {'scope':MEMORY_SCOPE,'path':STRING,'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['scope']),
+    schema('list_memory','List Memory paths in global or current project scope. Bounded pages; follow next_offset. Optional path filters a folder.', {'scope':MEMORY_SCOPE,'path':STRING,'offset':{'type':'integer'},'limit':{'type':'integer'}}, ['scope']),
+    schema('search_memory','Search Memory text in global or current project scope. Matches are partial; use read_memory for full pages.', {'scope':MEMORY_SCOPE,'query':STRING,'limit':{'type':'integer'}}, ['scope','query']),
+    schema('remember','Append reviewed text to an existing Memory path in global/current project scope. Omit path for a legacy file; only its exact learning grant bypasses review. Identity/preferences are user-editable only. No training.', {'scope':MEMORY_SCOPE,'path':STRING,'text':STRING}, ['scope','text']),
     schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt or list_tool_results and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
     schema('list_tool_results','Discover saved tool results from this chat, including earlier paused or compacted turns, without rerunning actions. Metadata is partial; use read_tool_result for full saved output. Start after_id=0. For each next page keep through_id and set after_id=next_after_id. limit is 1–20, default 10.', {'after_id':{'type':'integer'},'through_id':{'type':'integer'},'limit':{'type':'integer'}}, []),
     schema('list_files','List a local folder (no recursive enumeration). Outside project links requires approval.', {'path':STRING}, ['path']),
@@ -125,19 +127,73 @@ class ToolExecutor:
 
     def _read_memory(self, args):
         scope, project_id = self._memory_scope(args)
+        if 'path' in args:
+            return self.store.memory.read_file_page(self._memory_relative(args, scope), project_id=project_id,
+                offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
         return self.store.strand.read_page(scope, project_id=project_id,
             offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
+
+    def _memory_relative(self, args, scope, *, folder=False):
+        if scope == 'learning':
+            raise ValueError('Use global or project scope with a Memory path.')
+        path = args.get('path', '')
+        if folder and path == '':
+            return path
+        path = self._str(args, 'path')
+        if '\\' in path or ':' in path or any(not part or part.startswith('.') for part in path.split('/')):
+            raise ValueError('Use a relative Memory path without hidden or traversal components.')
+        return path
+
+    def _list_memory(self, args):
+        scope, project_id = self._memory_scope(args)
+        prefix = self._memory_relative(args, scope, folder=True)
+        offset, limit = args.get('offset', 0), args.get('limit', 50)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('Invalid Memory list page bounds.')
+        rows = self.store.memory.entries(project_id=project_id)
+        if prefix:
+            rows = [row for row in rows if row['path'] == prefix or row['path'].startswith(prefix + '/')]
+        end = min(len(rows), offset + limit)
+        return {'scope': scope, 'entries': rows[offset:end], 'offset': offset,
+                'next_offset': end if end < len(rows) else None, 'total_entries': len(rows)}
+
+    def _search_memory(self, args):
+        scope, project_id = self._memory_scope(args)
+        if scope == 'learning':
+            raise ValueError('Use global or project scope to search Memory.')
+        query = self._str(args, 'query', 1000)
+        limit = args.get('limit', 10)
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError('Memory search limit must be 1–20.')
+        return {'scope': scope, 'results': self.store.memory.search(query, project_id=project_id, limit=limit),
+                'partial': True, 'note': 'Bounded matches; use read_memory for full file pages.'}
 
     def _remember(self, args):
         scope, project_id = self._memory_scope(args)
         text = self._str(args, 'text', 8000)
+        if 'path' in args:
+            relative = self._memory_relative(args, scope)
+            snapshot = self.store.memory.file_snapshot(relative, project_id)
+            if snapshot.get('legacy_scope') in ('identity', 'preferences'):
+                raise ValueError('Identity and preferences are user-editable only.')
+            updated = snapshot['text'].rstrip() + ('\n\n' if snapshot['text'].strip() else '') + text + '\n'
+            diff = '\n'.join(difflib.unified_diff(snapshot['text'].splitlines(), updated.splitlines(),
+                fromfile=str(snapshot['path']), tofile=str(snapshot['path']), lineterm=''))
+            self._ask(ApprovalRequest('Save this Memory update?',
+                f"Scope: {scope}\nPath: {snapshot['path']}\n\nText to save:\n{text}\n\nAppend preview:\n{diff}",
+                'memory', 'Save only if the text and destination are right. This save has history and Undo.'))
+            if self.cancel.is_set():
+                raise Denied('Cancelled before saving memory.')
+            return self.store.memory.replace_file(relative, updated, snapshot['sha256'], project_id,
+                origin=f'chat:{self.chat_id}; user approved', expected_file_id=snapshot['file_id'],
+                expected_entry_identity=snapshot['entry_identity'])
         snapshot = self.store.strand.snapshot(scope, project_id)
         grant = scope == 'learning' and self.store.setting('strand_learning_grant', False) is True
         if not grant:
             diff = '\n'.join(difflib.unified_diff(snapshot['text'].splitlines(),
                 (snapshot['text'].rstrip() + '\n\n' + text).splitlines(),
                 fromfile=str(snapshot['path']), tofile=str(snapshot['path']), lineterm=''))
-            self._ask(ApprovalRequest('Remember this in Strand?',
+            self._ask(ApprovalRequest('Save this Memory update?',
                 f"Scope: {scope}\nPath: {snapshot['path']}\n\nText to save:\n{text}\n\nAppend preview (the saved entry also records its ID, date and origin):\n{diff}",
                 'memory', 'Save only if the text and scope are right. You can inspect the ordinary file and Undo this save.'))
         if self.cancel.is_set():

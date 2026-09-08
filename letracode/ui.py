@@ -23,6 +23,7 @@ from .engine import EngineConfig, LocalEngine
 from .worker import ConversationWorker
 from .store import message_status
 from .strand_ui import MemoryEditorState, StrandDialog
+from .memory_ui import MemoryDialog
 
 
 def assistant_html(text, font):
@@ -190,7 +191,7 @@ class MainWindow(QMainWindow):
 
         self.context_panel = QWidget(); context = QVBoxLayout(self.context_panel)
         context.setContentsMargins(8,12,12,12)
-        context_title = QLabel('Strand context')
+        context_title = QLabel('Context and Memory')
         font = context_title.font(); font.setBold(True); context_title.setFont(font)
         context.addWidget(context_title)
         self.context_hint = QLabel('Shared with every chat in this project.\nEdits save automatically.')
@@ -208,9 +209,10 @@ class MainWindow(QMainWindow):
         self.memory_reload.setToolTip('Use the external file version. Copy any unsaved editor text first; Reload discards that draft.')
         self.memory_reload.clicked.connect(self.reload_memory)
         context.addWidget(self.memory_reload)
-        self.strand_button = QPushButton('Strand identity & memory…')
-        self.strand_button.clicked.connect(self.edit_strand)
-        context.addWidget(self.strand_button)
+        self.memory_button = QPushButton('Memory folders…')
+        self.memory_button.clicked.connect(self.edit_memory)
+        self.strand_button = self.memory_button  # Compatibility for busy-state handling.
+        context.addWidget(self.memory_button)
         self.links_summary = QLabel(); self.links_summary.setWordWrap(True); context.addWidget(self.links_summary)
         self.links_button = QPushButton(QIcon.fromTheme('insert-link'),'Linked files & folders…')
         self.links_button.clicked.connect(self.manage_links)
@@ -235,7 +237,7 @@ class MainWindow(QMainWindow):
         self.mutation_actions = [self.action(file,'New &chat',self.new_chat,'Ctrl+N'), self.action(file,'New &project…',self.new_project,'Ctrl+Shift+N')]
         self.action(file,'&Export chat as Markdown…',self.export_chat,'Ctrl+Shift+E')
         self.action(file,'Export Evaluation…',self.export_evaluation)
-        self.action(file,'Back up chats, Strand and source backups…',self.backup)
+        self.action(file,'Back up chats, Memory and source backups…',self.backup)
         self.action(file,'Open data folder',lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.directory))))
         file.addSeparator(); self.action(file,'&Quit',self.close,'Ctrl+Q')
         chat = self.menuBar().addMenu('&Chat')
@@ -250,7 +252,7 @@ class MainWindow(QMainWindow):
         self.action(view,'Zoom out',lambda:self.transcript.zoomOut(),'Ctrl+-')
         settings = self.menuBar().addMenu('&Settings')
         self.mutation_actions.append(self.action(settings,'Model Setup…',self.model_setup))
-        self.mutation_actions.append(self.action(settings,'Strand identity & memory…',self.edit_strand))
+        self.mutation_actions.append(self.action(settings,'Memory folders…',self.edit_memory))
         self.action(settings,'Unload model from memory',self.unload_model)
         help_menu = self.menuBar().addMenu('&Help')
         self.action(help_menu,'Getting started',self.getting_started)
@@ -379,6 +381,21 @@ class MainWindow(QMainWindow):
         self.loading = False
         self.context_hint.setText(self.memory_state.error or str(self.memory_state.snapshot['path']))
 
+    def edit_memory(self):
+        if self.worker:
+            return
+        self.save_editors()
+        dialog = MemoryDialog(self.store, self.project_id, self)
+        dialog.exec()
+        # Reopen the compatibility pane after tree edits, moves or resolutions.
+        # A removed alias remains unavailable instead of being recreated.
+        self.memory_state = MemoryEditorState(self.store, 'project' if self.project_id else 'global', self.project_id)
+        self.loading = True
+        self.context_editors['memory'].setPlainText(self.memory_state.text)
+        self.context_editors['memory'].setReadOnly(not self.memory_state.available)
+        self.loading = False
+        self.context_hint.setText(self.memory_state.error or str(self.memory_state.snapshot['path']))
+
     def new_chat(self, checked=False):
         if self.worker:
             return
@@ -435,7 +452,7 @@ class MainWindow(QMainWindow):
         kind,ident = item.data(0,Qt.ItemDataRole.UserRole)
         if kind == 'global':
             return
-        message = 'Delete this project and all its chats and context? Its memory file, if present, will be archived in Strand for recovery. Linked files will stay where they are.' if kind=='project' else 'Delete this chat and its messages?'
+        message = 'Delete this project and all its chats and context? Its Memory files and folders, if present, will be archived for recovery. Linked files will stay where they are.' if kind=='project' else 'Delete this chat and its messages?'
         if QMessageBox.question(self,'Delete '+kind+'?',message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         self.save_editors()
@@ -455,7 +472,7 @@ class MainWindow(QMainWindow):
             if archive.get('warning'):
                 QMessageBox.warning(self,'Project deleted · recovery record warning',archive['warning'])
         elif kind == 'project':
-            self.statusBar().showMessage('Project deleted · no memory file was present; memory was not archived')
+            self.statusBar().showMessage('Project deleted · no Memory files were present; Memory was not archived')
 
     def manage_links(self):
         if self.project_id and not self.worker:
@@ -650,11 +667,17 @@ class MainWindow(QMainWindow):
             try:
                 receipt = self.store.strand.receipt(ident)
                 affected = self.memory_state and (receipt['scope'], receipt.get('project_id')) == (self.memory_state.scope, self.memory_state.project_id)
+                if self.memory_state and receipt.get('project_id') == self.memory_state.project_id:
+                    # Generic remember uses a stable file identity; the quick
+                    # pane may address that same file through a legacy alias.
+                    current_path = self.store.strand.path(self.memory_state.scope, self.memory_state.project_id)
+                    affected = affected or str(current_path) == receipt.get('path')
                 if affected:
                     text = self.context_editors['memory'].toPlainText()
-                    if text != self.memory_state.snapshot['text']:
+                    if self.memory_state.tree_draft or text != self.memory_state.snapshot['text']:
                         self.memory_state.keep_draft(text)
-                        self.context_hint.setText('Your editor draft is kept separately. Save or Reload memory file before undoing a saved change.')
+                        self.context_hint.setText('Your editor draft is kept separately. Save or Reload it in Memory folders before undoing a saved change.'
+                            if self.memory_state.tree_draft else 'Your editor draft is kept separately. Save or Reload memory file before undoing a saved change.')
                         return
                 self.store.strand.undo(ident)
                 self.store.add_message(self.chat_id, 'notice', 'Memory save undone. Previous file contents restored.')
@@ -736,7 +759,7 @@ class MainWindow(QMainWindow):
         self.text_dialog('Engine log',path.read_text(encoding='utf-8',errors='replace')[-100000:] if path.exists() else 'The local engine has not written a log yet.')
 
     def getting_started(self):
-        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\nOn Fedora, the installer installs the system Qt dependency. Install the inference engine with:\n  sudo dnf install llama-cpp\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders, then edit Memory, Current Context and Instructions. They save automatically.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Export chats or back up chats, Strand memory and retained source backups using File. The ZIP includes a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
+        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\nOn Fedora, the installer installs the system Qt dependency. Install the inference engine with:\n  sudo dnf install llama-cpp\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Current Context, Instructions and the quick Memory pane save automatically. Use Memory folders to organize Markdown and text files in nested folders; its Save file button applies edits and always-active choices. Navigation and Close keep tree drafts separately. Only always-active files are included automatically; other Memory is available to list, search and read when relevant.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
 
     def closeEvent(self,event):
         if self.worker:

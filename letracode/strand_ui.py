@@ -13,6 +13,7 @@ class MemoryEditorState:
         self.key = 'strand_draft_' + scope + '_' + (project_id or 'global')
         self.snapshot = {'text': '', 'sha256': None, 'path': str(store.strand.path(scope, project_id))}
         self.available = True
+        self.tree_draft = False
         self.error = ''
         try:
             self.snapshot = store.strand.snapshot(scope, project_id)
@@ -21,6 +22,13 @@ class MemoryEditorState:
         draft = store.setting(self.key)
         self.text = self.snapshot['text']
         if isinstance(draft, dict) and all(isinstance(draft.get(key), str) for key in ('text', 'base_text', 'sha256')):
+            if draft.get('memory_tree_draft') is True:
+                # The tree uses explicit reviewed saves. This autosaving quick
+                # pane must neither publish its draft nor discard its flag edit.
+                self.tree_draft = True
+                self.available = False
+                self.error = 'An unsaved draft is kept in Memory folders. Open that file there to Save or Reload; conversations use the saved file.'
+                return
             self.text = draft['text']
             self.snapshot = dict(self.snapshot, text=draft['base_text'], sha256=draft['sha256'])
 
@@ -30,11 +38,29 @@ class MemoryEditorState:
             'Memory is read-only. Any editor draft is kept separately. Repair the file, then Reload file to continue.')
 
     def keep_draft(self, text):
+        if self.tree_draft:
+            return
         self.text = text
         if isinstance(self.snapshot['sha256'], str):
             self.store.set_setting(self.key, {'text':text, 'base_text':self.snapshot['text'], 'sha256':self.snapshot['sha256']})
 
     def save(self, text):
+        if self.tree_draft:
+            # Unrelated composer autosaves leave the reviewed tree draft alone.
+            return text == self.text
+        deleted = getattr(self.store.strand, 'alias_deleted', lambda *_: False)(self.scope, self.project_id)
+        if deleted:
+            dirty = text != self.snapshot['text']
+            if dirty:
+                self.keep_draft(text)
+            else:
+                self.text = ''
+                self.snapshot = dict(self.snapshot, text='', sha256=None)
+            self.available = False
+            self.error = 'This memory file was deleted. Use Memory folders to create files or Undo the deletion.'
+            if dirty:
+                self.error += ' Your conflicting editor draft is kept separately.'
+            return not dirty
         if not self.available:
             return False
         try:
@@ -57,6 +83,9 @@ class MemoryEditorState:
             return False
 
     def reload(self, text=None):
+        if self.tree_draft:
+            self.error = 'The unsaved draft is kept in Memory folders. Open that file there to Save or Reload it.'
+            return False
         try:
             snapshot = self.store.strand.snapshot(self.scope, self.project_id)
         except (OSError, ValueError) as error:

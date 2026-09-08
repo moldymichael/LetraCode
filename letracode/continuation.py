@@ -37,7 +37,7 @@ class RunLimits:
             raise ValueError('max_seconds must be finite and positive')
 
 
-_READ_TOOLS = frozenset(('read_file', 'read_memory', 'read_tool_result', 'list_tool_results',
+_READ_TOOLS = frozenset(('read_file', 'read_memory', 'list_memory', 'search_memory', 'read_tool_result', 'list_tool_results',
                          'list_files', 'search_project', 'web_search', 'fetch_url'))
 _WRITE_TOOLS = frozenset(('write_file', 'edit_file', 'remember'))
 _EFFECT_TOOLS = _WRITE_TOOLS | {'run_command'}
