@@ -16,16 +16,13 @@ from PySide6.QtWidgets import (
     QStyle, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
-from .context import MAX_FILE, TEXT_SUFFIXES, read_text
+from .context import MAX_FILE, TEXT_SUFFIXES, read_text, is_link
 from .tools import ToolExecutor
 from .memory_ui import MemoryDialog
+from . import filesystem as fs
 
 
 MANAGED_TEXT_SUFFIXES = {'.md', '.txt', '.markdown'}
-
-
-def is_link(path):
-    return path.is_symlink() or getattr(path, "is_junction", lambda: False)()
 
 
 def _check_plain_path(path):
@@ -41,9 +38,9 @@ def _snapshot(path):
         raise ValueError('Only ordinary files with a single hard link can be edited.')
     if before.st_size > MAX_FILE:
         raise ValueError('File exceeds the 2 MiB text limit.')
-    flags = os.O_RDONLY | getattr(os, 'O_NONBLOCK', 0) | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0)
-    with os.fdopen(os.open(path, flags), 'rb') as file:
-        opened = os.fstat(file.fileno())
+    flags = os.O_RDONLY | fs.O_NONBLOCK | fs.O_NOFOLLOW | getattr(os, 'O_BINARY', 0)
+    with os.fdopen(fs.open(path, flags), 'rb') as file:
+        opened = fs.fstat(file.fileno())
         if not stat.S_ISREG(opened.st_mode) or not os.path.samestat(before, opened):
             raise ValueError('The file changed while opening it.')
         raw = file.read(MAX_FILE + 1)

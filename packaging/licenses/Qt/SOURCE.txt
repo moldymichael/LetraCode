@@ -1,0 +1,19 @@
+License texts copied unchanged from Qt 6.11.2:
+https://github.com/qt/qtbase/tree/v6.11.2/LICENSES
+
+The bundled Qt/PySide6 libraries are used under LGPL-3.0-only.
+The GNU GPL v3 is included as referenced by LGPL v3.
+
+Qt source archives and third-party notices:
+https://download.qt.io/official_releases/qt/6.11/6.11.2/submodules/
+https://doc.qt.io/qt-6/licenses-used-in-qt.html
+
+PySide6/Shiboken source:
+https://code.qt.io/cgit/pyside/pyside-setup.git/tag/?h=v6.11.2
+
+LetraCode source and rebuild instructions:
+https://github.com/moldymichael/LetraCode
+
+The Qt DLLs in _internal/PySide6 remain separate. You may replace them with
+ABI-compatible modified versions and reverse engineer the application to
+debug modifications to these LGPL libraries, as provided by their license.

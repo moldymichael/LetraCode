@@ -2,7 +2,6 @@
 import copy
 import hashlib
 import json
-import shlex
 import subprocess
 import sys
 import threading
@@ -10,6 +9,7 @@ import time
 
 import pytest
 
+from tools.run_acceptance import python_command
 from letracode.budgeting import RequestUsage
 from letracode.store import Store
 from letracode.tools import ToolExecutor
@@ -73,7 +73,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
     store, chat, folder = coding_chat(tmp_path, instructions)
     source = folder / 'clamp.py'
     original = 'def clamp(value):\n    return value\n' + '# Unchanged supporting module documentation.\n' * 700
-    source.write_text(original)
+    source.write_bytes(original.encode('utf-8'))
     (folder / 'verify.py').write_text(
         'from clamp import clamp\n'
         'print("SAVED TEST EVIDENCE " * 600, flush=True)\n'
@@ -82,8 +82,9 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
         'print("ACCEPTANCE_PASS")\n')
     subprocess.run(['git', 'init', '--quiet', str(folder)], check=True, capture_output=True)
     subprocess.run(['git', '-C', str(folder), 'add', 'clamp.py', 'verify.py'], check=True, capture_output=True)
-    command = f'{shlex.quote(sys.executable)} -B verify.py'
-    command_args = {'command': command, 'cwd': str(folder), 'timeout': 5}
+    command = python_command('-B', 'verify.py')
+    command_timeout = 30 if sys.platform == 'win32' else 5
+    command_args = {'command': command, 'cwd': str(folder), 'timeout': command_timeout}
     snapshots = []
     observed_failures = []
 
@@ -114,7 +115,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
             return call('run_command', command_args, str(index))
         if index == 6:
             assert result['exit_code'] == 0 and 'ACCEPTANCE_PASS' in result['output']
-            return call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': 5}, str(index))
+            return call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': command_timeout}, str(index))
         if index == 7:
             assert result['exit_code'] == 0
             assert '-    return value' in result['output'] and '+    return min(10, max(0, value))' in result['output']
@@ -169,7 +170,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
     outcomes = [json.loads(message['content']) for message in packed if message.get('name') == 'run_command']
     assert any(item.get('context_truncated') for item in outcomes)
     assert [item['exit_code'] for item in outcomes] == [1, 1, 0, 0]
-    assert all(item['cwd'] == str(folder) and item['timeout'] == 5 for item in outcomes)
+    assert all(item['cwd'] == str(folder) and item['timeout'] == command_timeout for item in outcomes)
     assert [item['command'] for item in outcomes] == [command, command, command, 'git diff -- clamp.py']
     assert store.messages(chat) == saved
     reopened = Store(tmp_path / 'data')
@@ -179,7 +180,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
                             threading.Event(), False, False, store=reopened, chat_id=chat)
     page = json.loads(executor.execute('read_tool_result', {'result_id': first_command['id'], 'max_chars': 16000}))
     recovered = json.loads(page['content'])
-    assert recovered['command'] == command and recovered['cwd'] == str(folder) and recovered['timeout'] == 5
+    assert recovered['command'] == command and recovered['cwd'] == str(folder) and recovered['timeout'] == command_timeout
     assert recovered['exit_code'] == 1 and 'NEGATIVE_BOUNDARY' in recovered['output']
     assert reopened.messages(chat) == saved
 
@@ -256,12 +257,14 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
               f'Path({str(started)!r}).open("a").write("started\\n"); '
               'print("PARTIAL_COMMAND_EVIDENCE", flush=True); time.sleep(30); '
               f'Path({str(forbidden)!r}).write_text("unexpected continuation")')
-    command = f'{shlex.quote(sys.executable)} -B -c {shlex.quote(script)}'
+    command = python_command('-B', '-c', script)
     engine = CodingEngine(lambda index, messages: call('run_command', {
         'command': command, 'cwd': str(folder), 'timeout': 60}))
     worker = ConversationWorker(store, chat, engine, web_enabled=False)
     watchers = []
     watched_start = []
+    stop_requested = []
+    readiness_timeout = 30 if sys.platform == 'win32' else 5
     read_seen = threading.Event()
     read = tools_module.os.read
 
@@ -285,7 +288,8 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
             pending.decide(allowed)
 
         def stop_started_command():
-            watched_start.append(read_seen.wait(5) and started.exists())
+            watched_start.append(read_seen.wait(readiness_timeout) and started.exists())
+            stop_requested.append(time.monotonic())
             worker.request_stop()
 
         watcher = threading.Thread(target=stop_started_command)
@@ -296,10 +300,13 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
     begin = time.monotonic()
     worker.run()
     for watcher in watchers:
-        watcher.join(6)
+        watcher.join(readiness_timeout + 1)
         assert not watcher.is_alive()
     assert watched_start == [True]
-    assert time.monotonic() - begin < 8
+    # Shell startup is separate from cancellation responsiveness: once output
+    # is observed, stopping must still return promptly on every platform.
+    assert time.monotonic() - stop_requested[0] < 3
+    assert time.monotonic() - begin < readiness_timeout + 3
     assert engine.cancelled.wait(1)
     assert len(engine.requests) == 1
     assert started.read_text() == 'started\n'

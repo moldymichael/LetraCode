@@ -1,5 +1,5 @@
 """Backup recovery and filesystem/snapshot boundaries, using disposable data only."""
-import fcntl
+from letracode import filesystem as fs
 import hashlib
 import json
 import os
@@ -48,7 +48,7 @@ def test_oversized_opaque_deleted_memory_streams_and_restores(tmp_path, monkeypa
             return self.stream.read(size)
 
     def fdopen(fd, *args, **kwargs):
-        is_retained = os.fstat(fd).st_ino == retained_inode
+        is_retained = fs.fstat(fd).st_ino == retained_inode
         stream = real_fdopen(fd, *args, **kwargs)
         return BoundedReader(stream) if is_retained else stream
 
@@ -108,6 +108,8 @@ def test_malformed_retained_entries_abort_without_replacing_backup(tmp_path, tre
     elif kind == 'directory-link':
         bad.symlink_to(outside, target_is_directory=True)
     else:
+        if os.name == 'nt':
+            pytest.skip('Windows has no POSIX FIFO entries; native reparse points are tested separately')
         os.mkfifo(bad)
     destination = tmp_path / 'backup.zip'
     destination.write_bytes(b'previous snapshot')
@@ -150,15 +152,15 @@ def test_retained_file_identity_or_content_race_aborts_backup(tmp_path, monkeypa
     destination = tmp_path / 'backup.zip'
     destination.write_bytes(b'previous snapshot')
     if change == 'replace-before-open':
-        real_open = os.open
+        real_open = fs.open
 
         def replaced_open(name, flags, *args, **kwargs):
-            if name == source.name and flags & os.O_NOFOLLOW:
+            if name == source.name and flags & fs.O_NOFOLLOW:
                 source.rename(tmp_path / 'old-inode')
                 source.write_bytes(b'new bytes under the same name')
             return real_open(name, flags, *args, **kwargs)
 
-        monkeypatch.setattr(os, 'open', replaced_open)
+        monkeypatch.setattr(fs, 'open', replaced_open)
     else:
         real_fdopen = os.fdopen
 
@@ -187,12 +189,12 @@ def test_retained_file_identity_or_content_race_aborts_backup(tmp_path, monkeypa
                 return content
 
         def fdopen(fd, *args, **kwargs):
-            selected = os.fstat(fd).st_ino == inode
+            selected = fs.fstat(fd).st_ino == inode
             stream = real_fdopen(fd, *args, **kwargs)
             return MutatingReader(stream) if selected else stream
 
         monkeypatch.setattr(os, 'fdopen', fdopen)
-    with pytest.raises(ValueError, match='changed'):
+    with pytest.raises((ValueError, PermissionError)):
         store.backup(destination)
     assert destination.read_bytes() == b'previous snapshot'
 
@@ -249,7 +251,7 @@ def test_memory_save_waits_for_sqlite_and_strand_snapshot_without_deadlock(tmp_p
             # scheduling guesses. The snapshot must already exclude writers.
             with (store.strand.root / '.write-lock').open('r+b') as guard:
                 with pytest.raises(BlockingIOError):
-                    fcntl.flock(guard, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fs.flock(guard.fileno(), fs.LOCK_EX | fs.LOCK_NB)
             writer.start()
             assert attempted.wait(5), 'Worker did not reach memory save'
             assert not finished.is_set()

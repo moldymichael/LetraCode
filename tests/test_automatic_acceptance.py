@@ -6,11 +6,11 @@ Approval callbacks are explicitly scripted test decisions, not human approvals.
 import copy
 import hashlib
 import json
-import shlex
 import subprocess
 import sys
 import threading
 
+from tools.run_acceptance import python_command
 from letracode.budgeting import RequestUsage
 from letracode.store import Store
 from letracode.worker import ConversationWorker
@@ -115,7 +115,7 @@ def test_whole_work_reads_27_real_pages_and_recovers_old_evidence_without_user_c
         offset = 8900 if index == 2 else 500
         text = text[:offset] + marker + text[offset + len(marker):]
         path = folder / f'chapter-{index + 1}.txt'
-        path.write_text(text)
+        path.write_bytes(text.encode('utf-8'))
         paths.append(path)
         contents.append(text)
     observed = []
@@ -199,7 +199,7 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
     folder, store, chat, _ = chat_fixture(tmp_path, objective)
     source = folder / 'clamp.py'
     original = 'def clamp(value):\n    return value\n'
-    source.write_text(original)
+    source.write_bytes(original.encode('utf-8'))
     verify = ('from pathlib import Path\nfrom clamp import clamp\n'
               'with Path("executions.txt").open("a") as log: log.write("verification\\n")\n'
               'assert clamp(-1) == 0, "NEGATIVE_BOUNDARY"\n'
@@ -210,7 +210,7 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
     for index in range(7):
         path = folder / f'design-{index}.txt'
         text = (f'Design section {index}: clamp retains interior values and bounds endpoints to 0 and 10. ' * 200)[:12000]
-        path.write_text(text)
+        path.write_bytes(text.encode('utf-8'))
         support.extend((path, offset, text[offset:offset + 4000]) for offset in range(0, len(text), 4000))
     assert len(support) == 21
 
@@ -220,7 +220,7 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
     git('init', '--quiet')
     git('add', '.')
     git('-c', 'user.name=Acceptance Fixture', '-c', 'user.email=fixture@example.invalid',
-        '-c', 'core.hooksPath=/dev/null', '-c', 'commit.gpgsign=false',
+        '-c', 'core.hooksPath=' + str(tmp_path / 'empty-hooks'), '-c', 'commit.gpgsign=false',
         'commit', '--quiet', '-m', 'Disposable synthetic baseline')
     staged = folder / 'staged-note.txt'
     staged.write_text('Preserve this independently staged user change.\n')
@@ -228,8 +228,9 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
     sentinel = folder / 'untracked-sentinel.txt'
     sentinel.write_bytes(b'untouched sentinel\x00\xff')
     staged_before = git('diff', '--cached', '--binary')
-    command = f'{shlex.quote(sys.executable)} -B verify.py'
-    args = {'command': command, 'cwd': str(folder), 'timeout': 5}
+    command = python_command('-B', 'verify.py')
+    command_timeout = 30 if sys.platform == 'win32' else 5
+    args = {'command': command, 'cwd': str(folder), 'timeout': command_timeout}
     verification = []
     final = 'Verified clamp after negative and upper boundary failures. The final diff is ready for review.'
 
@@ -263,7 +264,7 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
         green = yield tool_call('run_command', args)
         assert green['exit_code'] == 0 and 'ACCEPTANCE_PASS' in green['output']
         verification.append(green)
-        diff = yield tool_call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': 5})
+        diff = yield tool_call('run_command', {'command': 'git diff -- clamp.py', 'cwd': str(folder), 'timeout': command_timeout})
         assert '-    return value' in diff['output'] and '+    return min(10, max(0, value))' in diff['output']
         catalog = yield tool_call('list_tool_results', {'limit': 20})
         oldest_check = next(item for item in catalog['results'] if item['name'] == 'run_command')

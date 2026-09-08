@@ -2,8 +2,9 @@
 
 This update is based on the current reliability implementation, commit
 `7863707`, on branch `codex/evaluation-memory`. The older repository anchor
-contains separate Windows work and is preserved. This branch still requires
-the Linux filesystem primitives used by the existing guarded-save system.
+contains separate Windows work and is preserved. This historical update used
+Linux filesystem primitives. Version 0.3.0 subsequently adds native Windows
+support; see [its verification record](WINDOWS-RELEASE.md).
 Development and automated verification use disposable data; your live data
 folder has not been opened, migrated, or installed over.
 

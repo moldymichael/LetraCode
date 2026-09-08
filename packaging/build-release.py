@@ -11,6 +11,7 @@ import stat
 import tarfile
 import tempfile
 import tomllib
+import zipfile
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -24,6 +25,7 @@ def release_files() -> list[Path]:
     files.extend((ROOT / "letracode").glob("*.py"))
     files.append(ROOT / "letracode/assets/io.letracode.LetraCode.svg")
     files.extend((ROOT / "tests").glob("test_*.py"))
+    files.append(ROOT / "tests/conftest.py")
     files.extend(
         ROOT / "packaging" / name
         for name in (
@@ -34,14 +36,31 @@ def release_files() -> list[Path]:
             "io.letracode.LetraCode.metainfo.xml",
         )
     )
-    # Ship capability claims with their linked current/historical explanations.
-    # Include portable verification entry points, never raw scratch or models.
     files.extend((ROOT / "docs").rglob("*.md"))
     files.extend((ROOT / "tools").glob("*.py"))
+    files.extend((ROOT / ".github/workflows").glob("*.yml"))
+    files.extend((ROOT / "packaging/licenses").rglob("*.txt"))
+    files.extend(ROOT / "packaging" / name for name in (
+        "build-windows.py", "windows-launcher.py", "windows.iss",
+        "windows-requirements.txt", "smoke-windows.py",
+    ))
+    files.append(ROOT / ".gitattributes")
     missing = [path for path in files if not path.is_file()]
     if missing:
         raise FileNotFoundError(f"required release file is missing: {missing[0]}")
     return sorted(set(files))
+
+
+def file_mode(path: Path) -> int:
+    # Windows does not preserve POSIX executable bits. The archives must still
+    # contain runnable Fedora installers when the release is built on Windows.
+    return 0o755 if path.suffix == ".sh" or path.name == "build-release.py" else 0o644
+
+
+def release_content(path: Path) -> bytes:
+    # Every release_files entry is text. Keep Fedora shell scripts executable
+    # and archives reproducible even after a Git for Windows CRLF checkout.
+    return path.read_bytes().replace(b"\r\n", b"\n")
 
 
 def archive_bytes(version: str) -> bytes:
@@ -55,9 +74,22 @@ def archive_bytes(version: str) -> bytes:
                 info.uid = info.gid = 0
                 info.uname = info.gname = "root"
                 info.mtime = 0
-                info.mode = 0o755 if os.access(path, os.X_OK) else 0o644
-                with path.open("rb") as source:
-                    archive.addfile(info, source)
+                info.mode = file_mode(path)
+                content = release_content(path)
+                info.size = len(content)
+                archive.addfile(info, io.BytesIO(content))
+    return raw.getvalue()
+
+
+def zip_bytes(version: str) -> bytes:
+    raw = io.BytesIO()
+    with zipfile.ZipFile(raw, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for path in release_files():
+            info = zipfile.ZipInfo(f"LetraCode-{version}/{path.relative_to(ROOT).as_posix()}", date_time=(1980, 1, 1, 0, 0, 0))
+            info.create_system = 3
+            info.external_attr = (stat.S_IFREG | file_mode(path)) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, release_content(path))
     return raw.getvalue()
 
 
@@ -100,10 +132,13 @@ def main() -> int:
     payload = archive_bytes(version)
     source_archive = arguments.output_dir / f"LetraCode-{version}.tar.gz"
     run_installer = arguments.output_dir / f"LetraCode-{version}.run"
+    source_zip = arguments.output_dir / f"LetraCode-{version}.zip"
     atomic_write(source_archive, payload, 0o644)
     atomic_write(run_installer, run_stub(version) + payload, 0o755)
+    atomic_write(source_zip, zip_bytes(version), 0o644)
     print(source_archive)
     print(run_installer)
+    print(source_zip)
     return 0
 
 

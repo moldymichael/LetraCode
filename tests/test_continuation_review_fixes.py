@@ -1,7 +1,5 @@
 """Review regressions exercise real persistence/tools with scripted inference."""
 import json
-import shlex
-import sys
 
 import pytest
 
@@ -11,6 +9,7 @@ from letracode.engine import Cancelled
 from letracode.evidence import evidence_state
 from letracode.store import Store, message_status
 from letracode.worker import ConversationWorker
+from tools.run_acceptance import python_command
 
 
 class Engine:
@@ -175,7 +174,7 @@ def test_smaller_source_pages_recover_compacted_exposure_without_false_stalls(tm
 def test_equivalent_effectful_commands_reference_saved_outcome_instead_of_rerunning(tmp_path, variant):
     source, store, chat, _ = fixture(tmp_path)
     marker = source / 'executions.txt'
-    command = 'printf x >> ' + shlex.quote(str(marker))
+    command = python_command('-c', f'from pathlib import Path; Path({str(marker)!r}).open("ab").write(b"x")')
     alias = tmp_path / 'source-alias'
     alias.symlink_to(source, target_is_directory=True)
 
@@ -220,7 +219,7 @@ def test_pure_command_identity_uses_execution_fields_and_default_timeout():
 def test_real_output_cap_halts_batch_before_later_approval_effects_or_request(tmp_path):
     source, store, chat, _ = fixture(tmp_path)
     script = 'import sys,time; sys.stdout.write("x" * 100000); sys.stdout.flush(); time.sleep(5)'
-    command = shlex.quote(sys.executable) + ' -u -c ' + shlex.quote(script)
+    command = python_command('-u', '-c', script)
     batch = [call('run_command', {'command': command, 'cwd': str(source)}, 'capped')]
     batch += [call('write_file', {'path': str(source / f'never-{index}.txt'),
                                  'content': 'obsolete', 'expected_sha256': None}, index)
@@ -232,7 +231,8 @@ def test_real_output_cap_halts_batch_before_later_approval_effects_or_request(tm
     worker.run()
     results = outcomes(store, chat)
     assert results[0]['executed'] is True and results[0]['output_limit_reached'] is True
-    assert len(results[0]['output']) == 64000 and results[0]['exit_code'] < 0
+    # Windows termination statuses do not use POSIX negative signal numbers.
+    assert len(results[0]['output']) == 64000 and results[0]['exit_code'] != 0
     assert not list(source.glob('never-*.txt')), 'Output-cap termination allowed later effects'
     assert len(approvals) == 1 and len(engine.requests) == 1
     assert len(results) == 3
@@ -305,7 +305,7 @@ def test_page_novelty_uses_returned_offset_content_and_source_version_not_reques
 def test_unknown_command_argument_is_validated_before_duplicate_diagnostic(tmp_path):
     source, store, chat, _ = fixture(tmp_path)
     marker = source / 'executions.txt'
-    command = 'printf x >> ' + shlex.quote(str(marker))
+    command = python_command('-c', f'from pathlib import Path; Path({str(marker)!r}).open("ab").write(b"x")')
 
     def reply(number, _):
         if number == 3:

@@ -1,10 +1,12 @@
 """Real disposable sources; injected boundaries model ordinary editor races."""
 import importlib.util
-import fcntl
+from letracode import filesystem as fs
 import json
 import multiprocessing
 import os
 import stat
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -26,12 +28,13 @@ def test_snapshot_keeps_raw_utf8_bom_newlines_hash_and_mode(tmp_path, source_fil
     target.write_bytes(original)
     target.chmod(0o751)
     before = source_files.snapshot(target)
+    expected_mode = stat.S_IMODE(target.stat().st_mode)
     assert before == {'path': str(target), 'raw': original,
-                      'text': original.decode('utf-8'), 'sha256': guarded.digest(original), 'mode': 0o751}
+                      'text': original.decode('utf-8'), 'sha256': guarded.digest(original), 'mode': expected_mode}
     updated = before['text'].replace('before', 'after').encode('utf-8')
     saved = source_files.publish(target, updated, before['sha256'], mode=before['mode'])
     assert saved['raw'] == updated == target.read_bytes()
-    assert stat.S_IMODE(target.stat().st_mode) == 0o751
+    assert stat.S_IMODE(target.stat().st_mode) == expected_mode
     assert read_text(target) == updated.decode('utf-8-sig')
     retained = list((tmp_path / '.letracode-recovery' / target.name).glob('*.before'))
     assert len(retained) == 1 and retained[0].read_bytes() == original
@@ -47,6 +50,8 @@ def test_stale_snapshot_cannot_publish_over_external_change(tmp_path, source_fil
     if change == 'content':
         target.write_text('external edit\n')
     else:
+        if fs.IS_WINDOWS:
+            pytest.skip('POSIX executable permission changes do not exist on Windows')
         target.chmod(0o750)
     expected_bytes, expected_mode = target.read_bytes(), stat.S_IMODE(target.stat().st_mode)
     with pytest.raises(ValueError, match='changed|conflict'):
@@ -105,6 +110,11 @@ def test_late_descriptor_edit_is_retained_and_detected_by_context_reads(tmp_path
     target.write_bytes(b'original\n')
     before = source_files.snapshot(target)
     with target.open('r+b') as editor:
+        if fs.IS_WINDOWS:
+            with pytest.raises(PermissionError):
+                source_files.publish(target, b'model edit\n', before['sha256'], mode=before['mode'])
+            assert target.read_bytes() == b'original\n'
+            return
         source_files.publish(target, b'model edit\n', before['sha256'], mode=before['mode'])
         editor.write(b'late descriptor save\n')
         editor.truncate()
@@ -126,31 +136,30 @@ def test_process_crash_keeps_recoverable_sources_without_automatic_restoration(t
     target.chmod(0o755)
     before = source_files.snapshot(target)
 
-    def child_save():
-        move = guarded.rename_noreplace
-
-        def interrupt(source_fd, source, destination_fd, destination):
-            move(source_fd, source, destination_fd, destination)
-            if ((stage == 'capture' and source == target.name) or
-                    (stage == 'publish' and destination == target.name and source.endswith('.proposed'))):
-                os.fsync(source_fd)
-                os.fsync(destination_fd)
-                os._exit(0)
-
-        guarded.rename_noreplace = interrupt
-        source_files.publish(target, b'model edit\r\n', before['sha256'], mode=before['mode'])
-        os._exit(2)
-
-    child = multiprocessing.get_context('fork').Process(target=child_save)
-    child.start(); child.join(5)
-    if child.is_alive():
-        child.terminate(); child.join()
-        pytest.fail('Save did not reach its interruption boundary')
-    assert child.exitcode == 0
+    program = r'''
+import os, sys
+from pathlib import Path
+from letracode import filesystem as fs, source_files
+import letracode.strand as guarded
+target, stage = Path(sys.argv[1]), sys.argv[2]
+before = source_files.snapshot(target)
+move = guarded.rename_noreplace
+def interrupt(source_fd, source, destination_fd, destination):
+    move(source_fd, source, destination_fd, destination)
+    if ((stage == 'capture' and source == target.name) or
+            (stage == 'publish' and destination == target.name and source.endswith('.proposed'))):
+        fs.fsync(source_fd); fs.fsync(destination_fd); os._exit(73)
+guarded.rename_noreplace = interrupt
+source_files.publish(target, b'model edit\r\n', before['sha256'], mode=before['mode'])
+os._exit(74)
+'''
+    child = subprocess.run([sys.executable, '-c', program, str(target), stage], capture_output=True, timeout=10)
+    assert child.returncode == 73, child.stderr.decode()
     recovery = tmp_path / '.letracode-recovery' / target.name
     old = list(recovery.glob('*.before'))
     assert len(old) == 1 and old[0].read_bytes() == b'original\r\n'
-    assert stat.S_IMODE(old[0].stat().st_mode) == 0o755
+    expected_mode = 0o666 if fs.IS_WINDOWS else 0o755
+    assert stat.S_IMODE(old[0].stat().st_mode) == expected_mode
     for read in (lambda: read_text(target), lambda: source_files.snapshot(target)):
         with pytest.raises(ValueError, match='recovery|recoverable') as error:
             read()
@@ -162,7 +171,7 @@ def test_process_crash_keeps_recoverable_sources_without_automatic_restoration(t
             assert any(path.read_bytes() == b'model edit\r\n' for path in recovery.glob('*.proposed'))
         else:
             assert target.read_bytes() == b'model edit\r\n'
-            assert stat.S_IMODE(target.stat().st_mode) == 0o755
+            assert stat.S_IMODE(target.stat().st_mode) == expected_mode
 
 
 @pytest.mark.parametrize('stage', ['already', 'staged', 'captured'])
@@ -202,6 +211,8 @@ def test_unsafe_source_targets_are_rejected_without_modification(tmp_path, sourc
     elif unsafe == 'hardlink':
         os.link(target, tmp_path / 'another.py')
     else:
+        if fs.IS_WINDOWS:
+            pytest.skip('Windows has no POSIX FIFO entries')
         selected = tmp_path / 'pipe'; os.mkfifo(selected)
     with pytest.raises((ValueError, OSError)):
         source_files.snapshot(selected)
@@ -212,15 +223,15 @@ def test_unsafe_source_targets_are_rejected_without_modification(tmp_path, sourc
 
 def test_snapshot_refuses_path_replaced_between_stat_and_open(tmp_path, source_files, monkeypatch):
     target = tmp_path / 'source.py'; target.write_bytes(b'original\n')
-    real_open = os.open
+    real_open = fs.open
 
     def replace_then_open(path, flags, *args, **kwargs):
-        if path == target.name and flags & os.O_NONBLOCK:
+        if path == target.name and flags & fs.O_NONBLOCK:
             replacement = tmp_path / 'replacement.py'; replacement.write_bytes(b'external\n')
             os.replace(replacement, target)
         return real_open(path, flags, *args, **kwargs)
 
-    monkeypatch.setattr(os, 'open', replace_then_open)
+    monkeypatch.setattr(fs, 'open', replace_then_open)
     with pytest.raises(ValueError, match='changed'):
         source_files.snapshot(target)
     assert target.read_bytes() == b'external\n'
@@ -247,7 +258,10 @@ def test_create_source_uses_private_mode_and_preserves_exact_bytes(tmp_path, sou
     assert missing['raw'] is None and missing['sha256'] is None
     result = source_files.publish(target, b'\xef\xbb\xbf# created\r\n', None)
     assert result['raw'] == target.read_bytes() == b'\xef\xbb\xbf# created\r\n'
-    assert result['mode'] == stat.S_IMODE(target.stat().st_mode) == 0o600
+    # Windows reports ordinary writable bits; security is inherited through
+    # ACLs. POSIX creation must retain the explicit private permission mode.
+    expected_mode = 0o666 if fs.IS_WINDOWS else 0o600
+    assert missing['mode'] == result['mode'] == stat.S_IMODE(target.stat().st_mode) == expected_mode
 
 
 @pytest.mark.parametrize('raw', [b'not\x00text', b'not\xffutf8'])
@@ -291,31 +305,26 @@ def test_busy_untrusted_source_lock_fails_promptly_without_mutation(tmp_path, so
     before = source_files.snapshot(target)
     recovery = tmp_path / '.letracode-recovery' / target.name
     recovery.mkdir(parents=True)
-    receive, send = multiprocessing.Pipe(duplex=False)
-
-    def attempt():
-        try:
-            if action == 'read':
-                source_files.snapshot(target)
-            else:
-                source_files.publish(target, b'new\n', before['sha256'], mode=before['mode'])
-        except (OSError, ValueError) as error:
-            send.send(str(error))
-        else:
-            send.send('unexpected success')
-        finally:
-            send.close()
-
+    program = r'''
+import sys
+from pathlib import Path
+from letracode import source_files
+target, action = Path(sys.argv[1]), sys.argv[2]
+try:
+    if action == 'read':
+        source_files.snapshot(target)
+    else:
+        source_files.publish(target, b'new\n', sys.argv[3], mode=int(sys.argv[4]))
+except (OSError, ValueError) as error:
+    print(str(error))
+else:
+    sys.exit('unexpected success')
+'''
     with (recovery / '.lock').open('wb') as held:
-        fcntl.flock(held, fcntl.LOCK_EX)
-        child = multiprocessing.get_context('fork').Process(target=attempt)
-        child.start()
-        available = receive.poll(1)
-        if not available:
-            child.terminate()
-        child.join(3)
-        assert available, 'Source operation waited indefinitely on a repository-controlled lock'
-        assert 'busy' in receive.recv().lower()
-    receive.close(); send.close()
+        fs.flock(held.fileno(), fs.LOCK_EX)
+        child = subprocess.run([sys.executable, '-c', program, str(target), action,
+                                before['sha256'], str(before['mode'])], capture_output=True, timeout=5)
+        assert child.returncode == 0, child.stderr.decode()
+        assert 'busy' in child.stdout.decode().lower()
     assert target.read_bytes() == b'original\n'
     assert {path.name for path in recovery.iterdir()} == {'.lock'}

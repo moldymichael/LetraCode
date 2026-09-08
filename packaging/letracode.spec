@@ -1,5 +1,5 @@
 Name:           letracode
-Version:        0.2.1
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        Private local AI conversations with project context
 License:        MIT
@@ -53,6 +53,9 @@ PYTHONPATH=%{buildroot}%{_datadir}/letracode %{_bindir}/python3 -P -m letracode 
 %{_metainfodir}/io.letracode.LetraCode.metainfo.xml
 
 %changelog
+* Tue Sep 08 2026 LetraCode contributors - 0.3.0-1
+- Native Windows support while preserving Fedora and project recovery behavior
+
 * Tue Sep 08 2026 LetraCode contributors - 0.2.1-1
 - File-first project interface with existing Memory recovery support
 

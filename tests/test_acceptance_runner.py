@@ -9,6 +9,24 @@ import pytest
 from tools import run_acceptance as runner
 
 
+def test_acceptance_python_command_runs_with_quoted_paths_and_environment(tmp_path):
+    from letracode.tools import command_argv
+
+    folder = tmp_path / "Project café's notes"
+    folder.mkdir()
+    script = folder / 'check environment.py'
+    script.write_text(
+        "import json, os, sys\n"
+        "print(json.dumps([os.environ['LETRACODE_FIXTURE_VALUE'], sys.argv[1]], ensure_ascii=True))\n",
+        encoding='utf-8')
+    value = "apostrophe ' and double quote \" and $literal"
+    command = runner.python_command(str(script), value,
+        environment={'LETRACODE_FIXTURE_VALUE': value})
+    result = subprocess.run(command_argv(command), cwd=folder, text=True,
+        capture_output=True, timeout=15, check=True)
+    assert json.loads(result.stdout) == [value, value]
+
+
 def git(path, *args):
     return subprocess.check_output(['git', *args], cwd=path)
 
@@ -23,6 +41,7 @@ def repository(tmp_path):
     (source / 'letracode/tools.py').write_text('original = True\n')
     (source / 'tests/test_tools.py').write_text('def test_original(): pass\n')
     git(source, 'init', '-q')
+    git(source, 'config', 'core.autocrlf', 'false')
     git(source, 'add', '.')
     git(source, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
         'commit', '-qm', 'fixture')
@@ -72,7 +91,7 @@ def test_prelaunch_provenance_records_head_patch_and_current_file_hashes(tmp_pat
     source = repository(tmp_path)
     (source / 'letracode/tools.py').write_text('current_fix = True\n')
     new_module = source / 'letracode/new_dependency.py'
-    new_module.write_text('new_dependency = True\n')
+    new_module.write_bytes(b'new_dependency = True\n')
     git(source, 'add', 'letracode/new_dependency.py')
     original_head = git(source, 'rev-parse', 'HEAD').decode().strip()
     patch = git(source, 'diff', '--binary', 'HEAD')
@@ -274,6 +293,11 @@ def test_opted_in_legacy_fixture_continues_once_with_distinct_origin(tmp_path, m
                 data['checkpoint'].pop('continuation')
                 data['checkpoint']['reason'] = 'action_round_limit'
                 self.store.update_message(row['id'], 'Scripted legacy manual ten-round pause.', 'paused', payload=data)
+                if counter == 20:
+                    # End the idle second pause deterministically. This checks
+                    # the single fixture continuation, not filesystem speed;
+                    # the separate wall-budget test covers real elapsed time.
+                    budget.started -= budget.max_seconds
     monkeypatch.setattr(ui, 'ConversationWorker', ScriptedLegacyWorker)
     fixture = runner.prepare_fixture(tmp_path / 'trial', 'reading', repository(tmp_path))
     fixture['fixture_continuation'] = True
@@ -295,8 +319,9 @@ def test_opted_in_legacy_fixture_continues_once_with_distinct_origin(tmp_path, m
             'type':'function', 'function':{'name':'read_file','arguments':json.dumps({'path':str(paths[(counter - 1) % 10])})}}]}
     monkeypatch.setattr(LocalEngine, 'complete', scripted)
     root = Path(fixture['root'])
+    budget = runner.Budget(max_seconds=30, max_turns=3)
     runner.run_native(fixture, EngineConfig(executable='/scripted/runtime', model_path='/scripted/model.gguf'),
-                      runner.Budget(max_seconds=2, max_turns=3), runner.Recorder(root, evidence_kind='scripted-engine-test'))
+                      budget, runner.Recorder(root, evidence_kind='scripted-engine-test'))
     result = json.loads((root / 'result.json').read_text())
     assert result['pause_exercised'] is True
     assert result['fixture_continuation_exercised'] is True

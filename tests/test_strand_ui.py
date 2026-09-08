@@ -1,4 +1,7 @@
 import json
+import os
+import stat
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -8,6 +11,19 @@ from PySide6.QtWidgets import QApplication
 
 from letracode.store import Store
 from letracode.ui import MainWindow
+
+
+def deny_file_reads(path):
+    """Make a disposable fixture unreadable with the host's permission model."""
+    if os.name == 'nt':
+        account = os.environ['USERNAME']
+        subprocess.run(['icacls', str(path), '/deny', account + ':(RD)'],
+                       check=True, capture_output=True, timeout=10)
+        return lambda: subprocess.run(['icacls', str(path), '/remove:d', account],
+                                      check=True, capture_output=True, timeout=10)
+    mode = stat.S_IMODE(path.stat().st_mode)
+    path.chmod(0)
+    return lambda: path.chmod(mode)
 
 
 def file_dialog(store, project=None):
@@ -296,10 +312,11 @@ def test_unavailable_project_memory_editor_requires_reload_after_repair(tmp_path
     store = Store(tmp_path / 'data'); project = store.create_project('Novel')
     path = Path(store.strand.snapshot('project', project)['path'])
     path.write_text('Authoritative memory', encoding='utf-8')
+    restore_reads = lambda: None
     if damage == 'missing':
         path.unlink()
     elif damage == 'inaccessible':
-        path.chmod(0)
+        restore_reads = deny_file_reads(path)
     else:
         path.write_bytes(b'\xff malformed memory')
     try:
@@ -310,7 +327,7 @@ def test_unavailable_project_memory_editor_requires_reload_after_repair(tmp_path
         if damage == 'missing':
             assert not path.exists()
         else:
-            path.chmod(0o600)
+            restore_reads()
             expected = b'Authoritative memory' if damage == 'inaccessible' else b'\xff malformed memory'
             assert path.read_bytes() == expected
         path.write_text('Repaired external memory', encoding='utf-8')
@@ -320,6 +337,7 @@ def test_unavailable_project_memory_editor_requires_reload_after_repair(tmp_path
         assert state.available and state.text == 'Repaired external memory'
         assert state.save('User correction after reload') is True
     finally:
+        restore_reads()
         if path.exists():
             path.chmod(0o600)
 
@@ -351,8 +369,9 @@ def test_unavailable_last_project_memory_does_not_block_app_or_other_chats(tmp_p
     store.add_message(affected, 'user', 'Still readable history')
     store.set_setting('last_chat', affected)
     path = Path(store.strand.snapshot('project', damaged)['path'])
+    restore_reads = lambda: None
     if damage == 'missing': path.unlink()
-    elif damage == 'inaccessible': path.chmod(0)
+    elif damage == 'inaccessible': restore_reads = deny_file_reads(path)
     else: path.write_bytes(b'\xff malformed memory')
     w = None
     try:
@@ -373,13 +392,14 @@ def test_unavailable_last_project_memory_does_not_block_app_or_other_chats(tmp_p
         assert store.chat(unrelated)['draft'] == 'Unrelated draft'
         w.select_chat(affected)
         assert w.composer.toPlainText() == 'Keep this affected draft'
-        if damage == 'inaccessible': path.chmod(0o600)
+        restore_reads()
         path.write_text('Externally repaired memory', encoding='utf-8')
         dialog = file_dialog(w.store, damaged)
         assert not dialog.editor.isReadOnly()
         assert dialog.editor.toPlainText() == 'Externally repaired memory'
         dialog.close()
     finally:
+        restore_reads()
         if path.exists(): path.chmod(0o600)
         if w: w.close()
 

@@ -4,17 +4,22 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "letracode"
-version = "0.2.1"
+version = "0.3.0"
 description = "Private local AI conversations with project context"
 readme = "README.md"
 requires-python = ">=3.11"
 license = {file = "LICENSE"}
 authors = [{name = "LetraCode contributors"}]
+dependencies = [
+  "PySide6>=6.6,<7; sys_platform == 'win32'",
+  "pypdf>=4; sys_platform == 'win32'",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: X11 Applications :: Qt",
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: Desktop Environment :: K Desktop Environment (KDE)",
@@ -22,6 +27,9 @@ classifiers = [
 
 [project.scripts]
 letracode = "letracode.app:main"
+
+[project.gui-scripts]
+letracode-gui = "letracode.app:main"
 
 [tool.setuptools]
 include-package-data = true

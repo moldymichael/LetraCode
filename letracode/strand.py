@@ -6,15 +6,15 @@ All paths are app-owned; no-follow directory descriptors prevent link redirectio
 from __future__ import annotations
 
 import hashlib
-import ctypes
-import fcntl
 import json
 import os
+
+from . import filesystem as fs
 import re
 import stat
 import threading
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -39,38 +39,38 @@ def backup_tree(root):
         return (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_mode, info.st_nlink)
 
     def walk(directory, prefix=''):
-        before = os.fstat(directory)
-        for name in sorted(os.listdir(directory)):
+        before = fs.fstat(directory)
+        for name in sorted(fs.listdir(directory)):
             relative = prefix + name
-            info = os.stat(name, dir_fd=directory, follow_symlinks=False)
+            info = fs.stat(name, dir_fd=directory, follow_symlinks=False)
             if stat.S_ISDIR(info.st_mode):
-                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+                child = fs.open(name, os.O_RDONLY | fs.O_DIRECTORY | fs.O_NOFOLLOW, dir_fd=directory)
                 try:
-                    if identity(os.fstat(child)) != identity(info):
+                    if identity(fs.fstat(child)) != identity(info):
                         raise ValueError(f'Directory changed during backup: {relative}')
                     yield from walk(child, relative + '/')
-                    if identity(os.stat(name, dir_fd=directory, follow_symlinks=False)) != identity(info):
+                    if identity(fs.stat(name, dir_fd=directory, follow_symlinks=False)) != identity(info):
                         raise ValueError(f'Directory changed during backup: {relative}')
                 finally:
-                    os.close(child)
+                    fs.close(child)
             elif stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
                 if Path(name).suffix.lower() == '.gguf' or name in ('.write-lock', '.lock') or name.startswith('.strand-'):
                     continue
-                fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+                fd = fs.open(name, os.O_RDONLY | fs.O_NOFOLLOW | fs.O_NONBLOCK, dir_fd=directory)
                 with os.fdopen(fd, 'rb') as incoming:
-                    opened = os.fstat(incoming.fileno())
+                    opened = fs.fstat(incoming.fileno())
                     if (not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1
                             or identity(opened) != identity(info) or version(opened) != version(info)):
                         raise ValueError(f'File changed while opening backup: {relative}')
                     yield relative, incoming
-                    after = os.fstat(incoming.fileno())
-                    named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    after = fs.fstat(incoming.fileno())
+                    named = fs.stat(name, dir_fd=directory, follow_symlinks=False)
                     if (version(after) != version(opened) or identity(named) != identity(opened)
                             or version(named) != version(opened)):
                         raise ValueError(f'File changed while reading backup: {relative}')
             else:
                 raise ValueError(f'Unsafe linked file in backup: {root / relative}')
-        if version(os.fstat(directory)) != version(before):
+        if version(fs.fstat(directory)) != version(before):
             raise ValueError(f'Directory changed during backup: {root / prefix}')
 
     with safe_directory(root) as directory:
@@ -81,134 +81,146 @@ def digest(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def rename_noreplace(src_fd, src, dst_fd, dst):
-    """Linux atomic move that NEVER replaces a name created by another writer."""
-    libc = ctypes.CDLL(None, use_errno=True)
-    rename = getattr(libc, 'renameat2', None)
-    if rename is None:
-        raise OSError('Safe Strand saves require Linux renameat2 support')
-    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-    rename.restype = ctypes.c_int
-    if rename(src_fd, os.fsencode(src), dst_fd, os.fsencode(dst), 1):  # RENAME_NOREPLACE
-        error = ctypes.get_errno()
-        raise OSError(error, os.strerror(error), dst)
+# Keep these entry points stable for callers and fault-injection tests.
+def rename_noreplace(src_fd, src, dst_fd, dst, **options):
+    return fs.rename_noreplace(src_fd, src, dst_fd, dst, **options)
 
 
-@contextmanager
-def safe_directory(path: Path, create=False):
-    """Open every ancestor without following symlinks, including the data root."""
-    path = Path(path).absolute()
-    fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+safe_directory = fs.safe_directory
+
+
+def _read_at(fd, name, max_bytes=MAX_FILE_BYTES, *, with_stat=False, for_replacement=False):
     try:
-        for name in path.parts[1:]:
-            if name in ('.', '..'):
-                raise ValueError('Unsafe directory component')
-            if create:
-                try:
-                    os.mkdir(name, 0o700, dir_fd=fd)
-                    os.fsync(fd)
-                except FileExistsError:
-                    pass
-            try:
-                child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-            except OSError as error:
-                raise ValueError(f'Unsafe or missing directory (links are refused): {path}') from error
-            os.close(fd)
-            fd = child
-        yield fd
-    finally:
-        os.close(fd)
-
-
-def _read_at(fd, name, max_bytes=MAX_FILE_BYTES, *, with_stat=False):
-    try:
-        info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+        info = fs.stat(name, dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
         return None
     if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
         raise ValueError(f'Unsafe file or linked target: {name}')
     if info.st_size > max_bytes:
         raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
-    stream = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    stream = fs.open(name, os.O_RDONLY | fs.O_NOFOLLOW | fs.O_NONBLOCK, dir_fd=fd)
     with os.fdopen(stream, 'rb') as incoming:
-        opened = os.fstat(incoming.fileno())
+        opened = fs.fstat(incoming.fileno())
         if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
             raise ValueError(f'Unsafe file or linked target: {name}')
         if (opened.st_dev, opened.st_ino) != (info.st_dev, info.st_ino):
             raise ValueError(f'File changed while opening: {name}')
         if opened.st_size > max_bytes:
             raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
+        if for_replacement:
+            permissions = fs.check_replacement_permissions(incoming.fileno())
         data = incoming.read(max_bytes + 1)
         if len(data) > max_bytes:
             raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
-        after = os.fstat(incoming.fileno())
+        after = fs.fstat(incoming.fileno())
         if (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns, opened.st_mode) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns, after.st_mode):
             raise ValueError(f'File changed while reading: {name}')
+    if for_replacement:
+        return data, opened, permissions
     return (data, opened) if with_stat else data
 
 
-def _write_new(fd, name, data, *, mode=None):
+def _write_new(fd, name, data, *, mode=None, permissions=None):
     # Publish control records only when complete: a killed process must not
     # leave a partial final journal or completion marker that poisons recovery.
     staging = '.strand-stage-' + uuid.uuid4().hex
     try:
-        out_fd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+        out_fd = fs.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | fs.O_NOFOLLOW, 0o600, dir_fd=fd)
         with os.fdopen(out_fd, 'wb') as out:
+            if permissions is not None and fs.check_replacement_permissions(out.fileno()) != permissions:
+                # Check the empty staged file before writing potentially
+                # private content under a broader inherited Windows DACL.
+                raise PermissionError('Replacement has different Windows permissions; saving was refused to preserve its access controls')
             out.write(data)
             out.flush()
             if mode is not None:
-                os.fchmod(out.fileno(), mode)
-            os.fsync(out.fileno())
+                fs.fchmod(out.fileno(), mode)
+            fs.fsync(out.fileno())
         rename_noreplace(fd, staging, fd, name)
-        os.fsync(fd)
+        fs.fsync(fd)
     finally:
         try:
-            os.unlink(staging, dir_fd=fd)
+            fs.unlink(staging, dir_fd=fd)
         except FileNotFoundError:
             pass
 
 
 @contextmanager
-def _recovery_directory(path, create=False, *, namespace='.strand-recovery'):
+def _recovery_location(path, create, namespace, parent):
+    recovery = path.parent / namespace / path.name
+    if fs.IS_WINDOWS and parent is not None:
+        # The caller's Windows handle pins every ancestor already. Reopening
+        # the entire chain for each recovery component adds no protection and
+        # makes receipt/history scans needlessly expensive. Keep that guard
+        # live while opening and checking just these two child directories.
+        with ExitStack() as stack:
+            directory = parent
+            try:
+                for name in (namespace, path.name):
+                    if create:
+                        try:
+                            fs.mkdir(name, 0o700, dir_fd=directory)
+                            fs.fsync(directory)
+                        except FileExistsError:
+                            pass
+                    child = fs.open(name, os.O_RDONLY | fs.O_DIRECTORY | fs.O_NOFOLLOW, dir_fd=directory)
+                    stack.callback(fs.close, child)
+                    directory = child
+            except FileNotFoundError:
+                if create:
+                    raise
+                yield None
+                return
+            yield directory
+        return
+    if not create:
+        with safe_directory(path.parent) as folder:
+            try:
+                fs.stat(namespace, dir_fd=folder, follow_symlinks=False)
+            except FileNotFoundError:
+                yield None
+                return
+        with safe_directory(recovery.parent) as folder:
+            try:
+                fs.stat(path.name, dir_fd=folder, follow_symlinks=False)
+            except FileNotFoundError:
+                yield None
+                return
+    with safe_directory(recovery, create=create) as directory:
+        yield directory
+
+
+@contextmanager
+def _recovery_directory(path, create=False, *, namespace='.strand-recovery', parent=None):
     # A separate directory per target isolates a damaged project's recovery data.
     if namespace not in ('.strand-recovery', '.letracode-recovery'):
         raise ValueError('Invalid recovery namespace')
     recovery = path.parent / namespace / path.name
-    if not create:
-        with safe_directory(path.parent) as parent:
-            try:
-                os.stat(namespace, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                yield None
-                return
-        with safe_directory(recovery.parent) as parent:
-            try:
-                os.stat(path.name, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                yield None
-                return
-    with safe_directory(recovery, create=create) as fd:
-        flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    with _recovery_location(path, create, namespace, parent) as fd:
+        if fd is None:
+            yield None
+            return
+        flags = os.O_RDWR | fs.O_NOFOLLOW | fs.O_NONBLOCK
         if create or namespace == '.strand-recovery':
             flags |= os.O_CREAT
         try:
-            lock = os.open('.lock', flags, 0o600, dir_fd=fd)
+            lock = fs.open('.lock', flags, 0o600, dir_fd=fd)
         except FileNotFoundError:
             # Reading untrusted source recovery metadata does not authorize
             # creating even its control files in the linked repository.
             raise ValueError(f'Source recovery requires explicit reconciliation: missing lock in {recovery}') from None
         try:
-            info = os.fstat(lock)
+            info = fs.fstat(lock)
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError('Unsafe Strand recovery lock')
             try:
-                operation = fcntl.LOCK_EX | (fcntl.LOCK_NB if namespace == '.letracode-recovery' else 0)
-                fcntl.flock(lock, operation)
+                operation = fs.LOCK_EX | (fs.LOCK_NB if namespace == '.letracode-recovery' else 0)
+                fs.flock(lock, operation)
             except BlockingIOError:
                 raise ValueError(f'Source recovery is busy; retry after the other operation finishes: {recovery}') from None
             yield fd
         finally:
-            os.close(lock)
+            fs.close(lock)
 
 
 def _finish_recovery(fd, ident, status, before_hash):
@@ -225,7 +237,7 @@ def _check_recovery(path, parent, recovery, max_bytes, *, namespace='.strand-rec
         return
     location = path.parent / namespace / path.name
     kind = 'Memory' if namespace == '.strand-recovery' else 'Source file'
-    for name in sorted(os.listdir(recovery)):
+    for name in sorted(fs.listdir(recovery)):
         if not re.fullmatch(r'[a-f0-9]{32}\.json', name):
             continue
         ident = name[:-5]
@@ -248,8 +260,8 @@ def _check_recovery(path, parent, recovery, max_bytes, *, namespace='.strand-rec
             if old is not None:
                 try:
                     rename_noreplace(recovery, ident + '.before', parent, path.name)
-                    os.fsync(parent)
-                    os.fsync(recovery)
+                    fs.fsync(parent)
+                    fs.fsync(recovery)
                     old = None
                 except FileExistsError:
                     pass
@@ -266,21 +278,21 @@ def _check_recovery(path, parent, recovery, max_bytes, *, namespace='.strand-rec
 
 
 def safe_read(path: Path, max_bytes=MAX_FILE_BYTES):
-    with safe_directory(path.parent) as fd, _recovery_directory(path) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, max_bytes)
         return _read_at(fd, path.name, max_bytes)
 
 
 def safe_snapshot(path: Path, max_bytes=MAX_FILE_BYTES, *, namespace='.strand-recovery'):
     """Read bytes and metadata from one descriptor after checking recovery."""
-    with safe_directory(path.parent) as fd, _recovery_directory(path, namespace=namespace) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, namespace=namespace, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
         return _read_at(fd, path.name, max_bytes, with_stat=True)
 
 
 def recover_file(path: Path):
     """Resolve interrupted saves before archiving ownership of a memory path."""
-    with safe_directory(path.parent) as fd, _recovery_directory(path) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, MAX_FILE_BYTES)
 
 
@@ -288,7 +300,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
                transaction_id=None, namespace='.strand-recovery', mode=None, cancel=None, expected_entry_identity=None):
     """Preserve the displaced inode, validate it, then publish without replacement.
 
-    Advisory locks cannot coordinate ordinary editors. Every move uses Linux
+    Advisory locks cannot coordinate ordinary editors. Every move uses atomic
     NOREPLACE, including restoration; a competing pathname is never overwritten.
     The brief absent-name interval is recoverable from the durable journal.
     """
@@ -298,15 +310,19 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
         raise ValueError('Invalid write transaction ID')
     if mode is not None and (type(mode) is not int or not 0 <= mode <= 0o7777):
         raise ValueError('Invalid file mode')
+    if fs.IS_WINDOWS and mode is not None and not mode & 0o222:
+        raise PermissionError('File is read-only; change its attribute before saving')
 
     def check_cancel():
         if cancel is not None and cancel.is_set():
             raise InterruptedError('Cancelled before saving.')
 
     check_cancel()
-    with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
-        observed = _read_at(fd, path.name, max_bytes, with_stat=True)
+        observed = _read_at(fd, path.name, max_bytes, with_stat=True, for_replacement=True)
+        if fs.IS_WINDOWS and observed is not None and not observed[1].st_mode & 0o222:
+            raise PermissionError('File is read-only; change its attribute before saving')
         if expected_entry_identity is not None and (observed is None or
                 [observed[1].st_dev, observed[1].st_ino] != list(expected_entry_identity)):
             raise ValueError('File identity changed; reload to review the replacement before saving')
@@ -322,34 +338,52 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
         captured = False
         published = False
         try:
-            _write_new(recovery, temporary, data, mode=mode)
-            proposed_info = os.stat(temporary, dir_fd=recovery, follow_symlinks=False)
+            _write_new(recovery, temporary, data, mode=mode,
+                       permissions=None if observed is None else observed[2])
+            proposed_info = fs.stat(temporary, dir_fd=recovery, follow_symlinks=False)
             proposed_identity = [proposed_info.st_dev, proposed_info.st_ino]
+
+            def check_permissions(permissions):
+                if permissions is None:  # POSIX retains its existing mode policy.
+                    return
+                proposed_fd = fs.open(temporary, os.O_RDONLY | fs.O_NOFOLLOW, dir_fd=recovery)
+                try:
+                    info = fs.fstat(proposed_fd)
+                    if [info.st_dev, info.st_ino] != proposed_identity:
+                        raise ValueError('Staged file identity changed before saving')
+                    if fs.check_replacement_permissions(proposed_fd) != permissions:
+                        raise PermissionError('Replacement has different Windows permissions; saving was refused to preserve its access controls')
+                finally:
+                    fs.close(proposed_fd)
+
+            if observed is not None:
+                check_permissions(observed[2])
             check_cancel()
             # Reopen the ancestor chain and compare directory identity before commit.
             with safe_directory(path.parent) as fresh:
-                a, b = os.fstat(fd), os.fstat(fresh)
+                a, b = fs.fstat(fd), fs.fstat(fresh)
                 if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
                     raise ValueError('Directory changed during write')
             if original is not None:
                 _write_new(recovery, ident + '.json', json.dumps({'before_sha256': expected_sha256}).encode())
                 rename_noreplace(fd, path.name, recovery, previous)
                 captured = True
-                os.fsync(fd)
-                os.fsync(recovery)
-                captured_snapshot = _read_at(recovery, previous, max_bytes, with_stat=True)
+                fs.fsync(fd)
+                fs.fsync(recovery)
+                captured_snapshot = _read_at(recovery, previous, max_bytes, with_stat=True, for_replacement=True)
                 if (captured_snapshot is None or captured_snapshot[0] != original or
                         (expected_entry_identity is not None and [captured_snapshot[1].st_dev, captured_snapshot[1].st_ino] != list(expected_entry_identity)) or
                         (mode is not None and stat.S_IMODE(captured_snapshot[1].st_mode) != mode)):
                     raise ValueError(f'File changed; reload to resolve the conflict: {path}')
+                check_permissions(captured_snapshot[2])
             check_cancel()
             try:
                 rename_noreplace(recovery, temporary, fd, path.name)
             except FileExistsError as error:
                 raise ValueError(f'File changed; reload to resolve the conflict: {path}') from error
             published = True
-            os.fsync(fd)
-            os.fsync(recovery)
+            fs.fsync(fd)
+            fs.fsync(recovery)
             if captured:
                 _finish_recovery(recovery, ident, 'saved', expected_sha256)
                 _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
@@ -360,8 +394,8 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
             if captured and not published:
                 try:
                     rename_noreplace(recovery, previous, fd, path.name)
-                    os.fsync(fd)
-                    os.fsync(recovery)
+                    fs.fsync(fd)
+                    fs.fsync(recovery)
                     if namespace == '.letracode-recovery':
                         # This process owns this attempted save and has just
                         # restored the captured inode. Future source reads must
@@ -379,7 +413,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
             # create-only attempts have no journal and can discard their staging.
             try:
                 if original is None:
-                    os.unlink(temporary, dir_fd=recovery)
+                    fs.unlink(temporary, dir_fd=recovery)
             except FileNotFoundError:
                 pass
 
@@ -412,19 +446,19 @@ class StrandFiles:
     def _operation(self):
         """Serialize cooperating writers across Store instances and processes."""
         with self._lock, safe_directory(self.root) as directory:
-            fd = os.open('.write-lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+            fd = fs.open('.write-lock', os.O_RDWR | os.O_CREAT | fs.O_NOFOLLOW | fs.O_NONBLOCK,
                          0o600, dir_fd=directory)
             try:
-                info = os.fstat(fd)
+                info = fs.fstat(fd)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise ValueError('Unsafe linked Strand write lock')
-                fcntl.flock(fd, fcntl.LOCK_EX)
+                fs.flock(fd, fs.LOCK_EX)
                 try:
                     yield
                 finally:
-                    fcntl.flock(fd, fcntl.LOCK_UN)
+                    fs.flock(fd, fs.LOCK_UN)
             finally:
-                os.close(fd)
+                fs.close(fd)
 
     def path(self, scope, project_id=None):
         if scope == 'project':
@@ -575,7 +609,7 @@ class StrandFiles:
 
     def _receipt_records(self):
         with safe_directory(self.root / '.receipts') as fd:
-            ids = [name[:-5] for name in os.listdir(fd) if re.fullmatch(r'[a-f0-9]{32}\.json', name)]
+            ids = [name[:-5] for name in fs.listdir(fd) if re.fullmatch(r'[a-f0-9]{32}\.json', name)]
         records = [self.receipt(ident) for ident in ids]
         sequences = {}
         for record in records:

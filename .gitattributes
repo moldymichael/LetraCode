@@ -1,0 +1,3 @@
+# Fedora scripts must stay executable even when archives are built on Windows.
+*.sh text eol=lf
+*.py text eol=lf

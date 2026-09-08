@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QDoubleSpin
     QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
 from .engine import EngineConfig
+from .platform import engine_setup_help, is_windows
 
 
 class ApprovalDialog(QDialog):
@@ -69,8 +70,8 @@ class ModelDialog(QDialog):
         intro.setWordWrap(True)
         layout.addWidget(intro)
         form = QFormLayout()
-        self.executable = QLineEdit(config.executable or shutil.which('llama-server') or '')
-        self.executable.setPlaceholderText('/usr/bin/llama-server')
+        self.executable = QLineEdit(config.executable or shutil.which('llama-server.exe' if is_windows() else 'llama-server') or '')
+        self.executable.setPlaceholderText(r'C:\llama.cpp\llama-server.exe' if is_windows() else '/usr/bin/llama-server')
         self.model = QLineEdit(config.model_path)
         self.model.setPlaceholderText('Choose a local .gguf instruction/chat model')
         for label, field, mode in [('Engine executable',self.executable,'engine'),('Model file',self.model,'model')]:
@@ -91,7 +92,7 @@ class ModelDialog(QDialog):
         for label, field in [('Context size (tokens)',self.context),('Maximum reply (tokens)',self.tokens),('GPU layers',self.layers),('CPU threads',self.threads),('Temperature',self.temperature)]:
             form.addRow(label,field)
         layout.addLayout(form)
-        note = QLabel('Getting started: install llama-cpp from Fedora, then select an instruction/chat GGUF. Model weights are separate downloads and can be several GB. Tool use and Thinking depend on the model and its chat template. If loading fails, check the engine log under Help.')
+        note = QLabel(engine_setup_help() + ' Then select an instruction/chat GGUF. Model weights are separate downloads and can be several GB. Tool use and Thinking depend on the model and its chat template. If loading fails, check the engine log under Help.')
         note.setWordWrap(True)
         layout.addWidget(note)
         docs = QPushButton('Open official model / engine guide')
@@ -103,15 +104,17 @@ class ModelDialog(QDialog):
         layout.addWidget(buttons)
 
     def browse(self, field, mode):
-        file, _ = QFileDialog.getOpenFileName(self, 'Choose local model' if mode=='model' else 'Choose llama-server', field.text() or str(Path.home()), 'GGUF models (*.gguf)' if mode=='model' else 'All files (*)')
+        file_filter = 'GGUF models (*.gguf)' if mode == 'model' else ('Windows executable (*.exe)' if is_windows() else 'All files (*)')
+        file, _ = QFileDialog.getOpenFileName(self, 'Choose local model' if mode=='model' else 'Choose llama-server', field.text() or str(Path.home()), file_filter)
         if file:
             field.setText(file)
 
     def validate(self):
         executable = Path(self.executable.text()).expanduser()
         model = Path(self.model.text()).expanduser()
-        if not executable.is_file() or not os.access(executable, os.X_OK):
-            QMessageBox.warning(self,'Engine not found','Select an executable llama-server. On Fedora, install it with: sudo dnf install llama-cpp')
+        access = os.R_OK if is_windows() else os.R_OK | os.X_OK
+        if not executable.is_file() or not os.access(executable, access) or (is_windows() and executable.suffix.lower() != '.exe'):
+            QMessageBox.warning(self,'Engine not found','Select an executable llama-server. ' + engine_setup_help())
             return
         if not model.is_file():
             QMessageBox.warning(self,'Model not found','Choose an existing local GGUF file.')
