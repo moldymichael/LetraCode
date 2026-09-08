@@ -113,7 +113,13 @@ def test_migration_preserves_identity_projects_receipts_recovery_and_drafts(tmp_
 def test_delete_file_retains_late_external_inode_and_undo_detects_changed_trash(tmp_path):
     m = Store(tmp_path / 'data').memory
     m.create_file('note.md', 'before')
+    before = m.file_snapshot('note.md')
     with open(m.root / 'note.md', 'r+b') as editor:
+        if fs.IS_WINDOWS:
+            with pytest.raises(PermissionError):
+                m.delete('note.md', before['sha256'])
+            assert (m.root / 'note.md').read_text() == 'before'
+            return
         removed = m.delete('note.md', m.file_snapshot('note.md')['sha256'])
         editor.seek(0); editor.write(b'changed'); editor.truncate(); editor.flush()
     with pytest.raises(ValueError, match='changed|conflict'):
@@ -264,7 +270,14 @@ def test_crash_recovery_retains_complete_move_delete_and_creation(tmp_path, monk
 def test_move_retains_old_recovery_inodes_and_reports_late_editor_write(tmp_path):
     m = Store(tmp_path / 'data').memory
     m.create_file('before.md', 'original')
+    before = m.file_snapshot('before.md')
     with open(m.root / 'before.md', 'r+b') as editor:
+        if fs.IS_WINDOWS:
+            with pytest.raises(PermissionError):
+                m.replace_file('before.md', 'saved', before['sha256'])
+            assert (m.root / 'before.md').read_text() == 'original'
+            assert not (m.root / 'after.md').exists()
+            return
         m.replace_file('before.md', 'saved', m.file_snapshot('before.md')['sha256'])
         m.move('before.md', 'after.md', m.file_snapshot('before.md')['sha256'])
         editor.seek(0); editor.write(b'late editor'); editor.truncate(); editor.flush()
@@ -328,14 +341,17 @@ def test_migration_resumes_after_root_rename_without_recreating_legacy_paths(tmp
 def test_ancestor_of_retained_recovery_cannot_hide_late_editor_conflicts(tmp_path, operation):
     m = Store(tmp_path / 'data').memory
     m.create_folder('A'); m.create_folder('B'); m.create_file('A/note.md', 'original')
-    with open(m.root / 'A/note.md', 'r+b') as editor:
-        m.replace_file('A/note.md', 'saved', m.file_snapshot('A/note.md')['sha256'])
-        m.move('A/note.md', 'B/note.md', m.file_snapshot('A/note.md')['sha256'])
-        with pytest.raises(ValueError, match='recovery|Recovery'):
-            if operation == 'move':
-                m.move('A', 'C', m.snapshot_entry('A')['sha256'])
-            else:
-                m.delete('A', m.snapshot_entry('A')['sha256'])
+    # The recovery location must remain stable even if the editor closes its
+    # handle temporarily before making a later correction to the retained file.
+    m.replace_file('A/note.md', 'saved', m.file_snapshot('A/note.md')['sha256'])
+    m.move('A/note.md', 'B/note.md', m.file_snapshot('A/note.md')['sha256'])
+    retained = next((m.root / 'A/.strand-recovery/note.md').glob('*.before'))
+    with pytest.raises(ValueError, match='recovery|Recovery'):
+        if operation == 'move':
+            m.move('A', 'C', m.snapshot_entry('A')['sha256'])
+        else:
+            m.delete('A', m.snapshot_entry('A')['sha256'])
+    with open(retained, 'r+b') as editor:
         editor.seek(0); editor.write(b'late correction'); editor.truncate(); editor.flush()
     with pytest.raises(ValueError, match='conflict|external edit'):
         m.file_snapshot('B/note.md')

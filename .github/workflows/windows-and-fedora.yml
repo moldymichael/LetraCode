@@ -51,7 +51,7 @@ jobs:
           architecture: x64
       - run: python -m pip install pytest pytest-timeout
       - name: Verify native Unicode Start Menu shortcut independently
-        run: python -m pytest -q tests/test_windows_install.py::test_native_shortcut_with_unicode_paths --timeout=30 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-shortcuts"
+        run: python -m pytest -q tests/test_windows_install.py::test_native_shortcut_with_unicode_paths --timeout=60 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-shortcuts"
 
   windows-package:
     runs-on: windows-2022

@@ -307,6 +307,13 @@ def test_coding_goal_crosses_three_boundaries_with_real_red_green_and_preserved_
 
     worker.approval_needed.connect(scripted_fixture_approval)
     worker.run()
+    for _, message in saved_tools(store.messages(chat)):
+        if message['name'] == 'run_command':
+            result = json.loads(message['content'])
+            details = {key: result.get(key) for key in
+                       ('exit_code', 'timed_out', 'cancelled', 'output_limit_reached', 'error')}
+            details['output_tail'] = result.get('output', '')[-300:]
+            print('COMMAND_DIAGNOSTICS:', json.dumps(details))
     rows = assert_finished(store, chat, engine, objective, final, 32)
     assert len(retained_check_ids) == 1
     assert approvals == ['command', 'write', 'command', 'write', 'command', 'command']

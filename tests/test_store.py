@@ -157,6 +157,16 @@ def test_partial_migration_failure_retains_prepared_files_and_reuses_them_on_ret
         assert db.execute('PRAGMA user_version').fetchone()[0] == 1
         assert db.execute('SELECT memory FROM projects WHERE id=?', (first,)).fetchone()[0] == 'Preserve the legacy memory'
     monkeypatch.setattr(store_module, 'safe_write', real_write)
+    if fs.IS_WINDOWS:
+        with prepared.open('r+b'):
+            with pytest.raises(PermissionError):
+                Store(directory)
+            assert prepared.read_text() == 'Preserve the legacy memory'
+        restored = Store(directory)
+        assert restored.project(first)['memory'] == 'Preserve the legacy memory'
+        assert restored.project('second')['memory'] == 'Second legacy note'
+        assert restored.strand.path('project', first).stat().st_ino == prepared_inode
+        return
     with prepared.open('r+b') as editor:
         restored = Store(directory)
         assert restored.project(first)['memory'] == 'Preserve the legacy memory'

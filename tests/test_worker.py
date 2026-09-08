@@ -1,6 +1,7 @@
 import copy
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -24,7 +25,7 @@ class ScriptedEngine:
             assert 'denied' in messages[-1]['content'].lower()
             on_delta('The action was denied. No file was changed.')
             return {'role':'assistant','content':'The action was denied. No file was changed.'}
-        return {'role':'assistant','content':'','tool_calls':[{'id':'call_1','type':'function','function':{'name':'write_file','arguments':'{"path":"/tmp/letracode-never-write-test","content":"bad","expected_sha256":null}'}}]}
+        return {'role':'assistant','content':'','tool_calls':[{'id':'call_1','type':'function','function':{'name':'write_file','arguments':json.dumps({'path':str(Path('/tmp/letracode-never-write-test').absolute()),'content':'bad','expected_sha256':None})}}]}
     def cancel(self):
         pass
 
@@ -352,7 +353,7 @@ def test_repeated_pause_compaction_keeps_earlier_saved_references(tmp_path):
         store.add_message(chat, 'assistant', '', payload={'message': {
             'role': 'assistant', 'content': '', 'tool_calls': [call]}})
         worker = ConversationWorker(store, chat, ScriptedEngine())
-        worker.save_tool_result(call, {}, json.dumps({'path': f'/synthetic/{cycle}', 'text': 'saved evidence',
+        worker.save_tool_result(call, {}, json.dumps({'path': str(Path('/synthetic').absolute() / str(cycle)), 'text': 'saved evidence',
             'offset':0, 'total_chars':14, 'editable':True, 'sha256':'a' * 64, 'source_truncated':False}))
         evidence_ids.append(store.messages(chat)[-1]['id'])
         store.add_message(chat, 'assistant', 'Previous working notes. ' * 300)
@@ -653,14 +654,13 @@ def test_worker_rereads_strand_files_and_reports_configured_model_filename(tmp_p
 @pytest.mark.parametrize('mutation', ['write_file', 'external_edit', 'failed_command'])
 def test_worker_refreshes_source_context_before_each_model_request(tmp_path, mutation):
     import hashlib
-    import shlex
-    import sys
+    from tools.run_acceptance import python_command
 
     folder = tmp_path / 'project'; folder.mkdir()
     source = folder / 'marker.py'
     before = 'SOURCE_VERSION = "BEFORE_CHANGE"\n'
     after = 'SOURCE_VERSION = "AFTER_CHANGE"\n'
-    source.write_text(before)
+    source.write_bytes(before.encode('utf-8'))
     store = Store(tmp_path / 'data')
     project = store.create_project('Fresh source')
     instructions = 'Inspect SOURCE_VERSION. Preserve this objective and its acceptance checks.'
@@ -691,7 +691,7 @@ def test_worker_refreshes_source_context_before_each_model_request(tmp_path, mut
                     name, args = 'read_file', {'path': str(source)}
                 else:
                     script = f'from pathlib import Path; Path({str(source)!r}).write_text({after!r}); raise SystemExit(7)'
-                    name, args = 'run_command', {'command': f'{shlex.quote(sys.executable)} -c {shlex.quote(script)}',
+                    name, args = 'run_command', {'command': python_command('-c', script),
                                                 'cwd': str(folder), 'timeout': 5}
                 return {'role': 'assistant', 'content': '', 'tool_calls': [{
                     'id': 'change', 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(args)}}]}

@@ -14,7 +14,7 @@ import re
 import stat
 import threading
 import uuid
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -138,25 +138,60 @@ def _write_new(fd, name, data, *, mode=None):
 
 
 @contextmanager
-def _recovery_directory(path, create=False, *, namespace='.strand-recovery'):
+def _recovery_location(path, create, namespace, parent):
+    recovery = path.parent / namespace / path.name
+    if fs.IS_WINDOWS and parent is not None:
+        # The caller's Windows handle pins every ancestor already. Reopening
+        # the entire chain for each recovery component adds no protection and
+        # makes receipt/history scans needlessly expensive. Keep that guard
+        # live while opening and checking just these two child directories.
+        with ExitStack() as stack:
+            directory = parent
+            try:
+                for name in (namespace, path.name):
+                    if create:
+                        try:
+                            fs.mkdir(name, 0o700, dir_fd=directory)
+                            fs.fsync(directory)
+                        except FileExistsError:
+                            pass
+                    child = fs.open(name, os.O_RDONLY | fs.O_DIRECTORY | fs.O_NOFOLLOW, dir_fd=directory)
+                    stack.callback(fs.close, child)
+                    directory = child
+            except FileNotFoundError:
+                if create:
+                    raise
+                yield None
+                return
+            yield directory
+        return
+    if not create:
+        with safe_directory(path.parent) as folder:
+            try:
+                fs.stat(namespace, dir_fd=folder, follow_symlinks=False)
+            except FileNotFoundError:
+                yield None
+                return
+        with safe_directory(recovery.parent) as folder:
+            try:
+                fs.stat(path.name, dir_fd=folder, follow_symlinks=False)
+            except FileNotFoundError:
+                yield None
+                return
+    with safe_directory(recovery, create=create) as directory:
+        yield directory
+
+
+@contextmanager
+def _recovery_directory(path, create=False, *, namespace='.strand-recovery', parent=None):
     # A separate directory per target isolates a damaged project's recovery data.
     if namespace not in ('.strand-recovery', '.letracode-recovery'):
         raise ValueError('Invalid recovery namespace')
     recovery = path.parent / namespace / path.name
-    if not create:
-        with safe_directory(path.parent) as parent:
-            try:
-                fs.stat(namespace, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                yield None
-                return
-        with safe_directory(recovery.parent) as parent:
-            try:
-                fs.stat(path.name, dir_fd=parent, follow_symlinks=False)
-            except FileNotFoundError:
-                yield None
-                return
-    with safe_directory(recovery, create=create) as fd:
+    with _recovery_location(path, create, namespace, parent) as fd:
+        if fd is None:
+            yield None
+            return
         flags = os.O_RDWR | fs.O_NOFOLLOW | fs.O_NONBLOCK
         if create or namespace == '.strand-recovery':
             flags |= os.O_CREAT
@@ -235,21 +270,21 @@ def _check_recovery(path, parent, recovery, max_bytes, *, namespace='.strand-rec
 
 
 def safe_read(path: Path, max_bytes=MAX_FILE_BYTES):
-    with safe_directory(path.parent) as fd, _recovery_directory(path) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, max_bytes)
         return _read_at(fd, path.name, max_bytes)
 
 
 def safe_snapshot(path: Path, max_bytes=MAX_FILE_BYTES, *, namespace='.strand-recovery'):
     """Read bytes and metadata from one descriptor after checking recovery."""
-    with safe_directory(path.parent) as fd, _recovery_directory(path, namespace=namespace) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, namespace=namespace, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
         return _read_at(fd, path.name, max_bytes, with_stat=True)
 
 
 def recover_file(path: Path):
     """Resolve interrupted saves before archiving ownership of a memory path."""
-    with safe_directory(path.parent) as fd, _recovery_directory(path) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, MAX_FILE_BYTES)
 
 
@@ -275,7 +310,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
             raise InterruptedError('Cancelled before saving.')
 
     check_cancel()
-    with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace) as recovery:
+    with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
         observed = _read_at(fd, path.name, max_bytes, with_stat=True)
         if fs.IS_WINDOWS and observed is not None and not observed[1].st_mode & 0o222:

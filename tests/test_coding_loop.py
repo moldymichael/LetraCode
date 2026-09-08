@@ -32,6 +32,20 @@ def call(name, arguments, ident='step'):
         'id': ident, 'type': 'function', 'function': {'name': name, 'arguments': json.dumps(arguments)}}]}
 
 
+def print_command_diagnostics(store, chat):
+    for row in store.messages(chat):
+        if row['role'] != 'tool':
+            continue
+        message = json.loads(row['payload'])['message']
+        if message['name'] != 'run_command':
+            continue
+        result = json.loads(message['content'])
+        details = {key: result.get(key) for key in
+                   ('exit_code', 'timed_out', 'cancelled', 'output_limit_reached', 'error')}
+        details['output_tail'] = result.get('output', '')[-300:]
+        print('COMMAND_DIAGNOSTICS:', json.dumps(details))
+
+
 class CodingEngine:
     config = type('Config', (), {'context_size': 32768, 'max_tokens': 1024})()
 
@@ -148,6 +162,7 @@ def test_coding_loop_repairs_after_two_real_test_failures_and_keeps_reviewable_d
 
     worker.approval_needed.connect(approve)
     worker.run()
+    print_command_diagnostics(store, chat)
     assert store.messages(chat)[-1]['content'] == 'Acceptance passed after two failed checks. The saved Git diff is ready for review.'
     assert observed_failures == ['NEGATIVE_BOUNDARY', 'UPPER_BOUNDARY']
     assert approvals == ['command', 'write', 'command', 'write', 'command', 'command']
@@ -294,6 +309,8 @@ def test_stop_during_command_saves_partial_outcome_and_continues_without_reexecu
     worker.approval_needed.connect(approve)
     begin = time.monotonic()
     worker.run()
+    print_command_diagnostics(store, chat)
+    print('COMMAND_ELAPSED_SECONDS:', time.monotonic() - begin)
     for watcher in watchers:
         watcher.join(6)
         assert not watcher.is_alive()

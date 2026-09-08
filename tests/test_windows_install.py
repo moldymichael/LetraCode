@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import base64
 import json
 import os
 from pathlib import Path
@@ -152,6 +153,18 @@ def test_uninstall_preserves_a_replaced_shortcut(installer, locations):
     assert shortcut.exists()
 
 
+def test_uninstall_preserves_a_shortcut_with_changed_arguments(installer, locations):
+    local, roaming = locations
+    app = installer.install(ROOT, local, roaming)
+    shortcut = installer.shortcut_path(roaming)
+    details = installer.shortcut_details(shortcut)
+    details["Arguments"] = "--data-dir another-folder"
+    shortcut.write_text(json.dumps(details), encoding="utf-8")
+    installer.uninstall(local, roaming)
+    assert not app.exists()
+    assert shortcut.exists()
+
+
 def test_uninstall_refuses_unmarked_directory(installer, locations):
     local, roaming = locations
     app = local / "letracode-app"
@@ -217,6 +230,15 @@ def test_shortcut_errors_include_the_windows_diagnostic(installer, monkeypatch):
         installer.powershell("unused")
 
 
+def test_unicode_shortcut_command_preserves_literal_path(installer, tmp_path):
+    app = tmp_path / "O'Brien 日本語 $(literal)/letracode-app"
+    arguments = installer.shortcut_arguments(app)
+    assert arguments.isascii()
+    command = base64.b64decode(arguments.split()[-1]).decode("utf-16-le")
+    escaped = str(app / ".venv/Scripts/pythonw.exe").replace("'", "''")
+    assert command == f"& '{escaped}' -I -m letracode"
+
+
 @pytest.mark.skipif(sys.platform != "win32", reason="Needs native Windows PowerShell and COM")
 def test_native_shortcut_with_unicode_paths(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("native_windows_install", ROOT / "packaging/windows_install.py")
@@ -229,12 +251,29 @@ def test_native_shortcut_with_unicode_paths(tmp_path, monkeypatch):
     target = app / ".venv/Scripts/letracode-gui.exe"
     target.parent.mkdir(parents=True)
     target.write_bytes(b"placeholder")
+    subprocess.run([sys.executable, "-m", "venv", "--without-pip", str(app / ".venv")], check=True)
+    package = app / ".venv/Lib/site-packages/letracode"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "__main__.py").write_text(
+        "import os\nfrom pathlib import Path\n"
+        "Path(os.environ['LETRACODE_SHORTCUT_SMOKE_MARKER']).write_text('launched 日本語', encoding='utf-8')\n",
+        encoding="utf-8",
+    )
     shortcut = module.shortcut_path(roaming)
     shortcut.parent.mkdir(parents=True)
     temporary = shortcut.with_name(".LetraCode.0123456789abcdef0123456789abcdef.lnk")
     module.write_shortcut(temporary, app)
     temporary.rename(shortcut)
     assert module.managed_shortcut(shortcut, app)
+    details = module.shortcut_details(shortcut)
+    marker = tmp_path / "shortcut-launch.txt"
+    env = dict(os.environ, LETRACODE_SHORTCUT_SMOKE_MARKER=str(marker))
+    subprocess.run([details["TargetPath"], *details["Arguments"].split()], env=env, check=True, timeout=20)
+    deadline = time.monotonic() + 5
+    while not marker.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    assert marker.read_text(encoding="utf-8") == "launched 日本語"
 
 
 @pytest.mark.parametrize("action", ["install", "uninstall"])

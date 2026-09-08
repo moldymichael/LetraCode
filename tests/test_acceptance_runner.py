@@ -293,6 +293,11 @@ def test_opted_in_legacy_fixture_continues_once_with_distinct_origin(tmp_path, m
                 data['checkpoint'].pop('continuation')
                 data['checkpoint']['reason'] = 'action_round_limit'
                 self.store.update_message(row['id'], 'Scripted legacy manual ten-round pause.', 'paused', payload=data)
+                if counter == 20:
+                    # End the idle second pause deterministically. This checks
+                    # the single fixture continuation, not filesystem speed;
+                    # the separate wall-budget test covers real elapsed time.
+                    budget.started -= budget.max_seconds
     monkeypatch.setattr(ui, 'ConversationWorker', ScriptedLegacyWorker)
     fixture = runner.prepare_fixture(tmp_path / 'trial', 'reading', repository(tmp_path))
     fixture['fixture_continuation'] = True
@@ -314,8 +319,9 @@ def test_opted_in_legacy_fixture_continues_once_with_distinct_origin(tmp_path, m
             'type':'function', 'function':{'name':'read_file','arguments':json.dumps({'path':str(paths[(counter - 1) % 10])})}}]}
     monkeypatch.setattr(LocalEngine, 'complete', scripted)
     root = Path(fixture['root'])
+    budget = runner.Budget(max_seconds=30, max_turns=3)
     runner.run_native(fixture, EngineConfig(executable='/scripted/runtime', model_path='/scripted/model.gguf'),
-                      runner.Budget(max_seconds=2, max_turns=3), runner.Recorder(root, evidence_kind='scripted-engine-test'))
+                      budget, runner.Recorder(root, evidence_kind='scripted-engine-test'))
     result = json.loads((root / 'result.json').read_text())
     assert result['pause_exercised'] is True
     assert result['fixture_continuation_exercised'] is True

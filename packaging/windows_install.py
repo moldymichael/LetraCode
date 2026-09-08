@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from contextlib import contextmanager
 import json
 import os
@@ -66,7 +67,7 @@ def powershell(script: str, **values: str) -> str:
 def shortcut_details(path: Path) -> dict:
     return json.loads(powershell(
         "$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($env:LETRACODE_SHORTCUT); "
-        "$shortcut | Select-Object Description, TargetPath | ConvertTo-Json -Compress",
+        "$shortcut | Select-Object Description, TargetPath, Arguments | ConvertTo-Json -Compress",
         LETRACODE_SHORTCUT=str(path),
     ))
 
@@ -76,24 +77,44 @@ def managed_shortcut(path: Path, app_dir: Path) -> bool:
         return False
     try:
         details = shortcut_details(path)
-        target = os.path.normcase(str(app_dir / ".venv/Scripts/letracode-gui.exe"))
-        return details.get("Description") == APP_ID and os.path.normcase(details.get("TargetPath", "")) == target
+        if details.get("Description") != APP_ID:
+            return False
+        target = os.path.normcase(details.get("TargetPath", ""))
+        arguments = details.get("Arguments", "")
+        legacy = os.path.normcase(str(app_dir / ".venv/Scripts/letracode-gui.exe"))
+        if target == legacy and not arguments:
+            return True
+        return (target == os.path.normcase(shutil.which("powershell.exe") or "") and
+                arguments == shortcut_arguments(app_dir))
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError):
         return False
 
 
 def write_shortcut(path: Path, app_dir: Path) -> None:
-    # Environment values avoid interpolating user paths into PowerShell source.
+    # WScript's TargetPath setter rejects some non-ANSI user paths. Keep its
+    # target and arguments ASCII; PowerShell decodes the Unicode launcher path.
+    # The private Python is isolated, so no working-directory import is needed.
     powershell(
         "$shortcut = (New-Object -ComObject WScript.Shell).CreateShortcut($env:LETRACODE_SHORTCUT); "
         "$shortcut.TargetPath = $env:LETRACODE_TARGET; "
-        "$shortcut.WorkingDirectory = $env:LETRACODE_APP_DIR; "
+        "$shortcut.Arguments = $env:LETRACODE_ARGUMENTS; "
+        "$shortcut.WorkingDirectory = $env:SystemRoot; "
         "$shortcut.Description = $env:LETRACODE_APP_ID; "
+        "$shortcut.WindowStyle = 7; "
         "$shortcut.Save()",
         LETRACODE_SHORTCUT=str(path),
-        LETRACODE_TARGET=str(app_dir / ".venv/Scripts/letracode-gui.exe"),
-        LETRACODE_APP_DIR=str(app_dir), LETRACODE_APP_ID=APP_ID,
+        LETRACODE_TARGET=shutil.which("powershell.exe") or "powershell.exe",
+        LETRACODE_ARGUMENTS=shortcut_arguments(app_dir), LETRACODE_APP_ID=APP_ID,
     )
+
+
+def shortcut_arguments(app_dir: Path) -> str:
+    # Escape a literal single-quoted PowerShell string before UTF-16 encoding;
+    # even names containing apostrophes or '$()' remain ordinary path text.
+    pythonw = str(app_dir / ".venv/Scripts/pythonw.exe").replace("'", "''")
+    command = f"& '{pythonw}' -I -m letracode"
+    encoded = base64.b64encode(command.encode("utf-16-le")).decode("ascii")
+    return "-NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + encoded
 
 
 def create_runtime(app_dir: Path) -> None:

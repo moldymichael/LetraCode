@@ -4,10 +4,14 @@ import hashlib
 import importlib
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
 from letracode.tools import ToolExecutor
+
+
+SYNTHETIC_ROOT = Path("/synthetic").absolute().as_posix()
 
 
 def api():
@@ -15,7 +19,7 @@ def api():
 
 
 def source(offset=0, text='abcd', total=12, sha='a' * 64, **extra):
-    return {'path': '/synthetic/chapter.txt', 'offset': offset, 'text': text,
+    return {'path': f'{SYNTHETIC_ROOT}/chapter.txt', 'offset': offset, 'text': text,
             'total_chars': total, 'next_offset': offset + len(text) if offset + len(text) < total else None,
             'sha256': sha, 'editable': True, 'source_truncated': False, **extra}
 
@@ -195,10 +199,10 @@ def test_legacy_untracked_reads_and_other_scope_never_claim_complete():
 
 
 @pytest.mark.parametrize('legacy,failed_path,late_failure,want_incomplete', [
-    (False, '/synthetic/./chapter.txt', False, False),
-    (True, '/synthetic/chapter.txt', False, True),
-    (False, '/synthetic/other.txt', False, True),
-    (False, '/synthetic/chapter.txt', True, True),
+    (False, f'{SYNTHETIC_ROOT}/./chapter.txt', False, False),
+    (True, f'{SYNTHETIC_ROOT}/chapter.txt', False, True),
+    (False, f'{SYNTHETIC_ROOT}/other.txt', False, True),
+    (False, f'{SYNTHETIC_ROOT}/chapter.txt', True, True),
 ])
 def test_only_resolved_modern_read_attempts_stop_blocking_coverage(legacy, failed_path, late_failure, want_incomplete):
     failed = tool_row(2, {'error': 'File was unavailable'}, tracked=not legacy)
@@ -222,12 +226,12 @@ def test_recovery_matches_saved_requested_path_when_source_resolves_to_an_alias(
     read = tool_row(3, source(0, 'x' * 12))
     for item in (failed, read):
         data = json.loads(item['payload'])
-        data['arguments'] = {'path': '/synthetic/linked-chapter.txt'}
+        data['arguments'] = {'path': f'{SYNTHETIC_ROOT}/linked-chapter.txt'}
         item['payload'] = json.dumps(data)
     rows = [row(1, 'user'), failed, read]
     rows.append(expose(4, rows))
     state = api().evidence_state(rows, 1)
-    assert state['files'][0]['path'] == '/synthetic/chapter.txt'
+    assert state['files'][0]['path'] == f'{SYNTHETIC_ROOT}/chapter.txt'
     assert state['incomplete'] is False
 
 
@@ -247,7 +251,7 @@ def test_invalid_source_metadata_fails_closed(change):
 
 
 def test_file_and_range_limits_are_bounded():
-    hits = [source(path=f'/synthetic/{i}.txt') for i in range(129)]
+    hits = [source(path=f'{SYNTHETIC_ROOT}/{i}.txt') for i in range(129)]
     with pytest.raises(ValueError, match='128|limit'):
         api().source_evidence('search_project', {'results': hits})
     with pytest.raises(ValueError, match='4096|range|limit'):
@@ -258,7 +262,7 @@ def test_file_and_range_limits_are_bounded():
 def test_summary_is_bounded_and_never_claims_whole_work_or_understanding():
     rows = [row(1, 'user')]
     for ident in range(2, 15):
-        rows.append(tool_row(ident, source(path=f'/synthetic/chapter-{ident}.txt')))
+        rows.append(tool_row(ident, source(path=f'{SYNTHETIC_ROOT}/chapter-{ident}.txt')))
     text = api().summary(api().evidence_state(rows, 1), max_files=8)
     assert len(text) <= 2500
     assert 'ordinary' in text.lower() and 'whole' in text.lower()
@@ -269,9 +273,9 @@ def test_summary_is_bounded_and_never_claims_whole_work_or_understanding():
 def test_successful_edit_invalidates_observed_version_before_any_followup_read():
     rows = [row(1, 'user'), tool_row(2, source(0, 'x' * 12))]
     rows.append(expose(3, rows))
-    changed = tool_row(4, {'path': '/synthetic/chapter.txt', 'sha256': 'b' * 64,
-                           'written_characters': 8, 'backup': '/synthetic/backup'}, 'edit_file')
-    data = json.loads(changed['payload']); data['arguments'] = {'path': '/synthetic/chapter.txt'}
+    changed = tool_row(4, {'path': f'{SYNTHETIC_ROOT}/chapter.txt', 'sha256': 'b' * 64,
+                           'written_characters': 8, 'backup': f'{SYNTHETIC_ROOT}/backup'}, 'edit_file')
+    data = json.loads(changed['payload']); data['arguments'] = {'path': f'{SYNTHETIC_ROOT}/chapter.txt'}
     changed['payload'] = json.dumps(data); rows.append(changed)
     state = api().evidence_state(rows, 1)
     file = state['files'][0]
@@ -287,9 +291,9 @@ def test_successful_edit_invalidates_observed_version_before_any_followup_read()
 def test_unchanged_write_keeps_same_version_and_commands_are_not_read_evidence():
     rows = [row(1, 'user'), tool_row(2, source(0, 'x' * 12))]
     rows.append(expose(3, rows))
-    unchanged = tool_row(4, {'path': '/synthetic/chapter.txt', 'sha256': 'a' * 64,
+    unchanged = tool_row(4, {'path': f'{SYNTHETIC_ROOT}/chapter.txt', 'sha256': 'a' * 64,
                              'unchanged': True}, 'write_file')
-    data = json.loads(unchanged['payload']); data['arguments'] = {'path': '/synthetic/chapter.txt'}
+    data = json.loads(unchanged['payload']); data['arguments'] = {'path': f'{SYNTHETIC_ROOT}/chapter.txt'}
     unchanged['payload'] = json.dumps(data); rows.append(unchanged)
     rows.append(tool_row(5, {'executed': True, 'exit_code': 0, 'output': 'All files fully read.'}, 'run_command'))
     state = api().evidence_state(rows, 1)
@@ -339,7 +343,7 @@ def test_same_version_cannot_change_its_total_characters():
 def test_unchanged_write_without_prior_read_keeps_unknown_length_until_read():
     rows = [row(1, 'user')]
     for ident in (2, 3):
-        rows.append(tool_row(ident, {'path': '/synthetic/chapter.txt', 'sha256': 'a' * 64,
+        rows.append(tool_row(ident, {'path': f'{SYNTHETIC_ROOT}/chapter.txt', 'sha256': 'a' * 64,
                                     'unchanged': True}, 'write_file'))
     assert api().evidence_state(rows, 1)['files'][0]['length_known'] is False
     rows.append(tool_row(4, source(0, 'x' * 12)))
