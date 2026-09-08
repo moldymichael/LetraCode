@@ -25,10 +25,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
           architecture: x64
-      - run: python -m pip install . pytest pytest-timeout
+      - run: python -m pip install . pytest pytest-timeout pytest-instafail
       - name: Verify native guarded file publication before the full suite
         run: python -m pytest tests/test_filesystem.py::test_guarded_move_publishes_complete_unicode_name -q -x --timeout=30 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-preflight"
-      - run: python -m pytest -q --timeout=60 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-tests" --junitxml=windows-tests.xml
+      # Temporary diagnostic cap; remove --maxfail after the native fix wave.
+      - run: python -m pytest -q --instafail --maxfail=25 --timeout=300 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-tests" --junitxml=windows-tests.xml
       - run: python -m compileall -q letracode packaging
       - run: python packaging/build-release.py
       - uses: actions/upload-artifact@v4
@@ -36,6 +37,21 @@ jobs:
         with:
           name: windows-tests-${{ matrix.python-version }}
           path: windows-tests.xml
+
+  windows-shortcuts:
+    runs-on: windows-2022
+    timeout-minutes: 5
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - run: python -m pip install pytest pytest-timeout
+      - name: Verify native Unicode Start Menu shortcut independently
+        run: python -m pytest -q tests/test_windows_install.py::test_native_shortcut_with_unicode_paths --timeout=30 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-shortcuts"
 
   windows-package:
     runs-on: windows-2022

@@ -218,15 +218,18 @@ def test_shortcut_errors_include_the_windows_diagnostic(installer, monkeypatch):
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Needs native Windows PowerShell and COM")
-def test_native_shortcut_with_unicode_paths(tmp_path):
+def test_native_shortcut_with_unicode_paths(tmp_path, monkeypatch):
     spec = importlib.util.spec_from_file_location("native_windows_install", ROOT / "packaging/windows_install.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     app = tmp_path / "Local App Data é 日本語/letracode-app"
+    roaming = tmp_path / "Roaming App Data é 日本語"
+    monkeypatch.setenv("LOCALAPPDATA", str(app.parent))
+    monkeypatch.setenv("APPDATA", str(roaming))
     target = app / ".venv/Scripts/letracode-gui.exe"
     target.parent.mkdir(parents=True)
     target.write_bytes(b"placeholder")
-    shortcut = module.shortcut_path(tmp_path / "Roaming App Data é 日本語")
+    shortcut = module.shortcut_path(roaming)
     shortcut.parent.mkdir(parents=True)
     temporary = shortcut.with_name(".LetraCode.0123456789abcdef0123456789abcdef.lnk")
     module.write_shortcut(temporary, app)

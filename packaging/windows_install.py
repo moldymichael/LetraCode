@@ -225,6 +225,9 @@ def main() -> int:
     try:
         if sys.platform != "win32" or sys.version_info < (3, 11):
             raise RuntimeError("Use native Windows Python 3.11 or newer. On Fedora, run ./install.sh.")
+        windows = sys.getwindowsversion()
+        if arguments.action == "install" and (windows.major < 10 or windows.build < 17763):
+            raise RuntimeError("LetraCode requires Windows 10 version 1809 or newer, or Windows 11.")
         local = environment_directory("LOCALAPPDATA")
         roaming = environment_directory("APPDATA")
         if arguments.action == "install":
