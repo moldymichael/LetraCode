@@ -1,5 +1,47 @@
 # Reliability verification — September 6, 2026
 
+## September 7 final whole-change review fix wave
+
+Review of `12dec7a8f3a30e13452b69778675779ca2c81c97` identified two remaining
+boundaries: output-cap termination allowed later effects, and changing requested
+page sizes made identical returned evidence appear novel. Six focused regression
+cases failed before production edits (**6 failed, 11 deselected in 0.26 s**) and
+passed after repair (**6 passed, 11 deselected in 0.20 s**). These also cover the
+scoped diagnostic fix for an unknown argument on an otherwise duplicate command.
+
+A real command emits 100000 characters, reaches the 64000-character cap and is
+terminated. Its two following writes now receive paired `executed: false`,
+`code: action_blocker` receipts, without approval, effects or a next inference
+request. Worker halting, continuation replay protection and transcript/export
+status use one forced-interruption predicate, including output caps. A later
+source change does not unlock an interrupted command's unknown effects.
+
+Actual returned offsets, content and source versions identify nonempty pages;
+request-only selectors, including omitted versus explicit paging defaults, do
+not. A real saved-memory fixture now stops after one novel page and three stalls,
+not the fifth-request cap. Pure saved-result/memory cases preserve new page,
+content and source-version progress; existing empty-page guards remain unchanged.
+Ordinary schema-key validation is shared by execution and command-identity
+normalization, so unknown keys are rejected before duplicate diagnostics without
+granting approval or repeating effects.
+
+Fresh verification (Python 3.14.7 / pytest 8.4.2 / PySide6 6.11.2):
+
+- Affected worker/continuation/evidence/tool/store/UI group: **242 passed in 14.42 s**.
+- Isolated complete offscreen suite: **494 passed, 10 warnings in 28.26 s**.
+- **49 Python files compiled** without bytecode; shell syntax, version smoke
+  (`LetraCode 0.1.1`) and `git diff --check` passed.
+
+The full invocation uses separate runtime/cache/config/data/scratch directories
+under `/tmp/letracode-continuation-finalfix-HvFrne`; output is in `full.log`.
+The ten warnings remain Python 3.14 process-fork warnings (four source-file,
+one store and five Strand). No existing test was weakened. Release archives and
+document/install checks use fresh temporary output; exact commands, artifact
+hashes and local fix commit are recorded in the completion report. No live data,
+installed app or actual model was used. Scripted inference demonstrates runtime
+safety, not model quality or understanding. Manual KDE and prior model-quality
+limitations remain unchanged.
+
 ## September 7 independent-review fix round 1
 
 Review of `1296e258cde67ffa698f48c36b12e69c015ed5ee` found five additional

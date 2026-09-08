@@ -12,6 +12,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from .continuation import interrupted_outcome
 from .strand import BACKUP_CHUNK_BYTES, StrandFiles, backup_tree, digest, safe_directory, safe_read, safe_write
 
 
@@ -55,7 +56,7 @@ def message_status(message):
             return 'Denied'
         if result.get('executed') is False:
             return 'Not executed'
-        if result.get('timed_out') or result.get('cancelled'):
+        if interrupted_outcome(result):
             return 'Interrupted · effects require review'
         if reply.get('name') == 'run_command' and 'error' not in result and type(result.get('exit_code')) is not int:
             return 'Outcome unknown'

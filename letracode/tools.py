@@ -83,17 +83,20 @@ class ToolExecutor:
         if not readable_without_approval(path, self.roots):
             self._ask(ApprovalRequest('Read outside linked project files?', f'Path: {path}\nResolved path: {path.resolve()}\n\nContents will be available to the local model.', 'read', 'This file or folder is outside the normal project scope, or has a sensitive/hidden path.'))
 
+    def _validate_arguments(self, name, args):
+        if not isinstance(args, dict):
+            raise ValueError('Tool arguments must be an object.')
+        known = next((s['function'] for s in TOOL_SCHEMAS if s['function']['name'] == name), None)
+        if not known:
+            raise ValueError('Unknown tool.')
+        if not set(args) <= set(known['parameters']['properties']):
+            raise ValueError('Unknown argument.')
+
     def execute(self, name, args):
         try:
             if self.cancel.is_set():
                 raise Denied('Cancelled')
-            if not isinstance(args, dict):
-                raise ValueError('Tool arguments must be an object.')
-            known = next((s['function'] for s in TOOL_SCHEMAS if s['function']['name'] == name), None)
-            if not known:
-                raise ValueError('Unknown tool.')
-            if not set(args) <= set(known['parameters']['properties']):
-                raise ValueError('Unknown argument.')
+            self._validate_arguments(name, args)
             if name in ('web_search','fetch_url'):
                 if not self.web_enabled:
                     raise Denied('Internet access is turned off.')
@@ -350,6 +353,7 @@ class ToolExecutor:
         """Normalize the actual command identity before checking saved effects."""
         if name != 'run_command':
             return args
+        self._validate_arguments(name, args)
         command, cwd, timeout, _ = self._command_parameters(args)
         return {'command': command, 'cwd': str(cwd), 'timeout': timeout}
 

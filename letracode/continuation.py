@@ -72,6 +72,10 @@ def _effect_identity(name, args):
 def _fingerprint(name, args, result, empty_page):
     omitted = _VOLATILE
     argument_omitted = {'tool_call_id', 'call_id'}
+    if name in ('read_file', 'read_memory', 'read_tool_result'):
+        # Page selectors are requests, not evidence. Returned offsets, content
+        # and source versions identify the page, including effective defaults.
+        argument_omitted |= _PAGE_ARGUMENTS
     if name in ('read_tool_result', 'list_tool_results'):
         omitted |= _SAVED_CURSORS
         argument_omitted |= {'result_id'} | _SAVED_CURSORS
@@ -110,14 +114,19 @@ def _result(value):
     return value
 
 
+def interrupted_outcome(result):
+    """Forced termination leaves effects requiring review, regardless of exit code."""
+    return isinstance(result, dict) and any(result.get(flag) for flag in (
+        'timed_out', 'cancelled', 'output_limit_reached'))
+
+
 def _successful(name, result):
     if isinstance(result, dict):
-        if 'error' in result or 'denied' in result or result.get('timed_out') or result.get('cancelled'):
+        if 'error' in result or 'denied' in result or interrupted_outcome(result):
             return False
     if name == 'run_command':
         return (isinstance(result, dict) and result.get('executed') is True
-                and type(result.get('exit_code')) is int and result['exit_code'] == 0
-                and not result.get('output_limit_reached'))
+                and type(result.get('exit_code')) is int and result['exit_code'] == 0)
     if name == 'remember':
         return isinstance(result, dict) and result.get('status') == 'saved'
     if name in ('write_file', 'edit_file'):
@@ -261,7 +270,7 @@ class RunProgress:
         completed = (name in _WRITE_TOOLS and successful or name == 'run_command'
                      and isinstance(result, dict) and result.get('executed') is True)
         if completed:
-            interrupted = name == 'run_command' and (result.get('timed_out') or result.get('cancelled')
+            interrupted = name == 'run_command' and (interrupted_outcome(result)
                                                      or type(result.get('exit_code')) is not int)
             # Later source changes cannot resolve unknown interrupted effects.
             self._effects[(name, _effect_identity(name, args))] = (None if interrupted else self._generation, result_id)

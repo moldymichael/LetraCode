@@ -23,13 +23,16 @@ explicit new user input is required after a stop.
 
 The September 7 completion builds on `017fccde46096cef7b00d3de38e1a7bc0b3054ed`
 in `/home/miceoil/Projects/worktrees/active/LetraCode-reliability`, preserving the
-interrupted implementation. After the first independent-review fix round, fresh
-full offscreen verification is **488 passed, 10 existing Python 3.14 process-fork
-warnings, 27.74 seconds**, no failures or
+interrupted implementation. After the final whole-change review fix wave, fresh
+full offscreen verification is **494 passed, 10 existing Python 3.14 process-fork
+warnings, 28.26 seconds**, no failures or
 skips. Source retrieval and exposure in completed requests are tracked
 separately by source version. Partial responses remain provisional and receive
 bounded corrective opportunity. Transcript and Markdown export distinguish
 successful execution, incomplete coverage and unverified task outcomes.
+Output-cap termination halts dispatch like timeout/cancellation and is labeled
+as interrupted with effects requiring review. Identical returned source pages
+cannot reset the stall limit by changing requested page sizes or defaults.
 The 27-page synthetic whole-work reading trial spans three segments; the real
 file/process coding fixture spans four, preserving staged and untracked work.
 These scripted engines establish application behavior, not model quality or

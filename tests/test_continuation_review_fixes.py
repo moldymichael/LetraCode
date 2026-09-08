@@ -1,14 +1,15 @@
 """Review regressions exercise real persistence/tools with scripted inference."""
 import json
 import shlex
+import sys
 
 import pytest
 
 from letracode.budgeting import RequestUsage
-from letracode.continuation import RunProgress
+from letracode.continuation import RunHalted, RunLimits, RunProgress
 from letracode.engine import Cancelled
 from letracode.evidence import evidence_state
-from letracode.store import Store
+from letracode.store import Store, message_status
 from letracode.worker import ConversationWorker
 
 
@@ -214,3 +215,112 @@ def test_pure_command_identity_uses_execution_fields_and_default_timeout():
     assert progress.duplicate_effect('run_command', {'command': 'printf y', 'cwd': '/work'}) is None
     assert progress.duplicate_effect('run_command', {'command': 'printf x', 'cwd': '/other'}) is None
     assert progress.duplicate_effect('run_command', {'command': 'printf x', 'cwd': '/work', 'timeout': 5}) is None
+
+
+def test_real_output_cap_halts_batch_before_later_approval_effects_or_request(tmp_path):
+    source, store, chat, _ = fixture(tmp_path)
+    script = 'import sys,time; sys.stdout.write("x" * 100000); sys.stdout.flush(); time.sleep(5)'
+    command = shlex.quote(sys.executable) + ' -u -c ' + shlex.quote(script)
+    batch = [call('run_command', {'command': command, 'cwd': str(source)}, 'capped')]
+    batch += [call('write_file', {'path': str(source / f'never-{index}.txt'),
+                                 'content': 'obsolete', 'expected_sha256': None}, index)
+              for index in range(2)]
+    engine = Engine(lambda *_: {'role': 'assistant', 'content': '', 'tool_calls': batch})
+    worker = ConversationWorker(store, chat, engine)
+    approvals = []
+    worker.approval_needed.connect(lambda pending: (approvals.append(pending), pending.decide(True)))
+    worker.run()
+    results = outcomes(store, chat)
+    assert results[0]['executed'] is True and results[0]['output_limit_reached'] is True
+    assert len(results[0]['output']) == 64000 and results[0]['exit_code'] < 0
+    assert not list(source.glob('never-*.txt')), 'Output-cap termination allowed later effects'
+    assert len(approvals) == 1 and len(engine.requests) == 1
+    assert len(results) == 3
+    assert all(result['executed'] is False and result['code'] == 'action_blocker' for result in results[1:])
+    rows = [row for row in store.messages(chat) if row['role'] == 'tool']
+    assert [json.loads(row['payload'])['message']['tool_call_id'] for row in rows] == ['capped', '0', '1']
+    assert message_status(rows[0]) == 'Interrupted · effects require review'
+    assert 'Interrupted · effects require review' in store.export_markdown(chat)
+    assert json.loads(store.messages(chat)[-1]['payload'])['checkpoint']['reason'] == 'action_blocker'
+
+
+def test_output_cap_is_interrupted_even_after_later_source_change():
+    progress = RunProgress()
+    args = {'command': 'noisy command', 'cwd': '/work'}
+    result = {'executed': True, 'exit_code': -15, 'output_limit_reached': True}
+    assert not progress.observe('run_command', args, result, 7)
+    progress.observe('write_file', {'path': 'changed'}, {'path': 'changed', 'written_characters': 1}, 8)
+    assert progress.duplicate_effect('run_command', args) == 7
+    row = {'role': 'tool', 'status': 'complete', 'payload': json.dumps({
+        'message': {'name': 'run_command', 'content': json.dumps(result)}})}
+    assert message_status(row) == 'Interrupted · effects require review'
+
+
+def test_real_saved_memory_identical_pages_with_different_sizes_hit_stall_limit(tmp_path):
+    _, store, chat, _ = fixture(tmp_path)
+    snapshot = store.strand.snapshot('global')
+    store.strand.remember('global', 'A saved memory page.', expected_sha256=snapshot['sha256'])
+    saved = store.strand.read_page('global')
+    size = len(saved['text'])
+    assert 0 < size < 1000
+
+    def reply(number, _):
+        args = {'scope': 'global', 'max_chars': size + number * 100}
+        if number % 2 == 0:
+            args['offset'] = 0
+        return {'role': 'assistant', 'content': '', 'tool_calls': [call('read_memory', args, number)]}
+
+    engine = Engine(reply)
+    worker = ConversationWorker(store, chat, engine, limits=RunLimits(max_requests=5))
+    worker.run()
+    assert len(engine.requests) == 4, 'Identical memory pages evaded the three-stall limit'
+    results = outcomes(store, chat)
+    assert len(results) == 4 and all(result['text'] == saved['text'] for result in results)
+    assert worker.progress.stalls == 3
+    assert json.loads(store.messages(chat)[-1]['payload'])['checkpoint']['reason'] == 'no_progress'
+
+
+@pytest.mark.parametrize('name,field', [('read_memory', 'text'), ('read_tool_result', 'content')])
+def test_page_novelty_uses_returned_offset_content_and_source_version_not_requested_size(name, field):
+    progress = RunProgress()
+    args = {'scope': 'global'} if name == 'read_memory' else {'result_id': 5}
+    page = {'offset': 0, 'next_offset': 5, 'total_chars': 10,
+            field: json.dumps({'source_sha256': 'v1', 'text': 'first'})}
+    assert progress.observe(name, args, page, 1)
+    assert not progress.observe(name, dict(args, offset=0, max_chars=4000), page, 2)
+    # Actual returned offsets, content and embedded source versions remain new evidence.
+    page = dict(page, offset=5, next_offset=None)
+    assert progress.observe(name, dict(args, offset=5, max_chars=8000), page, 3)
+    page[field] = json.dumps({'source_sha256': 'v1', 'text': 'second'})
+    assert progress.observe(name, args, page, 4)
+    page[field] = json.dumps({'source_sha256': 'v2', 'text': 'second'})
+    assert progress.observe(name, args, page, 5)
+    for index in range(2):
+        assert not progress.observe(name, dict(args, max_chars=9000 + index), page, 6 + index)
+    with pytest.raises(RunHalted, match='3 consecutive') as stopped:
+        progress.observe(name, dict(args, max_chars=10000), page, 8)
+    assert stopped.value.reason == 'no_progress'
+
+
+def test_unknown_command_argument_is_validated_before_duplicate_diagnostic(tmp_path):
+    source, store, chat, _ = fixture(tmp_path)
+    marker = source / 'executions.txt'
+    command = 'printf x >> ' + shlex.quote(str(marker))
+
+    def reply(number, _):
+        if number == 3:
+            return {'role': 'assistant', 'content': 'Use the saved result.'}
+        args = {'command': command, 'cwd': str(source)}
+        if number == 2:
+            args['unknown'] = 'not an execution argument'
+        return {'role': 'assistant', 'content': '', 'tool_calls': [call('run_command', args, number)]}
+
+    engine = Engine(reply)
+    worker = ConversationWorker(store, chat, engine)
+    approvals = []
+    worker.approval_needed.connect(lambda pending: (approvals.append(pending), pending.decide(True)))
+    worker.run()
+    assert marker.read_text() == 'x' and len(approvals) == 1
+    repeated = outcomes(store, chat)[1]
+    assert repeated['executed'] is False and repeated['error'] == 'Unknown argument.'
+    assert repeated.get('code') != 'duplicate_action'

@@ -14,7 +14,7 @@ from .context import build_context
 from .budgeting import fallback_usage
 from .engine import Cancelled, ContextOverflowError
 from .pause_context import payload as row_payload, resolve_intent
-from .continuation import RunHalted, RunLimits, RunProgress
+from .continuation import RunHalted, RunLimits, RunProgress, interrupted_outcome
 from .evidence import evidence_state, request_exposure, source_evidence, summary as evidence_summary
 from .tools import ApprovalRequest, SAVED_READ_TOOLS, TOOL_SCHEMAS, ToolExecutor
 
@@ -635,7 +635,7 @@ class ConversationWorker(QThread):
                             continue
                         if 'denied' in outcome:
                             halted = RunHalted('approval_denied', 'Approval was denied or the tool is disabled. No further action will run; do not bypass this decision.')
-                        elif (outcome.get('timed_out') or outcome.get('cancelled') or
+                        elif (interrupted_outcome(outcome) or
                               name in ('write_file', 'edit_file', 'run_command', 'remember') and
                               'error' in outcome and outcome.get('executed') is not False):
                             halted = RunHalted('action_blocker', 'An action failed or was interrupted with effects that need review. Its saved result is evidence, not permission to retry.')
