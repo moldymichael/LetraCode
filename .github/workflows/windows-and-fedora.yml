@@ -1,0 +1,97 @@
+name: Windows and Fedora
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13', '3.14']
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          architecture: x64
+      - run: python -m pip install . pytest
+      - run: python -m pytest -q --junitxml=windows-tests.xml
+      - run: python -m compileall -q letracode packaging
+      - run: python packaging/build-release.py
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: windows-tests-${{ matrix.python-version }}
+          path: windows-tests.xml
+
+  windows-package:
+    runs-on: windows-2022
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          architecture: x64
+      - run: python -m pip install -r packaging/windows-requirements.txt .
+      - name: Build self-contained Windows downloads
+        run: python packaging/build-windows.py
+      - name: Install, open, update, uninstall, retain data and open portable app
+        shell: pwsh
+        run: |
+          $version = python -c "from letracode import __version__; print(__version__)"
+          python packaging/smoke-windows.py --installer "dist/LetraCode-$version-windows-x64-setup.exe" --portable "dist/LetraCode-$version-windows-x64-portable.zip" --work-dir "$env:RUNNER_TEMP/LetraCode Package Smoke"
+      - name: Upload Windows downloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: LetraCode-windows-x64
+          path: dist/LetraCode-*-windows-*
+          if-no-files-found: error
+          compression-level: 0
+      - name: Upload native desktop screenshots and lifecycle evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-package-verification
+          path: |
+            ${{ runner.temp }}/LetraCode Package Smoke/*.log
+            ${{ runner.temp }}/LetraCode Package Smoke/*.json
+            ${{ runner.temp }}/LetraCode Package Smoke/*.png
+            build/windows/cache/LetraCode/warn-LetraCode.txt
+
+  fedora:
+    runs-on: ubuntu-latest
+    container: fedora:44
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - run: dnf install -y git python3 python3-pyside6 python3-pypdf python3-pytest rpm-build redhat-rpm-config
+      - uses: actions/checkout@v4
+      - run: python3 -m pytest -q --junitxml=fedora-tests.xml
+      - run: python3 -m compileall -q letracode packaging
+      - run: bash -n install.sh uninstall.sh packaging/build-rpm.sh
+      - run: packaging/build-rpm.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LetraCode-fedora-and-source
+          path: dist/*
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: fedora-tests
+          path: fedora-tests.xml

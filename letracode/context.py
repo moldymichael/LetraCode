@@ -9,6 +9,7 @@ from bisect import bisect_right
 from pathlib import Path
 
 from .documents import read_docx
+from .platform import pdf_install_help
 from .source_files import snapshot as source_snapshot
 from .source_files import RECOVERY_NAMESPACE
 from .strand import digest, safe_snapshot
@@ -17,11 +18,36 @@ MAX_FILE = 2 * 1024 * 1024
 MAX_DOCUMENT = 20 * 1024 * 1024
 SKIP_DIRS = {'node_modules', 'venv', '__pycache__', 'target', 'dist', 'build'}
 SECRET_NAMES = {'id_rsa','id_ed25519','credentials','credentials.json','secrets.json','secrets.yaml','secrets.yml'}
-TEXT_SUFFIXES = {'.md','.txt','.rst','.py','.js','.ts','.tsx','.jsx','.json','.toml','.yaml','.yml','.ini','.cfg','.css','.html','.htm','.xml','.csv','.tsv','.sh','.bash','.sql','.c','.h','.cpp','.hpp','.rs','.go','.java','.kt','.qml','.log','.srt','.vtt','.tex','.r','.rb','.pl','.php','.vue','.svelte','.desktop'}
+TEXT_SUFFIXES = {'.md','.txt','.rst','.py','.js','.ts','.tsx','.jsx','.json','.toml','.yaml','.yml','.ini','.cfg','.css','.html','.htm','.xml','.csv','.tsv','.sh','.bash','.ps1','.psm1','.psd1','.bat','.cmd','.cs','.csproj','.sln','.sql','.c','.h','.cpp','.hpp','.rs','.go','.java','.kt','.qml','.log','.srt','.vtt','.tex','.r','.rb','.pl','.php','.vue','.svelte','.desktop'}
 
 
-def sensitive(path: Path) -> bool:
-    return any(part.startswith('.') for part in path.parts if part not in ('.','..')) or path.name.lower() in SECRET_NAMES or path.suffix.lower() in {'.pem','.key','.p12','.pfx','.kdbx'}
+def sensitive(path: Path, *, boundary: Path | None = None) -> bool:
+    parts = path.relative_to(boundary).parts if boundary is not None else path.parts
+    if any(part.startswith('.') for part in parts if part not in ('.','..')) or path.name.lower() in SECRET_NAMES or path.suffix.lower() in {'.pem','.key','.p12','.pfx','.kdbx'}:
+        return True
+    # Windows hides files using attributes, including on containing folders.
+    for candidate in (path, *path.parents):
+        if candidate == boundary:
+            break
+        # NTFS volume roots themselves normally have Hidden and System set.
+        if candidate == Path(candidate.anchor):
+            continue
+        try:
+            if getattr(candidate.stat(), 'st_file_attributes', 0) & 2:  # FILE_ATTRIBUTE_HIDDEN
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def is_link(path: Path) -> bool:
+    """Include Windows junctions, which Path.is_symlink does not recognize."""
+    if path.is_symlink():
+        return True
+    try:
+        return getattr(path.lstat(), 'st_reparse_tag', 0) == 0xA0000003  # IO_REPARSE_TAG_MOUNT_POINT
+    except OSError:
+        return False
 
 
 def in_roots(path: Path, roots: list[str]) -> bool:
@@ -29,7 +55,7 @@ def in_roots(path: Path, roots: list[str]) -> bool:
     for raw in roots:
         root = Path(raw).expanduser()
         # A changed link must not silently grant a new location.
-        if root.is_symlink():
+        if is_link(root):
             continue
         root = root.resolve()
         if resolved == root or (root.is_dir() and resolved.is_relative_to(root)):
@@ -59,7 +85,7 @@ def read_source(path: Path) -> dict:
         try:
             import pypdf
         except ImportError:
-            raise ValueError('PDF support needs the Fedora package python3-pypdf.') from None
+            raise ValueError(pdf_install_help()) from None
         reader = pypdf.PdfReader(io.BytesIO(raw))
         if len(reader.pages) > 500:
             raise ValueError('PDF exceeds 500 pages; link a smaller document or text export.')
@@ -110,15 +136,15 @@ class ProjectFiles:
             root = Path(raw).expanduser()
             if root.is_file() and readable_without_approval(root, self.roots):
                 result.add(root.resolve())
-            elif root.is_dir() and not root.is_symlink() and readable_without_approval(root, self.roots):
+            elif root.is_dir() and not is_link(root) and readable_without_approval(root, self.roots):
                 for folder, dirs, names in os.walk(root, followlinks=False):
                     visited += 1
                     if visited > 1200 or (cancel and cancel.is_set()):
                         return sorted(result)[:limit]
-                    dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d not in SKIP_DIRS and not (Path(folder) / d).is_symlink())
+                    dirs[:] = sorted(d for d in dirs if not d.startswith('.') and d not in SKIP_DIRS and not is_link(Path(folder) / d))
                     for name in sorted(names):
                         path = Path(folder) / name
-                        if path.is_symlink() or not readable_without_approval(path, self.roots):
+                        if is_link(path) or not readable_without_approval(path, self.roots):
                             continue
                         if path.suffix.lower() in TEXT_SUFFIXES | {'.pdf','.docx'} or (not path.suffix and path.is_file()):
                             result.add(path.resolve())

@@ -4,8 +4,9 @@ from __future__ import annotations
 import difflib
 import json
 import os
-import selectors
-import signal
+import base64
+import queue
+import sys
 import subprocess
 import threading
 import time
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import source_files
+from .processes import start_process, stop_process
 from .context import ProjectFiles, line_starts, read_source, readable_without_approval, sensitive
 from .web import fetch_public, search_results, search_url, validate_url
 
@@ -34,6 +36,40 @@ def schema(name, description, properties, required):
     return {'type':'function','function':{'name':name,'description':description,'parameters':{'type':'object','properties':properties,'required':required,'additionalProperties':False}}}
 
 
+def command_shell_name():
+    return 'Windows PowerShell' if sys.platform == 'win32' else 'Bash'
+
+def command_argv(command):
+    if sys.platform != 'win32':
+        return ['/bin/bash', '--noprofile', '--norc', '-c', command]
+    executable = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32/WindowsPowerShell/v1.0/powershell.exe'
+    # Encoding the script avoids an additional layer of Windows argv quoting.
+    script = (
+        '[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false); '
+        '$OutputEncoding = [Console]::OutputEncoding; '
+        '\n' + command + '\n'
+        'if ($?) { exit 0 }; '
+        'if ($LASTEXITCODE) { exit $LASTEXITCODE }; exit 1'
+    )
+    encoded = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    return [str(executable), '-NoLogo', '-NoProfile', '-NonInteractive', '-OutputFormat', 'Text', '-EncodedCommand', encoded]
+
+def command_environment():
+    names = {'PATH','HOME','USER','LOGNAME','LANG','LC_ALL','TERM','TMPDIR','XDG_RUNTIME_DIR'}
+    if sys.platform == 'win32':
+        names |= {'SYSTEMROOT','WINDIR','COMSPEC','PATHEXT','USERPROFILE','HOMEDRIVE',
+                  'HOMEPATH','TEMP','TMP','APPDATA','LOCALAPPDATA','PROGRAMFILES',
+                  'PROGRAMFILES(X86)','PROGRAMW6432','PROGRAMDATA','USERNAME'}
+    environment = {key.upper() if sys.platform == 'win32' else key:value
+                   for key, value in os.environ.items() if key.upper() in names}
+    environment['GIT_TERMINAL_PROMPT'] = '0'
+    if sys.platform == 'win32':
+        environment.update({'PYTHONIOENCODING':'utf-8', 'PYTHONUTF8':'1'})
+    else:
+        environment['PAGER'] = 'cat'
+    return environment
+
+
 STRING = {'type':'string'}
 MEMORY_SCOPE = {'type':'string','enum':['global','project','learning']}
 SAVED_READ_TOOLS = ('read_memory', 'list_memory', 'search_memory', 'read_tool_result', 'list_tool_results')
@@ -49,7 +85,7 @@ TOOL_SCHEMAS = [
     schema('search_project','Search bounded overlapping character windows of linked source text. Returns diverse partial passages with paths, source lines and character offsets; use read_file to page further.', {'query':STRING}, ['query']),
     schema('write_file','Create or replace UTF-8 text with an approved diff and backup. expected_sha256 must match read_file for an existing file; null means create only if absent. Prefer edit_file for a small change.', {'path':STRING,'content':STRING,'expected_sha256':{'type':['string','null']}}, ['path','content','expected_sha256']),
     schema('edit_file','Replace exactly one nonempty old_text fragment in UTF-8 source; new_text may be empty. Supply the latest whole-file sha256 from read_file or an edit result. Rejects stale or ambiguous edits. Requires diff approval and backs up old bytes.', {'path':STRING,'expected_sha256':STRING,'old_text':STRING,'new_text':STRING}, ['path','expected_sha256','old_text','new_text']),
-    schema('run_command','Ask user to approve a shell command. Runs unsandboxed with their account; timeout and output cap apply. Never bypass a denied action.', {'command':STRING,'cwd':STRING,'timeout':{'type':'integer'},'reason':STRING}, ['command','cwd']),
+    schema('run_command',f'Ask user to approve a {command_shell_name()} command. Use syntax for that shell. Runs unsandboxed with their account; timeout and output cap apply. Never bypass a denied action.', {'command':STRING,'cwd':STRING,'timeout':{'type':'integer'},'reason':STRING}, ['command','cwd']),
     schema('web_search','Search the public internet. User approves the exact query. Do not send private project text or secrets.', {'query':STRING}, ['query']),
     schema('fetch_url','Retrieve a public HTTP/HTTPS text page for research. User approves the full URL; cite the returned URL.', {'url':STRING}, ['url']),
 ]
@@ -415,51 +451,63 @@ class ToolExecutor:
 
     def _run_command(self, args):
         command, cwd, timeout, reason = self._command_parameters(args)
-        self._ask(ApprovalRequest('Run this terminal command?', f'Working directory: {cwd}\nTime limit: {timeout} seconds\nPurpose: {reason[:1000]}\n\n{command}', 'command', 'Runs outside a sandbox with your user account. It can modify or delete files and send data over the network. Approve only a command you understand.'))
-        env = {key:os.environ[key] for key in ('PATH','HOME','USER','LOGNAME','LANG','LC_ALL','TERM','TMPDIR','XDG_RUNTIME_DIR') if key in os.environ}
-        env.update({'GIT_TERMINAL_PROMPT':'0','PAGER':'cat'})
-        proc = subprocess.Popen(['/bin/bash','--noprofile','--norc','-c',command], cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        self._ask(ApprovalRequest('Run this terminal command?', f'Shell: {command_shell_name()}\nWorking directory: {cwd}\nTime limit: {timeout} seconds\nPurpose: {reason[:1000]}\n\n{command}', 'command', 'Runs outside a sandbox with your user account. It can modify or delete files and send data over the network. Approve only a command you understand.'))
+        proc = start_process(command_argv(command), cwd=cwd, env=command_environment(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
         output, size = [], 0
         timed_out, capped = False, False
         deadline = time.monotonic() + timeout
-        selector = selectors.DefaultSelector()
-        selector.register(proc.stdout, selectors.EVENT_READ)
+        chunks = queue.Queue(maxsize=8)
+        finished = threading.Event()
+
+        def enqueue(chunk):
+            while not finished.is_set():
+                try:
+                    chunks.put(chunk, timeout=0.1)
+                    return
+                except queue.Full:
+                    continue
+
+        def read_output():
+            try:
+                while not finished.is_set():
+                    chunk = os.read(proc.stdout.fileno(), 8192)
+                    if not chunk:
+                        break
+                    enqueue(chunk)
+            except OSError:
+                pass
+            finally:
+                proc.stdout.close()
+                enqueue(None)
+
+        reader = threading.Thread(target=read_output, name='letracode-command-output', daemon=True)
+        reader.start()
         try:
-            while selector.get_map():
+            while True:
                 if self.cancel.is_set() or time.monotonic() > deadline:
                     timed_out = time.monotonic() > deadline
                     break
-                for key, _ in selector.select(0.1):
-                    chunk = os.read(key.fileobj.fileno(), 8192)
-                    if not chunk:
-                        selector.unregister(key.fileobj)
-                        continue
-                    output.append(chunk); size += len(chunk)
-                    if size >= 64000:
-                        capped = True
-                        break
-                if capped:
+                try:
+                    chunk = chunks.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if chunk is None:
+                    # EOF can precede process termination; preserve a normal
+                    # exit code before disposing of any remaining descendants.
+                    try:
+                        proc.wait(timeout=max(0, min(0.5, deadline-time.monotonic())))
+                    except subprocess.TimeoutExpired:
+                        pass
+                    break
+                output.append(chunk[:64000-size]); size += len(chunk)
+                if size >= 64000:
+                    capped = True
                     break
         finally:
-            selector.close()
-            # Kill the whole session even if the shell exited leaving children alive.
-            try:
-                os.killpg(proc.pid, signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            try:
-                proc.wait(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                pass
-            try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-            proc.wait(timeout=2)
-            proc.stdout.close()
-        return {'command':command,'cwd':str(cwd),'timeout':timeout,'executed':True,
-                'output':b''.join(output).decode('utf-8',errors='replace')[:64000], 'exit_code':proc.returncode,
-                'timed_out':timed_out,'cancelled':self.cancel.is_set(),'output_limit_reached':capped}
+            finished.set()
+            stop_process(proc, timeout=0.5)
+            reader.join(timeout=1)
+        return {'command':command,'cwd':str(cwd),'timeout':timeout,'executed':True,'output':b''.join(output).decode('utf-8',errors='replace')[:64000], 'exit_code':proc.returncode,'timed_out':timed_out,'cancelled':self.cancel.is_set(),'output_limit_reached':capped}
 
     def _web_approval(self, url, query=None):
         validate_url(url)

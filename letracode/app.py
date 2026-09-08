@@ -3,10 +3,11 @@ import argparse
 import os
 import sys
 from pathlib import Path
+from .platform import qt_install_help
 
 
 def main():
-    parser = argparse.ArgumentParser(description='LetraCode — local AI chat for KDE')
+    parser = argparse.ArgumentParser(description='LetraCode — private local AI chat')
     parser.add_argument('--data-dir',type=Path,help='Use a separate local data directory (also useful when restoring a backup).')
     parser.add_argument('--version',action='store_true')
     args = parser.parse_args()
@@ -18,7 +19,7 @@ def main():
         from PySide6.QtCore import QLockFile
         from PySide6.QtWidgets import QApplication, QMessageBox
     except ImportError as error:
-        print('LetraCode needs the system Qt bindings. On Fedora run: sudo dnf install python3-pyside6',file=sys.stderr)
+        print(qt_install_help(),file=sys.stderr)
         print(str(error),file=sys.stderr)
         return 1
     app = QApplication([sys.argv[0]])

@@ -3,8 +3,9 @@ from __future__ import annotations
 
 import json
 import copy
-import fcntl
 import os
+
+from . import filesystem as fs
 import sqlite3
 import stat
 import tempfile
@@ -20,6 +21,8 @@ from .strand import BACKUP_CHUNK_BYTES, MAX_FILE_BYTES, StrandFiles, backup_tree
 
 
 def data_home() -> Path:
+    if fs.IS_WINDOWS:
+        return Path(os.environ.get('LOCALAPPDATA') or Path.home() / 'AppData' / 'Local') / 'LetraCode'
     return Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share'))) / 'letracode'
 
 
@@ -87,7 +90,7 @@ class Store:
     def __init__(self, directory: Path | None = None):
         self.directory = Path(directory or data_home()).absolute()
         with safe_directory(self.directory, create=True) as fd:
-            os.fchmod(fd, 0o700)
+            fs.fchmod(fd, 0o700)
         self.path = self.directory / 'letracode.sqlite3'
         if self.path.is_symlink() or (self.path.exists() and self.path.stat().st_nlink != 1):
             raise ValueError('Unsafe linked database')
@@ -144,24 +147,24 @@ class Store:
         # Retain and lock the existing root descriptor without initializing
         # Strand defaults. The whole-directory rename carries this same lock
         # inode; existing cooperating saves finish before migration proceeds.
-        with safe_directory(root) as directory:
-            lock = os.open('.write-lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+        with safe_directory(root, allow_move=True) as directory:
+            lock = fs.open('.write-lock', os.O_RDWR | os.O_CREAT | fs.O_NOFOLLOW | fs.O_NONBLOCK,
                            0o600, dir_fd=directory)
             try:
-                info = os.fstat(lock)
+                info = fs.fstat(lock)
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                     raise ValueError('Unsafe linked Memory migration lock')
-                fcntl.flock(lock, fcntl.LOCK_EX)
+                fs.flock(lock, fs.LOCK_EX)
                 # Lock order matches normal backup/deletion: Memory, SQLite.
                 with self.connection() as db:
                     db.execute('BEGIN IMMEDIATE')
                     current = db.execute('PRAGMA user_version').fetchone()[0]
                     effective = 3 if current == 3 else initial_version
-                    self._migrate_memory_tree_locked(effective, db)
+                    self._migrate_memory_tree_locked(effective, db, fs.fstat(directory))
             finally:
-                os.close(lock)
+                fs.close(lock)
 
-    def _migrate_memory_tree_locked(self, initial_version, migration_db):
+    def _migrate_memory_tree_locked(self, initial_version, migration_db, locked_root):
         from .strand import rename_noreplace
         old, target = self.directory / 'strand', self.directory / 'Memory'
         marker = self.directory / 'memory-tree-migration.json'
@@ -196,8 +199,9 @@ class Store:
                 # recovery inodes, receipts, unknown files and deleted projects.
                 with safe_directory(old):
                     pass
-                rename_noreplace(directory, 'strand', directory, 'Memory')
-                os.fsync(directory)
+                options = {'expected_identity': (locked_root.st_dev, locked_root.st_ino)} if fs.IS_WINDOWS else {}
+                rename_noreplace(directory, 'strand', directory, 'Memory', **options)
+                fs.fsync(directory)
         self.memory = MemoryFiles(target, legacy=record['legacy'], migration_locked=True)
         migration_db.execute('PRAGMA user_version=3')
         migration_db.commit()
@@ -222,9 +226,9 @@ class Store:
             finally:
                 target.close()
         with destination.open('rb') as saved:
-            os.fsync(saved.fileno())
+            fs.fsync(saved.fileno())
         with safe_directory(directory) as fd:
-            os.fsync(fd)
+            fs.fsync(fd)
 
     def _migrate_memory(self):
         changes = []
@@ -388,13 +392,13 @@ class Store:
                     with safe_directory(original.parent) as source, safe_directory(destination.parent) as target:
                         rename_noreplace(source, original.name, target, destination.name)
                         moved = True
-                        os.fsync(source)
-                        os.fsync(target)
-                        info = os.stat(destination.name, dir_fd=target, follow_symlinks=False)
+                        fs.fsync(source)
+                        fs.fsync(target)
+                        info = fs.stat(destination.name, dir_fd=target, follow_symlinks=False)
                         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                             raise ValueError('Unsafe linked project memory changed during deletion')
                         try:
-                            os.stat(original.name, dir_fd=source, follow_symlinks=False)
+                            fs.stat(original.name, dir_fd=source, follow_symlinks=False)
                         except FileNotFoundError:
                             pass
                         else:
@@ -419,8 +423,8 @@ class Store:
                     try:
                         with safe_directory(destination.parent) as source, safe_directory(original.parent) as target:
                             rename_noreplace(source, destination.name, target, original.name)
-                            os.fsync(source)
-                            os.fsync(target)
+                            fs.fsync(source)
+                            fs.fsync(target)
                     except (OSError, ValueError) as recovery_error:
                         self._finish_project_archive(archive, 'recovery_required')
                         raise ValueError(
@@ -466,7 +470,7 @@ class Store:
             recover_file(original)
             with safe_directory(original.parent) as directory:
                 try:
-                    info = os.stat(original.name, dir_fd=directory, follow_symlinks=False)
+                    info = fs.stat(original.name, dir_fd=directory, follow_symlinks=False)
                 except FileNotFoundError:
                     return None
                 if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
@@ -603,7 +607,7 @@ class Store:
         destination = Path(destination)
         def copy_entries(archive, prefix, entries):
             for relative, incoming in entries:
-                remaining = os.fstat(incoming.fileno()).st_size
+                remaining = fs.fstat(incoming.fileno()).st_size
                 with archive.open(prefix + relative, 'w', force_zip64=True) as out:
                     while remaining:
                         chunk = incoming.read(min(remaining, BACKUP_CHUNK_BYTES))
@@ -677,7 +681,7 @@ class Store:
                 with os.fdopen(fd, 'wb') as out, stage.open('rb') as incoming:
                     import shutil
                     shutil.copyfileobj(incoming, out)
-                    out.flush(); os.fsync(out.fileno())
-                os.replace(name, destination)
+                    out.flush(); fs.fsync(out.fileno())
+                fs.replace(name, destination)
             finally:
                 Path(name).unlink(missing_ok=True)

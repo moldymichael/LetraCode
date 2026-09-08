@@ -9,6 +9,8 @@ import copy
 import hashlib
 import json
 import os
+
+from . import filesystem as fs
 import re
 import stat
 import threading
@@ -88,6 +90,9 @@ class MemoryFiles(StrandFiles):
             raise ValueError('Unsafe Memory path; hidden control paths and traversal are refused')
         if PurePosixPath(relative).is_absolute():
             raise ValueError('Use a relative Memory path')
+        if fs.IS_WINDOWS:
+            for part in parts:
+                fs.windows_component(part)
         return relative
 
     def root_for(self, project_id=None):
@@ -109,6 +114,9 @@ class MemoryFiles(StrandFiles):
         parts = relative.split('/')
         if any(part in ('', '.', '..') for part in parts) or relative.startswith('/'):
             raise ValueError('Invalid registry path')
+        if fs.IS_WINDOWS:
+            for part in parts:
+                fs.windows_component(part)
         return self.root / relative
 
     def _owned_path(self, relative, project_id, *, tree=False, retained=False):
@@ -165,9 +173,10 @@ class MemoryFiles(StrandFiles):
                     raise ValueError('Duplicate Memory legacy alias')
                 aliases.add(alias)
             if not row['deleted']:
-                if row['path'] in destinations:
+                destination = row['path'].casefold() if fs.IS_WINDOWS else row['path']
+                if destination in destinations:
                     raise ValueError('Duplicate live Memory destination')
-                destinations.add(row['path'])
+                destinations.add(destination)
 
     def _metadata(self):
         raw = safe_read(self.registry_path, MAX_RECEIPT_BYTES)
@@ -201,7 +210,7 @@ class MemoryFiles(StrandFiles):
         old_projects = self.root / 'memory/projects'
         if os.path.lexists(old_projects):
             with safe_directory(old_projects) as folder:
-                names = os.listdir(folder)
+                names = fs.listdir(folder)
             for name in names:
                 if name.endswith('.md') and re.fullmatch(r'[A-Za-z0-9_-]{1,128}', name[:-3]):
                     relative = 'memory/projects/' + name
@@ -222,7 +231,7 @@ class MemoryFiles(StrandFiles):
         known = {row['project_id'] for row in meta['files'].values()
                  if row.get('legacy_scope') == 'project'}
         with safe_directory(self.root / '.receipts') as folder:
-            names = sorted(name for name in os.listdir(folder)
+            names = sorted(name for name in fs.listdir(folder)
                            if re.fullmatch(r'[a-f0-9]{32}\.json', name))
         changed = False
         for name in names:
@@ -294,7 +303,8 @@ class MemoryFiles(StrandFiles):
         storage = self._storage(relative, project_id)
         meta, raw = self._metadata()
         found = [(ident, row) for ident, row in meta['files'].items()
-                 if row['path'] == storage and row.get('project_id') == project_id and not row.get('deleted')]
+                 if (row['path'].casefold() == storage.casefold() if fs.IS_WINDOWS else row['path'] == storage)
+                 and row.get('project_id') == project_id and not row.get('deleted')]
         if len(found) > 1:
             raise ValueError('Conflicting Memory file identities')
         if found:
@@ -389,7 +399,7 @@ class MemoryFiles(StrandFiles):
                 any(type(value) is not int or value < 0 for value in expected_entry_identity)):
             raise ValueError('Invalid reviewed Memory entry identity')
         with safe_directory(path.parent) as parent:
-            info = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            info = fs.stat(path.name, dir_fd=parent, follow_symlinks=False)
         if [info.st_dev, info.st_ino] != list(expected_entry_identity):
             raise ValueError('Memory entry identity changed; reload and review the current file or folder first.')
 
@@ -437,18 +447,18 @@ class MemoryFiles(StrandFiles):
 
     def _entry_digest(self, target):
         with safe_directory(target.parent) as parent:
-            info = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+            info = fs.stat(target.name, dir_fd=parent, follow_symlinks=False)
             if stat.S_ISREG(info.st_mode) and info.st_nlink == 1:
-                stream = os.open(target.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                stream = fs.open(target.name, os.O_RDONLY | fs.O_NOFOLLOW | fs.O_NONBLOCK, dir_fd=parent)
                 with os.fdopen(stream, 'rb') as incoming:
-                    opened = os.fstat(incoming.fileno())
+                    opened = fs.fstat(incoming.fileno())
                     if not os.path.samestat(info, opened) or opened.st_nlink != 1 or not stat.S_ISREG(opened.st_mode):
                         raise ValueError('Memory file changed while opening')
                     result = hashlib.sha256()
                     for chunk in iter(lambda: incoming.read(128 * 1024), b''):
                         result.update(chunk)
-                    after = os.fstat(incoming.fileno())
-                    named = os.stat(target.name, dir_fd=parent, follow_symlinks=False)
+                    after = fs.fstat(incoming.fileno())
+                    named = fs.stat(target.name, dir_fd=parent, follow_symlinks=False)
                     if not os.path.samestat(opened, named) or (opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns) != (after.st_size, after.st_mtime_ns, after.st_ctime_ns):
                         raise ValueError('Memory file changed during snapshot')
                     return result.hexdigest()
@@ -458,8 +468,8 @@ class MemoryFiles(StrandFiles):
         # Include empty directory names as well as opaque regular file bytes.
         def folders(path, prefix=''):
             with safe_directory(path) as fd:
-                for name in sorted(os.listdir(fd)):
-                    child = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                for name in sorted(fs.listdir(fd)):
+                    child = fs.stat(name, dir_fd=fd, follow_symlinks=False)
                     if stat.S_ISDIR(child.st_mode):
                         result.update(('directory:' + prefix + name + '\0').encode())
                         folders(path / name, prefix + name + '/')
@@ -473,7 +483,7 @@ class MemoryFiles(StrandFiles):
     def snapshot_entry(self, relative, project_id=None):
         target = self._checked_storage(self._storage(relative, project_id))
         with safe_directory(target.parent) as fd:
-            info = os.stat(target.name, dir_fd=fd, follow_symlinks=False)
+            info = fs.stat(target.name, dir_fd=fd, follow_symlinks=False)
         kind = 'folder' if stat.S_ISDIR(info.st_mode) else 'file'
         if kind == 'file':
             return dict(self.file_snapshot(relative, project_id), kind=kind)
@@ -489,12 +499,12 @@ class MemoryFiles(StrandFiles):
         result = []
         def walk(folder, prefix=''):
             with safe_directory(folder) as fd:
-                names = sorted(os.listdir(fd), key=str.casefold)
+                names = sorted(fs.listdir(fd), key=str.casefold)
                 for name in names:
                     if name.startswith('.') or (project_id is None and prefix + name == 'memory/projects'):
                         continue
                     relative = prefix + name
-                    info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    info = fs.stat(name, dir_fd=fd, follow_symlinks=False)
                     if stat.S_ISDIR(info.st_mode):
                         result.append({'path': relative, 'kind': 'folder'})
                         walk(folder / name, relative + '/')
@@ -580,7 +590,7 @@ class MemoryFiles(StrandFiles):
 
     def _operation_records(self):
         with safe_directory(self.root / '.operations') as fd:
-            names = sorted(os.listdir(fd))
+            names = sorted(fs.listdir(fd))
         records, sequences = [], set()
         for name in names:
             if not re.fullmatch(r'[a-f0-9]{32}\.json', name):
@@ -671,7 +681,7 @@ class MemoryFiles(StrandFiles):
                 continue
             if target_exists and not source_exists:
                 with safe_directory(target.parent) as fd:
-                    info = os.stat(target.name, dir_fd=fd, follow_symlinks=False)
+                    info = fs.stat(target.name, dir_fd=fd, follow_symlinks=False)
                 if [info.st_dev, info.st_ino] != record['inode'] or self._entry_digest(target) != record['sha256']:
                     raise ValueError(f'Memory operation conflict; retained entry changed at {target}. Journal: {self._operation_path(record["id"])}')
                 self._apply_registry(record)
@@ -687,7 +697,7 @@ class MemoryFiles(StrandFiles):
         if os.path.lexists(target):
             raise ValueError('Destination already exists; no Memory entry was overwritten')
         with safe_directory(old.parent) as fd:
-            info = os.stat(old.name, dir_fd=fd, follow_symlinks=False)
+            info = fs.stat(old.name, dir_fd=fd, follow_symlinks=False)
         if expected_entry_identity is not _UNREVIEWED_IDENTITY:
             self._check_entry_identity(old, expected_entry_identity)
             if [info.st_dev, info.st_ino] != list(expected_entry_identity):
@@ -764,10 +774,10 @@ class MemoryFiles(StrandFiles):
             # that an external actor has since moved outside this Memory tree.
             for parent, anchored in ((old.parent, src), (target.parent, dst)):
                 with safe_directory(parent) as fresh:
-                    if not os.path.samestat(os.fstat(anchored), os.fstat(fresh)):
+                    if not os.path.samestat(fs.fstat(anchored), fs.fstat(fresh)):
                         record['status'] = 'aborted'; self._write_operation(record, prepared)
                         raise ValueError('Memory directory identity changed during operation; no entry was moved')
-            current = os.stat(old.name, dir_fd=src, follow_symlinks=False)
+            current = fs.stat(old.name, dir_fd=src, follow_symlinks=False)
             if not os.path.samestat(info, current) or (not stat.S_ISDIR(current.st_mode) and
                     (not stat.S_ISREG(current.st_mode) or current.st_nlink != 1)):
                 record['status'] = 'aborted'; self._write_operation(record, prepared)
@@ -780,7 +790,7 @@ class MemoryFiles(StrandFiles):
                 # retries: two present names are otherwise ambiguous on restart.
                 record['status'] = 'aborted'; self._write_operation(record, prepared)
                 raise
-            os.fsync(src); os.fsync(dst)
+            fs.fsync(src); fs.fsync(dst)
         if self._entry_digest(target) != expected:
             raise ValueError(f'Memory entry changed during operation; conflict retained at {target}')
         self._apply_registry(record)
@@ -795,7 +805,7 @@ class MemoryFiles(StrandFiles):
                 pass
             temporary = '.trash/create-' + uuid.uuid4().hex
             with safe_directory(self.root / '.trash') as fd:
-                os.mkdir(Path(temporary).name, 0o700, dir_fd=fd); os.fsync(fd)
+                fs.mkdir(Path(temporary).name, 0o700, dir_fd=fd); fs.fsync(fd)
             return self._relocate(temporary, storage, self._entry_digest(self.root / temporary),
                                   project_id, 'create', files_after={})
 

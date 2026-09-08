@@ -17,7 +17,6 @@ import os
 from pathlib import Path
 import secrets
 import shutil
-import signal
 import socket
 import subprocess
 import sys
@@ -25,6 +24,8 @@ import threading
 import time
 from typing import BinaryIO, Callable
 import weakref
+
+from .processes import start_process, stop_process
 
 from .budgeting import RequestUsage, fallback_usage
 
@@ -134,6 +135,7 @@ class LocalEngine:
         with self._start_lock:
             if self.running:
                 return
+            self.stop()
             self._cancel_requested.clear()
             executable, model = self._validated_paths()
             self._prepare_data_dir()
@@ -167,12 +169,11 @@ class LocalEngine:
             on_status("Starting local model server")
             self._append_log("Starting local model server\n")
             try:
-                process = subprocess.Popen(
+                process = start_process(
                     argv,
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.STDOUT,
-                    start_new_session=True,
                     env=environment,
                 )
             except OSError as exc:
@@ -764,28 +765,8 @@ class LocalEngine:
             connection = self._active_connection
             self._active_response = None
             self._active_connection = None
-        if process is not None and process.poll() is None:
-            try:
-                if os.name == "posix":
-                    os.killpg(process.pid, signal.SIGTERM)
-                else:
-                    process.terminate()
-            except ProcessLookupError:
-                pass
-            try:
-                process.wait(timeout=_STOP_TIMEOUT)
-            except subprocess.TimeoutExpired:
-                try:
-                    if os.name == "posix":
-                        os.killpg(process.pid, signal.SIGKILL)
-                    else:
-                        process.kill()
-                except ProcessLookupError:
-                    pass
-                try:
-                    process.wait(timeout=_STOP_TIMEOUT)
-                except subprocess.TimeoutExpired:
-                    pass
+        if process is not None:
+            stop_process(process, timeout=_STOP_TIMEOUT)
         for stream in (connection, response):
             if stream is not None:
                 try:
@@ -799,13 +780,19 @@ class LocalEngine:
     def _validated_paths(self) -> tuple[Path, Path]:
         executable_setting = self.config.executable.strip()
         if not executable_setting:
-            executable_setting = shutil.which("llama-server") or ""
-        elif os.sep not in executable_setting:
-            executable_setting = shutil.which(executable_setting) or executable_setting
+            executable_setting = shutil.which('llama-server.exe' if sys.platform == 'win32' else 'llama-server') or ''
+        elif not any(separator in executable_setting for separator in (os.sep, os.altsep) if separator):
+            name = executable_setting
+            if sys.platform == 'win32' and not Path(name).suffix:
+                name += '.exe'
+            executable_setting = shutil.which(name) or executable_setting
         if not executable_setting:
             raise EngineError("No llama-server executable is configured")
         executable = Path(executable_setting).expanduser().resolve()
-        if not executable.is_file() or not os.access(executable, os.R_OK | os.X_OK):
+        if sys.platform == 'win32' and executable.suffix.lower() != '.exe':
+            raise EngineError('Select the native llama-server.exe executable, not a script or batch file')
+        access = os.R_OK if sys.platform == 'win32' else os.R_OK | os.X_OK
+        if not executable.is_file() or not os.access(executable, access):
             raise EngineError("The configured local model executable is missing or not executable")
 
         if not self.config.model_path.strip():

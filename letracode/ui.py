@@ -24,6 +24,7 @@ from .worker import ConversationWorker
 from .store import message_status
 from .memory_ui import MemoryDialog
 from .project_files import ProjectFilesPanel
+from .platform import engine_setup_help, is_windows
 
 
 def assistant_html(text, font):
@@ -73,7 +74,7 @@ class MainWindow(QMainWindow):
         except (TypeError,ValueError):
             self.engine_config = EngineConfig()
         if not self.engine_config.executable:
-            self.engine_config.executable = shutil.which('llama-server') or ''
+            self.engine_config.executable = shutil.which('llama-server.exe' if is_windows() else 'llama-server') or ''
         self.engine = LocalEngine(self.engine_config,store.directory)
         self.setWindowTitle('LetraCode')
         self.resize(1260,820)
@@ -236,7 +237,7 @@ class MainWindow(QMainWindow):
         help_menu = self.menuBar().addMenu('&Help')
         self.action(help_menu,'Getting started',self.getting_started)
         self.action(help_menu,'Engine log',self.show_log)
-        self.action(help_menu,'About LetraCode',lambda:QMessageBox.about(self,'About LetraCode',f'LetraCode {__version__}\n\nLocal conversations, with your context.\nNative Qt desktop application for Fedora KDE.\nInference: local llama.cpp / GGUF\nStorage: local SQLite\nNo account, telemetry or cloud inference.'))
+        self.action(help_menu,'About LetraCode',lambda:QMessageBox.about(self,'About LetraCode',f'LetraCode {__version__}\n\nLocal conversations, with your context.\nNative Qt desktop application for Windows and Linux.\nInference: local llama.cpp / GGUF\nStorage: local SQLite\nNo account, telemetry or cloud inference.'))
 
     def refresh_tree(self):
         selected = ('chat',self.chat_id) if self.chat_id else ('project',self.project_id) if self.project_id else ('global',None)
@@ -678,7 +679,7 @@ class MainWindow(QMainWindow):
         self.text_dialog('Engine log',path.read_text(encoding='utf-8',errors='replace')[-100000:] if path.exists() else 'The local engine has not written a log yet.')
 
     def getting_started(self):
-        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\nOn Fedora, the installer installs the system Qt dependency. Install the inference engine with:\n  sudo dnf install llama-cpp\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Use Project files to add existing files and folders, create notes and folders, and open or edit files. Save file applies note edits; navigation and Close keep unsaved note drafts separately. Files, saved drafts & history provides recovery and Undo. Shared files are available across projects. Always-active notes are included automatically; other notes are available to list, search and read when relevant. Set Project instructions in Settings.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
+        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\n' + engine_setup_help() + '\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Use Project files to add existing files and folders, create notes and folders, and open or edit files. Save file applies note edits; navigation and Close keep unsaved note drafts separately. Files, saved drafts & history provides recovery and Undo. Shared files are available across projects. Always-active notes are included automatically; other notes are available to list, search and read when relevant. Set Project instructions in Settings.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
 
     def closeEvent(self,event):
         if self.worker:

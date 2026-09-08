@@ -1,6 +1,10 @@
 import os
 os.environ.setdefault('QT_QPA_PLATFORM','offscreen')
 
+import pytest
+
+pytestmark = pytest.mark.usefixtures('python_engine_peer')
+
 from PySide6.QtWidgets import QApplication
 from letracode.store import Store
 from letracode.ui import MainWindow
@@ -32,7 +36,7 @@ def test_gui_streams_from_managed_local_peer_and_saves_answer(tmp_path):
     from pathlib import Path
     spec = importlib.util.spec_from_file_location('engine_fixtures',Path(__file__).with_name('test_engine.py'))
     fixtures = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixtures)
-    binary = tmp_path/'llama-server-peer'; binary.write_text(fixtures.PEER_SOURCE); binary.chmod(0o700)
+    binary = tmp_path/'llama-server-peer.exe'; binary.write_text(fixtures.PEER_SOURCE); binary.chmod(0o700)
     model = tmp_path/'model.gguf'; model.write_bytes(b'GGUF'+bytes(64))
     app = QApplication.instance() or QApplication([])
     s = Store(tmp_path/'data')
@@ -56,7 +60,7 @@ def test_stop_interrupts_silent_model_and_keeps_prompt(tmp_path):
     from pathlib import Path
     spec = importlib.util.spec_from_file_location('engine_fixtures',Path(__file__).with_name('test_engine.py'))
     fixtures = importlib.util.module_from_spec(spec); spec.loader.exec_module(fixtures)
-    binary = tmp_path/'llama-server-peer'; binary.write_text(fixtures.PEER_SOURCE); binary.chmod(0o700)
+    binary = tmp_path/'llama-server-peer.exe'; binary.write_text(fixtures.PEER_SOURCE); binary.chmod(0o700)
     model = tmp_path/'model.gguf'; model.write_bytes(b'GGUF'+bytes(64))
     app = QApplication.instance() or QApplication([])
     s = Store(tmp_path/'data'); s.set_setting('engine',{'executable':str(binary),'model_path':str(model)})

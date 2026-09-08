@@ -11,6 +11,8 @@ import hashlib
 import json
 import math
 import os
+
+from . import filesystem as fs
 from pathlib import Path, PureWindowsPath
 import re
 import sqlite3
@@ -354,23 +356,23 @@ def export_evaluation(store, chat_id, destination, notes=''):
     with safe_directory(destination.parent) as parent:
         check_destination()
         temporary = '.letracode-evaluation-' + uuid.uuid4().hex + '.zip'
-        fd = os.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+        fd = fs.open(temporary, os.O_RDWR | os.O_CREAT | os.O_EXCL | fs.O_NOFOLLOW, 0o600, dir_fd=parent)
         try:
             with os.fdopen(fd, 'w+b') as out:
                 with zipfile.ZipFile(out, 'w', zipfile.ZIP_DEFLATED) as archive:
                     for name, content in files.items():
                         archive.writestr(name, content)
                 out.flush()
-                os.fsync(out.fileno())
+                fs.fsync(out.fileno())
             check_destination()
             with safe_directory(destination.parent) as current:
-                before, after = os.fstat(parent), os.fstat(current)
+                before, after = fs.fstat(parent), fs.fstat(current)
                 if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
                     raise ValueError('Evaluation destination folder changed during export.')
-            os.replace(temporary, destination.name, src_dir_fd=parent, dst_dir_fd=parent)
-            os.fsync(parent)
+            fs.replace(temporary, destination.name, src_dir_fd=parent, dst_dir_fd=parent)
+            fs.fsync(parent)
         finally:
             try:
-                os.unlink(temporary, dir_fd=parent)
+                fs.unlink(temporary, dir_fd=parent)
             except FileNotFoundError:
                 pass
