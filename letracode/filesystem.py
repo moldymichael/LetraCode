@@ -40,6 +40,11 @@ def windows_path_equal(left, right):
     return simple_upper(left) == simple_upper(right)
 
 
+def check_replacement_permissions(fd):
+    """POSIX saves preserve reviewed mode bits; Windows checks the native DACL."""
+    pass
+
+
 def __getattr__(name):
     # Resolve dynamically so ordinary os fault-injection tests still exercise
     # the original POSIX implementation. Callers opt in with fs.operation().
@@ -92,7 +97,7 @@ def rename_noreplace(src_fd, src, dst_fd, dst, *, expected_identity=None):
 if IS_WINDOWS:
     from ._windows_filesystem import (safe_directory, open, stat, fstat, listdir,
         mkdir, close, fsync, fchmod, unlink, replace, rename_noreplace, flock,
-        LOCK_EX, LOCK_SH, LOCK_UN, LOCK_NB, windows_path_equal)
+        LOCK_EX, LOCK_SH, LOCK_UN, LOCK_NB, windows_path_equal, check_replacement_permissions)
 else:
     import fcntl
     from fcntl import LOCK_EX, LOCK_SH, LOCK_UN, LOCK_NB

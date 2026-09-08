@@ -29,7 +29,9 @@ def test_project_context_and_chats_survive_restart(tmp_path):
     assert [m['content'] for m in again.messages(chat)] == ['What changed?', 'The relationship changed.']
     assert again.messages(other) == []
     assert again.links(project) == [str(tmp_path.resolve())]
-    assert (tmp_path / 'data').stat().st_mode & 0o777 == 0o700
+    # Unix permission bits do not represent the inherited Windows ACL.
+    expected_mode = 0o777 if fs.IS_WINDOWS else 0o700
+    assert (tmp_path / 'data').stat().st_mode & 0o777 == expected_mode
 
 
 def test_delete_project_preserves_linked_files_and_other_chats(tmp_path):
@@ -378,11 +380,24 @@ def test_deletion_archives_original_inode_raw_bytes_and_record_in_backup(tmp_pat
     memory.write_bytes(b'An undecodable correction: \xff')
     inode = memory.stat().st_ino
     with memory.open('ab', buffering=0) as editor:
-        archive = store.delete_project(ident)
-        assert not memory.exists(), 'Deletion left authoritative project memory behind'
-        archive_path = Path(archive['path'])
-        assert archive_path.stat().st_ino == inode
+        if fs.IS_WINDOWS:
+            # Python's editor handle does not share deletion on Windows. A
+            # failed archive must retain the original until the editor closes.
+            with pytest.raises(PermissionError):
+                store.delete_project(ident)
+            assert memory.stat().st_ino == inode
+            assert memory.read_bytes() == b'An undecodable correction: \xff'
+        else:
+            archive = store.delete_project(ident)
+            assert not memory.exists(), 'Deletion left authoritative project memory behind'
+            archive_path = Path(archive['path'])
+            assert archive_path.stat().st_ino == inode
         editor.write(b'\nA late editor save')
+    if fs.IS_WINDOWS:
+        archive = store.delete_project(ident)
+        archive_path = Path(archive['path'])
+        assert not memory.exists()
+        assert archive_path.stat().st_ino == inode
     assert archive_path.read_bytes() == b'An undecodable correction: \xff\nA late editor save'
     assert store.project(ident) is None
     record = json.loads(Path(archive['record_path']).read_text())

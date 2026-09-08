@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def release_files() -> list[Path]:
     files = [
         ROOT / name
-        for name in ("pyproject.toml", "install.sh", "uninstall.sh", "install.ps1", "uninstall.ps1", "README.md", "LICENSE")
+        for name in ("pyproject.toml", "install.sh", "uninstall.sh", "README.md", "LICENSE")
     ]
     files.extend((ROOT / "letracode").glob("*.py"))
     files.append(ROOT / "letracode/assets/io.letracode.LetraCode.svg")
@@ -32,8 +32,6 @@ def release_files() -> list[Path]:
             "build-release.py",
             "build-rpm.sh",
             "letracode.spec",
-            "windows_install.py",
-            "windows-bootstrap.ps1",
             "io.letracode.LetraCode.desktop",
             "io.letracode.LetraCode.metainfo.xml",
         )
@@ -134,13 +132,13 @@ def main() -> int:
     payload = archive_bytes(version)
     source_archive = arguments.output_dir / f"LetraCode-{version}.tar.gz"
     run_installer = arguments.output_dir / f"LetraCode-{version}.run"
-    windows_archive = arguments.output_dir / f"LetraCode-{version}.zip"
+    source_zip = arguments.output_dir / f"LetraCode-{version}.zip"
     atomic_write(source_archive, payload, 0o644)
     atomic_write(run_installer, run_stub(version) + payload, 0o755)
-    atomic_write(windows_archive, zip_bytes(version), 0o644)
+    atomic_write(source_zip, zip_bytes(version), 0o644)
     print(source_archive)
     print(run_installer)
-    print(windows_archive)
+    print(source_zip)
     return 0
 
 

@@ -293,6 +293,53 @@ def test_readonly_source_save_keeps_attribute_or_refuses_unchanged(tmp_path):
         target.chmod(0o666)
 
 
+@pytest.mark.parametrize('check_number', [1, 2])
+def test_permission_refusal_preserves_original_source(tmp_path, monkeypatch, check_number):
+    from letracode import filesystem as fs, source_files
+    target = tmp_path / 'restricted.py'
+    target.write_bytes(b'original\n')
+    before = source_files.snapshot(target)
+    identity = target.stat().st_ino
+    checks = 0
+
+    def refuse_custom_permissions(fd):
+        nonlocal checks
+        assert fs.fstat(fd).st_ino == identity
+        checks += 1
+        if checks == check_number:
+            raise PermissionError('Custom Windows permissions must be preserved')
+
+    monkeypatch.setattr(fs, 'check_replacement_permissions', refuse_custom_permissions, raising=False)
+    with pytest.raises(PermissionError, match='permissions'):
+        source_files.publish(target, b'changed\n', before['sha256'], mode=before['mode'])
+    assert checks == check_number
+    assert target.read_bytes() == b'original\n'
+    assert target.stat().st_ino == identity
+    assert source_files.snapshot(target)['raw'] == b'original\n'
+
+
+@pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows access control lists')
+@pytest.mark.parametrize('permission_kind', ['explicit', 'protected'])
+def test_windows_custom_acl_save_is_refused_without_changes(tmp_path, permission_kind):
+    from letracode import source_files
+    target = tmp_path / 'custom-permissions.py'
+    target.write_bytes(b'original\n')
+    account = subprocess.run(['whoami'], check=True, capture_output=True, text=True).stdout.strip()
+    options = ['/inheritance:d'] if permission_kind == 'protected' else ['/grant:r', account + ':(F)']
+    subprocess.run(['icacls', str(target), *options, '/q'], check=True, capture_output=True)
+    before_acl = tmp_path / 'before.acl'
+    after_acl = tmp_path / 'after.acl'
+    subprocess.run(['icacls', str(target), '/save', str(before_acl), '/q'], check=True, capture_output=True)
+    before = source_files.snapshot(target)
+    identity = target.stat().st_ino
+    with pytest.raises(PermissionError, match='Windows permissions.*preserve'):
+        source_files.publish(target, b'changed\n', before['sha256'], mode=before['mode'])
+    subprocess.run(['icacls', str(target), '/save', str(after_acl), '/q'], check=True, capture_output=True)
+    assert target.read_bytes() == b'original\n'
+    assert target.stat().st_ino == identity
+    assert before_acl.read_bytes() == after_acl.read_bytes()
+
+
 @pytest.mark.skipif(sys.platform != 'win32', reason='Native Windows per-directory case sensitivity')
 def test_windows_case_sensitive_directories_are_refused(tmp_path):
     from letracode import filesystem as fs

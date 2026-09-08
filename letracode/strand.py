@@ -89,7 +89,7 @@ def rename_noreplace(src_fd, src, dst_fd, dst, **options):
 safe_directory = fs.safe_directory
 
 
-def _read_at(fd, name, max_bytes=MAX_FILE_BYTES, *, with_stat=False):
+def _read_at(fd, name, max_bytes=MAX_FILE_BYTES, *, with_stat=False, for_replacement=False):
     try:
         info = fs.stat(name, dir_fd=fd, follow_symlinks=False)
     except FileNotFoundError:
@@ -107,6 +107,8 @@ def _read_at(fd, name, max_bytes=MAX_FILE_BYTES, *, with_stat=False):
             raise ValueError(f'File changed while opening: {name}')
         if opened.st_size > max_bytes:
             raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
+        if for_replacement:
+            fs.check_replacement_permissions(incoming.fileno())
         data = incoming.read(max_bytes + 1)
         if len(data) > max_bytes:
             raise ValueError(f'File is too large (size limit {max_bytes} bytes): {name}')
@@ -312,7 +314,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
     check_cancel()
     with safe_directory(path.parent) as fd, _recovery_directory(path, create=True, namespace=namespace, parent=fd) as recovery:
         _check_recovery(path, fd, recovery, max_bytes, namespace=namespace)
-        observed = _read_at(fd, path.name, max_bytes, with_stat=True)
+        observed = _read_at(fd, path.name, max_bytes, with_stat=True, for_replacement=True)
         if fs.IS_WINDOWS and observed is not None and not observed[1].st_mode & 0o222:
             raise PermissionError('File is read-only; change its attribute before saving')
         if expected_entry_identity is not None and (observed is None or
@@ -345,7 +347,7 @@ def safe_write(path: Path, data: bytes, expected_sha256: str | None, *, max_byte
                 captured = True
                 fs.fsync(fd)
                 fs.fsync(recovery)
-                captured_snapshot = _read_at(recovery, previous, max_bytes, with_stat=True)
+                captured_snapshot = _read_at(recovery, previous, max_bytes, with_stat=True, for_replacement=True)
                 if (captured_snapshot is None or captured_snapshot[0] != original or
                         (expected_entry_identity is not None and [captured_snapshot[1].st_dev, captured_snapshot[1].st_ino] != list(expected_entry_identity)) or
                         (mode is not None and stat.S_IMODE(captured_snapshot[1].st_mode) != mode)):

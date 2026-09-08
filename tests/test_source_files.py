@@ -158,7 +158,8 @@ os._exit(74)
     recovery = tmp_path / '.letracode-recovery' / target.name
     old = list(recovery.glob('*.before'))
     assert len(old) == 1 and old[0].read_bytes() == b'original\r\n'
-    assert stat.S_IMODE(old[0].stat().st_mode) == 0o755
+    expected_mode = 0o666 if fs.IS_WINDOWS else 0o755
+    assert stat.S_IMODE(old[0].stat().st_mode) == expected_mode
     for read in (lambda: read_text(target), lambda: source_files.snapshot(target)):
         with pytest.raises(ValueError, match='recovery|recoverable') as error:
             read()
@@ -170,7 +171,7 @@ os._exit(74)
             assert any(path.read_bytes() == b'model edit\r\n' for path in recovery.glob('*.proposed'))
         else:
             assert target.read_bytes() == b'model edit\r\n'
-            assert stat.S_IMODE(target.stat().st_mode) == 0o755
+            assert stat.S_IMODE(target.stat().st_mode) == expected_mode
 
 
 @pytest.mark.parametrize('stage', ['already', 'staged', 'captured'])
@@ -257,7 +258,10 @@ def test_create_source_uses_private_mode_and_preserves_exact_bytes(tmp_path, sou
     assert missing['raw'] is None and missing['sha256'] is None
     result = source_files.publish(target, b'\xef\xbb\xbf# created\r\n', None)
     assert result['raw'] == target.read_bytes() == b'\xef\xbb\xbf# created\r\n'
-    assert result['mode'] == stat.S_IMODE(target.stat().st_mode) == 0o600
+    # Windows reports ordinary writable bits; security is inherited through
+    # ACLs. POSIX creation must retain the explicit private permission mode.
+    expected_mode = 0o666 if fs.IS_WINDOWS else 0o600
+    assert missing['mode'] == result['mode'] == stat.S_IMODE(target.stat().st_mode) == expected_mode
 
 
 @pytest.mark.parametrize('raw', [b'not\x00text', b'not\xffutf8'])

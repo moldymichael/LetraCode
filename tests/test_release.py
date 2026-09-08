@@ -37,19 +37,24 @@ def test_portable_archive_preserves_binary_files_and_folder_layout(tmp_path):
         assert all(archive.read(name) == payload for name in archive.namelist())
 
 
-def test_release_archives_include_both_platform_installers_and_are_reproducible(tmp_path):
+def test_source_archives_include_platform_build_inputs_and_are_reproducible(tmp_path):
     output = tmp_path / "Release Output With Spaces"
     command = [sys.executable, str(ROOT / "packaging/build-release.py"), "--output-dir", str(output)]
     subprocess.run(command, check=True, capture_output=True)
     zipped = output / "LetraCode-0.3.0.zip"
-    assert zipped.is_file(), "Windows users need an extractable source ZIP"
+    assert zipped.is_file(), "Source developers need an extractable ZIP"
     first = {file.name: file.read_bytes() for file in output.iterdir()}
     with zipfile.ZipFile(zipped) as archive:
         names = set(archive.namelist())
         assert archive.testzip() is None
         archive.extractall(tmp_path / "Extracted Source")
     prefix = "LetraCode-0.3.0/"
-    for name in ("install.ps1", "uninstall.ps1", "install.sh", "uninstall.sh", "packaging/windows_install.py", "packaging/windows-bootstrap.ps1", "tests/test_windows_install.py", "tests/test_release.py", "tests/conftest.py"):
+    for name in (
+        "install.sh", "uninstall.sh", "packaging/build-windows.py",
+        "packaging/windows-launcher.py", "packaging/windows.iss",
+        "packaging/windows-requirements.txt", "packaging/smoke-windows.py",
+        "tests/test_release.py", "tests/conftest.py",
+    ):
         assert prefix + name in names
     assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)
     assert not any("packaging-brief" in name or "packaging-report" in name for name in names)

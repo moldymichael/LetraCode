@@ -32,6 +32,7 @@ from contextlib import contextmanager
 from .filesystem import O_DIRECTORY, O_NOFOLLOW, O_NONBLOCK, windows_component
 
 kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+security = ctypes.WinDLL('advapi32', use_last_error=True)
 INVALID_HANDLE = ctypes.c_void_p(-1).value
 READ, WRITE, DELETE = 0x80000000, 0x40000000, 0x00010000
 READ_ATTRIBUTES = 0x80
@@ -63,6 +64,14 @@ class Overlapped(ctypes.Structure):
                 ('offset', w.DWORD), ('offset_high', w.DWORD), ('event', w.HANDLE)]
 
 
+class AclSizeInfo(ctypes.Structure):
+    _fields_ = [('count', w.DWORD), ('used', w.DWORD), ('free', w.DWORD)]
+
+
+class AceHeader(ctypes.Structure):
+    _fields_ = [('type', w.BYTE), ('flags', w.BYTE), ('size', w.WORD)]
+
+
 kernel.CreateFileW.argtypes = [w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE]
 kernel.CreateFileW.restype = w.HANDLE
 kernel.GetFinalPathNameByHandleW.argtypes = [w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD]
@@ -79,6 +88,20 @@ kernel.LockFileEx.argtypes = [w.HANDLE, w.DWORD, w.DWORD, w.DWORD, w.DWORD, ctyp
 kernel.LockFileEx.restype = w.BOOL
 kernel.UnlockFileEx.argtypes = [w.HANDLE, w.DWORD, w.DWORD, w.DWORD, ctypes.POINTER(Overlapped)]
 kernel.UnlockFileEx.restype = w.BOOL
+kernel.LocalFree.argtypes = [w.HLOCAL]
+kernel.LocalFree.restype = w.HLOCAL
+security.GetSecurityInfo.argtypes = [w.HANDLE, ctypes.c_int, w.DWORD,
+    ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.LPVOID),
+    ctypes.POINTER(w.LPVOID), ctypes.POINTER(w.LPVOID)]
+security.GetSecurityInfo.restype = w.DWORD
+security.GetSecurityDescriptorControl.argtypes = [w.LPVOID, ctypes.POINTER(w.WORD), ctypes.POINTER(w.DWORD)]
+security.GetSecurityDescriptorControl.restype = w.BOOL
+security.IsValidAcl.argtypes = [w.LPVOID]
+security.IsValidAcl.restype = w.BOOL
+security.GetAclInformation.argtypes = [w.LPVOID, w.LPVOID, w.DWORD, ctypes.c_int]
+security.GetAclInformation.restype = w.BOOL
+security.GetAce.argtypes = [w.LPVOID, w.DWORD, ctypes.POINTER(w.LPVOID)]
+security.GetAce.restype = w.BOOL
 
 
 kernel.CompareStringOrdinal.argtypes = [w.LPCWSTR, ctypes.c_int, w.LPCWSTR, ctypes.c_int, w.BOOL]
@@ -304,6 +327,42 @@ def fchmod(fd, mode):
         fd.handle
     else:
         msvcrt.get_osfhandle(fd)
+
+
+def check_replacement_permissions(fd):
+    """Refuse ACLs that a fresh file inheriting its directory cannot preserve.
+
+    Inspect the retained readable handle (GENERIC_READ includes READ_CONTROL),
+    never a separately resolved pathname. Do not approximate custom access
+    controls using POSIX mode bits or replace them with inherited defaults.
+    GetSecurityInfo allocates the descriptor; its DACL/ACE pointers live until
+    LocalFree. Only ordinary inherited allow/deny entries are supported.
+    """
+    refusal = 'File has custom or unreadable Windows permissions; saving was refused to preserve its access controls'
+    descriptor, dacl = w.LPVOID(), w.LPVOID()
+    result = security.GetSecurityInfo(msvcrt.get_osfhandle(fd), 1, 4,
+        None, None, ctypes.byref(dacl), None, ctypes.byref(descriptor))
+    try:
+        if result:
+            raise PermissionError(refusal) from ctypes.WinError(result)
+        control, revision = w.WORD(), w.DWORD()
+        if (not descriptor or not security.GetSecurityDescriptorControl(descriptor, ctypes.byref(control), ctypes.byref(revision)) or
+                revision.value != 1 or not control.value & 0x4 or control.value & 0x1000 or
+                not dacl or not security.IsValidAcl(dacl)):
+            raise PermissionError(refusal)
+        details = AclSizeInfo()
+        if not security.GetAclInformation(dacl, ctypes.byref(details), ctypes.sizeof(details), 2) or not details.count:
+            raise PermissionError(refusal)
+        for index in range(details.count):
+            ace = w.LPVOID()
+            if not security.GetAce(dacl, index, ctypes.byref(ace)) or not ace:
+                raise PermissionError(refusal)
+            header = AceHeader.from_address(ace.value)
+            if header.size < ctypes.sizeof(AceHeader) or header.type not in (0, 1) or not header.flags & 0x10:
+                raise PermissionError(refusal)
+    finally:
+        if descriptor:
+            kernel.LocalFree(descriptor)
 
 
 def unlink(path, *, dir_fd=None):

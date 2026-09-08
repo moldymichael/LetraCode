@@ -15,11 +15,11 @@ def engine_setup_help() -> str:
 
 def qt_install_help() -> str:
     if is_windows():
-        return 'LetraCode needs PySide6. Run install.ps1 again, or install PySide6 in your Python virtual environment.'
+        return 'LetraCode needs PySide6. In your Python virtual environment, run: python -m pip install PySide6'
     return 'LetraCode needs the system Qt bindings. On Fedora run: sudo dnf install python3-pyside6'
 
 
 def pdf_install_help() -> str:
     if is_windows():
-        return 'PDF support needs pypdf. Run install.ps1 again, or install pypdf in your Python virtual environment.'
+        return 'PDF support needs pypdf. In your Python virtual environment, run: python -m pip install pypdf'
     return 'PDF support needs the Fedora package python3-pypdf.'

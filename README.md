@@ -149,10 +149,6 @@ system Qt packages.
 
 Windows source development requires native Python 3.11 or newer. From the
 source directory, run `python -m pip install .` and `python -m letracode`.
-The optional `install.ps1` source installer creates a private virtual environment
-in `%LOCALAPPDATA%\letracode-app`; it requires Python with pip/venv and internet
-access. Use its `uninstall.ps1` before switching from that development installation
-to the packaged installer. Both preserve `%LOCALAPPDATA%\letracode`.
 The downloadable setup executable is the normal installation path.
 
 Build the Fedora `.run` and reproducible source `.tar.gz`/`.zip` archives with:
