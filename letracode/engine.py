@@ -26,10 +26,13 @@ import time
 from typing import BinaryIO, Callable
 import weakref
 
+from .budgeting import RequestUsage, fallback_usage
+
 
 _HOST = "127.0.0.1"
 _MODEL_LOAD_TIMEOUT = 180.0
 _REQUEST_TIMEOUT = 300.0
+_BUDGET_REQUEST_TIMEOUT = 5.0
 _STOP_TIMEOUT = 2.0
 _LOG_LIMIT = 1_048_576
 _LOG_TAIL_LIMIT = 32_768
@@ -70,6 +73,14 @@ class EngineError(RuntimeError):
     """A configuration, process, or local protocol failure."""
 
 
+class ContextOverflowError(EngineError):
+    """The intact request cannot fit with its reserved response capacity."""
+
+
+class _BudgetUnavailable(Exception):
+    pass
+
+
 class Cancelled(Exception):
     """The active local inference operation was cancelled."""
 
@@ -101,6 +112,8 @@ class LocalEngine:
         self._active_connection: http.client.HTTPConnection | None = None
         self._active_response: http.client.HTTPResponse | None = None
         self._diagnostic_tail = ""
+        self._budget_unavailable = False
+        self._usage_cache = None
         _INSTANCES.add(self)
 
     @property
@@ -170,6 +183,8 @@ class LocalEngine:
                 self._port = port
                 self._api_token = token
                 self._diagnostic_tail = ""
+                self._budget_unavailable = False
+                self._usage_cache = None
             self._log_thread = threading.Thread(
                 target=self._pump_log,
                 args=(process.stdout, token),
@@ -220,6 +235,7 @@ class LocalEngine:
         if not self._operation_lock.acquire(blocking=False):
             raise EngineError("A local model completion is already in progress")
         watcher_done = threading.Event()
+        watcher = None
         deadline_expired = threading.Event()
         connection: http.client.HTTPConnection | None = None
         response: http.client.HTTPResponse | None = None
@@ -232,20 +248,29 @@ class LocalEngine:
             if cancel.is_set() or self._cancel_requested.is_set():
                 self.stop()
                 raise Cancelled("Local model completion was cancelled")
+            usage = self._request_usage(payload, messages, tools, cancel, thinking)
+            if usage.total_tokens > self.config.context_size:
+                raise ContextOverflowError(
+                    f'The local model context window cannot fit this request: '
+                    f'{usage.prompt_tokens} prompt + {usage.reply_tokens} reserved reply + '
+                    f'{usage.safety_tokens} safety tokens ({usage.method}), '
+                    f'context {self.config.context_size}.')
             with self._state_lock:
                 port = self._port
                 token = self._api_token
                 process = self._process
             if port is None or token is None or process is None:
+                self._raise_if_cancelled(cancel)
                 raise EngineError("The local model server is not running")
 
             deadline = time.monotonic() + _REQUEST_TIMEOUT
-            threading.Thread(
+            watcher = threading.Thread(
                 target=self._watch_external_cancel,
                 args=(cancel, watcher_done, deadline, deadline_expired),
                 name="letracode-engine-cancel",
                 daemon=True,
-            ).start()
+            )
+            watcher.start()
             connection = http.client.HTTPConnection(_HOST, port, timeout=_REQUEST_TIMEOUT)
             with self._state_lock:
                 self._active_connection = connection
@@ -307,6 +332,8 @@ class LocalEngine:
             raise EngineError(f"Local model connection failed: {exc}") from exc
         finally:
             watcher_done.set()
+            if watcher is not None:
+                watcher.join()
             with self._state_lock:
                 if self._active_response is response:
                     self._active_response = None
@@ -343,6 +370,7 @@ class LocalEngine:
         }
         if tools:
             body["tools"] = tools
+            body["parallel_tool_calls"] = False
         try:
             payload = json.dumps(
                 body, ensure_ascii=False, separators=(",", ":"), allow_nan=False
@@ -352,6 +380,118 @@ class LocalEngine:
         if len(payload) > _MAX_REQUEST_BYTES:
             raise EngineError("The chat request is too large for the local engine")
         return payload
+
+    def request_usage(self, messages, tools, cancel, thinking=False) -> RequestUsage:
+        """Count the runtime-formatted prompt without generating model output."""
+        if not self._operation_lock.acquire(blocking=False):
+            raise EngineError("A local model completion is already in progress")
+        try:
+            if cancel.is_set():
+                raise Cancelled('Request counting was cancelled')
+            self._cancel_requested.clear()
+            payload = self._completion_payload(messages, tools, thinking)
+            self.start(cancel)
+            return self._request_usage(payload, messages, tools, cancel, thinking)
+        finally:
+            self._operation_lock.release()
+
+    def _request_usage(self, payload, messages, tools, cancel, thinking):
+        self._raise_if_cancelled(cancel)
+        if self._usage_cache and self._usage_cache[0] == payload:
+            return self._usage_cache[1]
+        if not self._budget_unavailable:
+            try:
+                body = json.loads(payload)
+                formatted = self._budget_json('/apply-template', body, cancel)
+                prompt = formatted.get('prompt')
+                if not isinstance(prompt, str):
+                    raise _BudgetUnavailable()
+                if tools:
+                    # Older servers may accept this endpoint but ignore tools.
+                    # Do not report an exact count when definitions are omitted.
+                    without_tools = dict(body)
+                    without_tools.pop('tools', None)
+                    without_tools.pop('parallel_tool_calls', None)
+                    bare = self._budget_json('/apply-template', without_tools, cancel)
+                    if bare.get('prompt') == prompt:
+                        raise _BudgetUnavailable()
+                tokenized = self._budget_json('/tokenize', {
+                    'content': prompt, 'add_special': True, 'parse_special': True,
+                    'with_pieces': False}, cancel)
+                tokens = tokenized.get('tokens')
+                if not isinstance(tokens, list) or not all(type(t) is int for t in tokens):
+                    raise _BudgetUnavailable()
+                usage = RequestUsage(len(tokens), self.config.max_tokens, 128, 'runtime tokenizer')
+                self._usage_cache = (payload, usage)
+                return usage
+            except _BudgetUnavailable:
+                self._budget_unavailable = True
+        usage = fallback_usage(messages, tools, self.config.max_tokens, thinking)
+        self._usage_cache = (payload, usage)
+        return usage
+
+    def _budget_json(self, path, body, cancel):
+        """Bounded authenticated loopback call; never follow a redirect."""
+        self._raise_if_cancelled(cancel)
+        with self._state_lock:
+            port, token = self._port, self._api_token
+        if port is None or token is None:
+            self._raise_if_cancelled(cancel)
+            raise EngineError('The local model server is not running')
+        payload = json.dumps(body, ensure_ascii=False, separators=(',', ':'), allow_nan=False).encode('utf-8')
+        if len(payload) > _MAX_REQUEST_BYTES:
+            raise _BudgetUnavailable()
+        connection = http.client.HTTPConnection(_HOST, port, timeout=_BUDGET_REQUEST_TIMEOUT)
+        response = None
+        watcher_done, deadline_expired = threading.Event(), threading.Event()
+        deadline = time.monotonic() + _BUDGET_REQUEST_TIMEOUT
+        watcher = threading.Thread(target=self._watch_external_cancel,
+            args=(cancel, watcher_done, deadline, deadline_expired),
+            name='letracode-budget-cancel', daemon=True)
+        watcher.start()
+        with self._state_lock:
+            self._active_connection = connection
+        try:
+            connection.request('POST', path, body=payload, headers={
+                'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'})
+            response = connection.getresponse()
+            with self._state_lock:
+                self._active_response = response
+            raw = response.read(_MAX_REQUEST_BYTES + 1)
+            self._raise_if_cancelled(cancel)
+            if response.status in (400, 404, 405, 422, 501):
+                raise _BudgetUnavailable()
+            if response.status != 200:
+                raise EngineError(f'Local model budget endpoint failed (HTTP {response.status})')
+            if len(raw) > _MAX_REQUEST_BYTES:
+                raise _BudgetUnavailable()
+            try:
+                result = json.loads(raw)
+            except (ValueError, UnicodeDecodeError):
+                raise _BudgetUnavailable() from None
+            if not isinstance(result, dict):
+                raise _BudgetUnavailable()
+            return result
+        except Cancelled:
+            if deadline_expired.is_set():
+                raise EngineError('Local model budget request timed out at its deadline') from None
+            raise
+        except (OSError, http.client.HTTPException, ValueError, AttributeError) as exc:
+            if deadline_expired.is_set():
+                raise EngineError('Local model budget request timed out at its deadline') from exc
+            self._raise_if_cancelled(cancel)
+            raise EngineError(f'Local model budget connection failed: {exc}') from exc
+        finally:
+            watcher_done.set()
+            watcher.join()
+            with self._state_lock:
+                if self._active_connection is connection:
+                    self._active_connection = None
+                if self._active_response is response:
+                    self._active_response = None
+            if response is not None:
+                response.close()
+            connection.close()
 
     def _watch_external_cancel(
         self, cancel: threading.Event, watcher_done: threading.Event,
@@ -585,7 +725,7 @@ class LocalEngine:
         if "context" in lowered and any(
             marker in lowered for marker in ("exceed", "size", "full", "too large", "kv")
         ):
-            return EngineError(f"The local model context window is full: {detail}")
+            return ContextOverflowError(f"The local model context window is full: {detail}")
         if used_tools and "tool" in lowered and any(
             marker in lowered for marker in ("template", "support", "jinja", "function")
         ):

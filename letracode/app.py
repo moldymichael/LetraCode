@@ -26,13 +26,15 @@ def main():
     app.setApplicationVersion(__version__)
     app.setOrganizationName('LetraCode')
     app.setDesktopFileName('io.letracode.LetraCode')
-    from .store import Store
+    from .store import Store, data_home
     try:
-        store = Store(args.data_dir)
-        lock = QLockFile(str(store.directory/'app.lock'))
+        directory = Path(args.data_dir or data_home()).expanduser().absolute()
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        lock = QLockFile(str(directory/'app.lock'))
         lock.setStaleLockTime(0)
         if not lock.tryLock(0):
             QMessageBox.information(None,'LetraCode is already open','Another LetraCode instance is using this data folder. Switch to its window to continue.'); return 0
+        store = Store(directory)
         store.recover_interrupted()
         from .ui import MainWindow
         window = MainWindow(store)

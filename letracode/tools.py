@@ -2,21 +2,19 @@
 from __future__ import annotations
 
 import difflib
-import hashlib
 import json
 import os
 import selectors
 import signal
-import stat
 import subprocess
-import tempfile
 import threading
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from .context import ProjectFiles, read_text, readable_without_approval, sensitive
+from . import source_files
+from .context import ProjectFiles, line_starts, read_source, readable_without_approval, sensitive
 from .web import fetch_public, search_results, search_url, validate_url
 
 
@@ -37,11 +35,20 @@ def schema(name, description, properties, required):
 
 
 STRING = {'type':'string'}
+MEMORY_SCOPE = {'type':'string','enum':['global','project','learning']}
+SAVED_READ_TOOLS = ('read_memory', 'list_memory', 'search_memory', 'read_tool_result', 'list_tool_results')
 TOOL_SCHEMAS = [
+    schema('read_memory','Read Memory by relative path in global or current project scope. Follow next_offset. Omit path only for a legacy scope file.', {'scope':MEMORY_SCOPE,'path':STRING,'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['scope']),
+    schema('list_memory','List Memory paths in global or current project scope. Bounded pages; follow next_offset. Optional path filters a folder.', {'scope':MEMORY_SCOPE,'path':STRING,'offset':{'type':'integer'},'limit':{'type':'integer'}}, ['scope']),
+    schema('search_memory','Search Memory text in global or current project scope. Matches are partial; use read_memory for full pages.', {'scope':MEMORY_SCOPE,'query':STRING,'limit':{'type':'integer'}}, ['scope','query']),
+    schema('remember','Append reviewed text to an existing Memory path in global/current project scope. Omit path for a legacy file; only its exact learning grant bypasses review. Identity/preferences are user-editable only. No training.', {'scope':MEMORY_SCOPE,'path':STRING,'text':STRING}, ['scope','text']),
+    schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt or list_tool_results and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
+    schema('list_tool_results','Discover saved tool results from this chat, including earlier paused or compacted turns, without rerunning actions. Metadata is partial; use read_tool_result for full saved output. Start after_id=0. For each next page keep through_id and set after_id=next_after_id. limit is 1–20, default 10.', {'after_id':{'type':'integer'},'through_id':{'type':'integer'},'limit':{'type':'integer'}}, []),
     schema('list_files','List a local folder (no recursive enumeration). Outside project links requires approval.', {'path':STRING}, ['path']),
-    schema('read_file','Read a UTF-8, Markdown, source, PDF or DOCX file with numbered lines. Use start_line and max_lines for long files.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'}}, ['path']),
-    schema('search_project','Search linked project text files for evidence. Returns diverse passages with paths and line numbers.', {'query':STRING}, ['query']),
-    schema('write_file','Create or replace a UTF-8 text file. User must approve the exact diff; old contents are backed up.', {'path':STRING,'content':STRING}, ['path','content']),
+    schema('read_file','Read numbered lines (start_line/max_lines) or exact Unicode character pages (offset/max_chars, default 4000, range 1–16000). Never mix modes. Follow next_offset with offset, including after a cut numbered line. Compare whole-source sha256 between pages for guarded UTF-8 edits. PDF/DOCX are read-only: source_sha256 and extraction.version identify evidence, never edit authority. Inspect source_truncated and extraction coverage even at EOF.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['path']),
+    schema('search_project','Search bounded overlapping character windows of linked source text. Returns diverse partial passages with paths, source lines and character offsets; use read_file to page further.', {'query':STRING}, ['query']),
+    schema('write_file','Create or replace UTF-8 text with an approved diff and backup. expected_sha256 must match read_file for an existing file; null means create only if absent. Prefer edit_file for a small change.', {'path':STRING,'content':STRING,'expected_sha256':{'type':['string','null']}}, ['path','content','expected_sha256']),
+    schema('edit_file','Replace exactly one nonempty old_text fragment in UTF-8 source; new_text may be empty. Supply the latest whole-file sha256 from read_file or an edit result. Rejects stale or ambiguous edits. Requires diff approval and backs up old bytes.', {'path':STRING,'expected_sha256':STRING,'old_text':STRING,'new_text':STRING}, ['path','expected_sha256','old_text','new_text']),
     schema('run_command','Ask user to approve a shell command. Runs unsandboxed with their account; timeout and output cap apply. Never bypass a denied action.', {'command':STRING,'cwd':STRING,'timeout':{'type':'integer'},'reason':STRING}, ['command','cwd']),
     schema('web_search','Search the public internet. User approves the exact query. Do not send private project text or secrets.', {'query':STRING}, ['query']),
     schema('fetch_url','Retrieve a public HTTP/HTTPS text page for research. User approves the full URL; cite the returned URL.', {'url':STRING}, ['url']),
@@ -49,7 +56,8 @@ TOOL_SCHEMAS = [
 
 
 class ToolExecutor:
-    def __init__(self, roots, data_dir, approve, cancel, web_enabled=True, computer_enabled=True):
+    def __init__(self, roots, data_dir, approve, cancel, web_enabled=True, computer_enabled=True, *, store=None, chat_id=None):
+        self.store, self.chat_id = store, chat_id
         self.roots = list(roots)
         self.data_dir = Path(data_dir)
         self.approve = approve
@@ -77,21 +85,24 @@ class ToolExecutor:
         if not readable_without_approval(path, self.roots):
             self._ask(ApprovalRequest('Read outside linked project files?', f'Path: {path}\nResolved path: {path.resolve()}\n\nContents will be available to the local model.', 'read', 'This file or folder is outside the normal project scope, or has a sensitive/hidden path.'))
 
+    def _validate_arguments(self, name, args):
+        if not isinstance(args, dict):
+            raise ValueError('Tool arguments must be an object.')
+        known = next((s['function'] for s in TOOL_SCHEMAS if s['function']['name'] == name), None)
+        if not known:
+            raise ValueError('Unknown tool.')
+        if not set(args) <= set(known['parameters']['properties']):
+            raise ValueError('Unknown argument.')
+
     def execute(self, name, args):
         try:
             if self.cancel.is_set():
                 raise Denied('Cancelled')
-            if not isinstance(args, dict):
-                raise ValueError('Tool arguments must be an object.')
-            known = next((s['function'] for s in TOOL_SCHEMAS if s['function']['name'] == name), None)
-            if not known:
-                raise ValueError('Unknown tool.')
-            if not set(args) <= set(known['parameters']['properties']):
-                raise ValueError('Unknown argument.')
+            self._validate_arguments(name, args)
             if name in ('web_search','fetch_url'):
                 if not self.web_enabled:
                     raise Denied('Internet access is turned off.')
-            elif not self.computer_enabled:
+            elif name not in SAVED_READ_TOOLS and not self.computer_enabled:
                 raise Denied('Computer tools are turned off.')
             result = getattr(self, '_' + name)(args)
             return json.dumps(result, ensure_ascii=False)
@@ -99,6 +110,154 @@ class ToolExecutor:
             return json.dumps({'denied':str(error)})
         except Exception as error:
             return json.dumps({'error':str(error)[:2500]})
+
+    def _memory_scope(self, args):
+        if self.store is None or not self.chat_id:
+            raise ValueError('Memory requires an active saved chat.')
+        chat = self.store.chat(self.chat_id)
+        if not chat:
+            raise ValueError('This chat no longer exists.')
+        scope = self._str(args, 'scope', 20)
+        if scope not in ('global', 'project', 'learning'):
+            raise ValueError('Memory scope must be global, project or learning. Identity is user-editable only.')
+        project_id = chat['project_id'] if scope == 'project' else None
+        if scope == 'project' and not project_id:
+            raise ValueError('Project memory requires a project chat. Choose a project or explicitly use global scope.')
+        return scope, project_id
+
+    def _read_memory(self, args):
+        scope, project_id = self._memory_scope(args)
+        if 'path' in args:
+            return self.store.memory.read_file_page(self._memory_relative(args, scope), project_id=project_id,
+                offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
+        return self.store.strand.read_page(scope, project_id=project_id,
+            offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
+
+    def _memory_relative(self, args, scope, *, folder=False):
+        if scope == 'learning':
+            raise ValueError('Use global or project scope with a Memory path.')
+        path = args.get('path', '')
+        if folder and path == '':
+            return path
+        path = self._str(args, 'path')
+        if '\\' in path or ':' in path or any(not part or part.startswith('.') for part in path.split('/')):
+            raise ValueError('Use a relative Memory path without hidden or traversal components.')
+        return path
+
+    def _list_memory(self, args):
+        scope, project_id = self._memory_scope(args)
+        prefix = self._memory_relative(args, scope, folder=True)
+        offset, limit = args.get('offset', 0), args.get('limit', 50)
+        if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 100:
+            raise ValueError('Invalid Memory list page bounds.')
+        rows = self.store.memory.entries(project_id=project_id)
+        if prefix:
+            rows = [row for row in rows if row['path'] == prefix or row['path'].startswith(prefix + '/')]
+        end = min(len(rows), offset + limit)
+        return {'scope': scope, 'entries': rows[offset:end], 'offset': offset,
+                'next_offset': end if end < len(rows) else None, 'total_entries': len(rows)}
+
+    def _search_memory(self, args):
+        scope, project_id = self._memory_scope(args)
+        if scope == 'learning':
+            raise ValueError('Use global or project scope to search Memory.')
+        query = self._str(args, 'query', 1000)
+        limit = args.get('limit', 10)
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError('Memory search limit must be 1–20.')
+        return {'scope': scope, 'results': self.store.memory.search(query, project_id=project_id, limit=limit),
+                'partial': True, 'note': 'Bounded matches; use read_memory for full file pages.'}
+
+    def _remember(self, args):
+        scope, project_id = self._memory_scope(args)
+        text = self._str(args, 'text', 8000)
+        if 'path' in args:
+            relative = self._memory_relative(args, scope)
+            snapshot = self.store.memory.file_snapshot(relative, project_id)
+            if snapshot.get('legacy_scope') in ('identity', 'preferences'):
+                raise ValueError('Identity and preferences are user-editable only.')
+            updated = snapshot['text'].rstrip() + ('\n\n' if snapshot['text'].strip() else '') + text + '\n'
+            diff = '\n'.join(difflib.unified_diff(snapshot['text'].splitlines(), updated.splitlines(),
+                fromfile=str(snapshot['path']), tofile=str(snapshot['path']), lineterm=''))
+            self._ask(ApprovalRequest('Save this Memory update?',
+                f"Scope: {scope}\nPath: {snapshot['path']}\n\nText to save:\n{text}\n\nAppend preview:\n{diff}",
+                'memory', 'Save only if the text and destination are right. This save has history and Undo.'))
+            if self.cancel.is_set():
+                raise Denied('Cancelled before saving memory.')
+            return self.store.memory.replace_file(relative, updated, snapshot['sha256'], project_id,
+                origin=f'chat:{self.chat_id}; user approved', expected_file_id=snapshot['file_id'],
+                expected_entry_identity=snapshot['entry_identity'])
+        snapshot = self.store.strand.snapshot(scope, project_id)
+        grant = scope == 'learning' and self.store.setting('strand_learning_grant', False) is True
+        if not grant:
+            diff = '\n'.join(difflib.unified_diff(snapshot['text'].splitlines(),
+                (snapshot['text'].rstrip() + '\n\n' + text).splitlines(),
+                fromfile=str(snapshot['path']), tofile=str(snapshot['path']), lineterm=''))
+            self._ask(ApprovalRequest('Save this Memory update?',
+                f"Scope: {scope}\nPath: {snapshot['path']}\n\nText to save:\n{text}\n\nAppend preview (the saved entry also records its ID, date and origin):\n{diff}",
+                'memory', 'Save only if the text and scope are right. You can inspect the ordinary file and Undo this save.'))
+        if self.cancel.is_set():
+            raise Denied('Cancelled before saving memory.')
+        return self.store.strand.remember(scope, text, project_id=project_id,
+            origin=f'chat:{self.chat_id}; ' + ('learning grant' if grant else 'user approved'),
+            expected_sha256=snapshot['sha256'])
+
+    def _read_tool_result(self, args):
+        if self.store is None or not self.chat_id:
+            raise ValueError('Saved result retrieval requires an active chat.')
+        return self.store.tool_result_page(self.chat_id, args.get('result_id'),
+            offset=args.get('offset', 0), max_chars=args.get('max_chars', 4000))
+
+    def _list_tool_results(self, args):
+        if self.store is None or not self.chat_id:
+            raise ValueError('Saved result retrieval requires an active chat.')
+        after_id, limit = args.get('after_id', 0), args.get('limit', 10)
+        if type(after_id) is not int or after_id < 0 or type(limit) is not int or not 1 <= limit <= 20:
+            raise ValueError('after_id must be nonnegative and limit must be 1–20.')
+        through_id = args.get('through_id')
+        if 'through_id' in args and (type(through_id) is not int or through_id < 0):
+            raise ValueError('through_id must be a nonnegative integer from the first page.')
+        if through_id is None:
+            through_id = self.store.rows(
+                "SELECT COALESCE(MAX(id), 0) AS id FROM messages WHERE chat_id=? AND role='tool'",
+                (self.chat_id,))[0]['id']
+        # The worker saves these pages too. Freeze the upper bound so a reader
+        # cannot chase newly appended catalog pages forever.
+        rows = self.store.rows(
+            "SELECT * FROM messages WHERE chat_id=? AND role='tool' AND id>? AND id<=? ORDER BY id LIMIT ?",
+            (self.chat_id, after_id, through_id, limit + 1))
+        results = []
+        for row in rows[:limit]:
+            message = json.loads(row['payload']).get('message', {})
+            content = message.get('content', row['content'])
+            if not isinstance(content, str):
+                content = json.dumps(content, ensure_ascii=False)
+            item = {'result_id': row['id'], 'created': row['created'], 'status': row['status']}
+
+            def bounded(value):
+                if not isinstance(value, (str, int, float, bool, type(None))):
+                    value = json.dumps(value, ensure_ascii=False)
+                if isinstance(value, str) and len(value) > 240:
+                    item['metadata_truncated'] = True
+                    return value[:240]
+                return value
+
+            item.update(name=bounded(message.get('name', '')),
+                        tool_call_id=bounded(message.get('tool_call_id', '')),
+                        total_chars=len(content), preview=bounded(content))
+            try:
+                outcome = json.loads(content)
+            except (TypeError, json.JSONDecodeError):
+                outcome = None
+            if isinstance(outcome, dict):
+                item['outcome'] = {key: bounded(outcome[key]) for key in (
+                    'denied', 'error', 'executed', 'exit_code', 'timed_out', 'cancelled',
+                    'output_limit_reached', 'code') if key in outcome}
+                item['source'] = {key: bounded(outcome[key]) for key in (
+                    'path', 'url', 'query', 'result_id') if key in outcome}
+            results.append(item)
+        return {'results': results, 'through_id': through_id,
+                'next_after_id': results[-1]['result_id'] if len(rows) > limit else None}
 
     def _list_files(self, args):
         path = self._path(args)
@@ -115,13 +274,52 @@ class ToolExecutor:
     def _read_file(self, args):
         path = self._path(args)
         self._read_permission(path)
+        character_mode = 'offset' in args or 'max_chars' in args
+        if character_mode and ('start_line' in args or 'max_lines' in args):
+            raise ValueError('Do not mix line and character paging arguments.')
+        offset, max_chars = args.get('offset', 0), args.get('max_chars', 4000)
+        if character_mode and (type(offset) is not int or offset < 0 or
+                               type(max_chars) is not int or not 1 <= max_chars <= 16000):
+            raise ValueError('offset must be nonnegative and max_chars must be 1–16000 integers.')
         start, maximum = args.get('start_line',1), args.get('max_lines',180)
         if type(start) is not int or type(maximum) is not int or start < 1 or not 1 <= maximum <= 400:
             raise ValueError('start_line must be positive and max_lines must be 1–400.')
-        lines = read_text(path).splitlines()
+        path = path.resolve()
+        source = read_source(path)
+        contents = source.pop('text')
+        common = {'path': str(path), 'total_chars': len(contents), **source}
+        if character_mode:
+            text = contents[offset:offset + max_chars]
+            following = offset + len(text)
+            next_offset = following if following < len(contents) else None
+            return {**common, 'offset': offset, 'text': text, 'next_offset': next_offset,
+                    'coverage': {'version': 1, 'representation': 'raw-characters',
+                                 'ranges': [[offset, following]] if text else []},
+                    'output_truncated': next_offset is not None,
+                    'truncated': next_offset is not None or source['source_truncated']}
+        lines = contents.splitlines()
+        starts = line_starts(contents)
         end = min(len(lines), start + maximum - 1)
-        text = '\n'.join(f'{i+1}: {lines[i]}' for i in range(start-1, end))
-        return {'path':str(path.resolve()),'start_line':start,'total_lines':len(lines),'text':text[:16000],'truncated':end<len(lines) or len(text)>16000}
+        parts, length = [], 0
+        next_offset = starts[end] if end < len(lines) else None
+        for i in range(start - 1, end):
+            prefix = ('\n' if parts else '') + f'{i + 1}: '
+            available = 16000 - length
+            part = (prefix + lines[i])[:available]
+            parts.append(part)
+            length += len(part)
+            if len(prefix) + len(lines[i]) > available:
+                next_offset = starts[i] + max(0, available - len(prefix))
+                break
+        output_truncated = next_offset is not None
+        coverage_start = starts[start - 1] if start <= len(lines) else len(contents)
+        coverage_end = next_offset if next_offset is not None else len(contents)
+        return {**common, 'start_line': start, 'total_lines': len(lines),
+                'text': ''.join(parts), 'next_offset': next_offset,
+                'coverage': {'version': 1, 'representation': 'numbered-lines',
+                             'ranges': [[coverage_start, coverage_end]] if coverage_start < coverage_end else []},
+                'output_truncated': output_truncated,
+                'truncated': output_truncated or source['source_truncated']}
 
     def _search_project(self, args):
         query = self._str(args, 'query', 500)
@@ -129,31 +327,55 @@ class ToolExecutor:
         return {'results':hits, 'scope':'Linked files; bounded text search, not an exhaustive analysis.'}
 
     def _write_file(self, args):
-        original = self._path(args)
         content = self._str(args, 'content', 200000)
-        if original.is_symlink():
-            raise ValueError('Writing through a symlink is blocked; select the real path explicitly.')
-        path = original.resolve()
-        if not path.parent.is_dir():
-            raise ValueError('Parent folder does not exist. Create it yourself or approve a separate command.')
-        before = None
-        mode = 0o600
-        if path.exists():
-            if not path.is_file() or path.stat().st_nlink > 1:
-                raise ValueError('Can only replace ordinary files with a single hard link.')
-            before = read_text(path)
-            mode = stat.S_IMODE(path.stat().st_mode)
-        old_bytes = path.read_bytes() if before is not None else None
-        digest = hashlib.sha256(old_bytes).digest() if old_bytes is not None else None
-        diff = '\n'.join(difflib.unified_diff((before or '').splitlines(), content.splitlines(), fromfile=str(path), tofile=str(path), lineterm=''))
+        path, snapshot = self._source_snapshot(args, allow_missing=True)
+        return self._save_source(path, snapshot, content)
+
+    def _edit_file(self, args):
+        old_text, new_text = args.get('old_text'), args.get('new_text')
+        for key, value in (('old_text', old_text), ('new_text', new_text)):
+            if not isinstance(value, str) or '\x00' in value or len(value) > 200000:
+                raise ValueError(f'{key} must be text, at most 200,000 characters, without NUL bytes.')
+        if not old_text:
+            raise ValueError('old_text must be nonempty and occur exactly once.')
+        path, snapshot = self._source_snapshot(args, allow_missing=False)
+        before = snapshot['text']
+        index = before.find(old_text)
+        if index < 0 or before.find(old_text, index + 1) >= 0:
+            raise ValueError('old_text must occur exactly once. Read a larger unique fragment from the current file.')
+        content = before[:index] + new_text + before[index + len(old_text):]
+        return self._save_source(path, snapshot, content)
+
+    def _source_snapshot(self, args, *, allow_missing):
+        if 'expected_sha256' not in args:
+            raise ValueError('expected_sha256 is required: use the hash from read_file, or null only to create a new file.')
+        expected = args['expected_sha256']
+        if expected is not None and (not isinstance(expected, str) or len(expected) != 64
+                or any(char not in '0123456789abcdef' for char in expected)):
+            raise ValueError('expected_sha256 must be a lowercase SHA-256 hash from read_file, or null for a new file.')
+        if expected is None and not allow_missing:
+            raise ValueError('expected_sha256 must be the current hash from read_file for edit_file.')
+        path = self._path(args)
+        if path.suffix.lower() in {'.pdf', '.docx'}:
+            raise ValueError('PDF and DOCX documents are read-only through source tools. Edit an explicit UTF-8 export instead.')
+        snapshot = source_files.snapshot(path, allow_missing=allow_missing)
+        if snapshot['sha256'] != expected:
+            raise ValueError('expected_sha256 does not match: file changed or exists unexpectedly. Read the current file before editing.')
+        return path, snapshot
+
+    def _save_source(self, path, snapshot, content):
+        before, old_bytes = snapshot['text'], snapshot['raw']
         if before == content:
-            return {'path':str(path),'unchanged':True}
-        self._ask(ApprovalRequest('Approve this file edit?', f'Path: {path}\n\n{diff}', 'write', 'The complete diff is shown below. Existing contents will be backed up locally.'))
-        if original.is_symlink() or original.resolve() != path:
-            raise ValueError('Path changed while awaiting approval. No edit was made.')
-        current = path.read_bytes() if path.exists() else None
-        if (hashlib.sha256(current).digest() if current is not None else None) != digest:
-            raise ValueError('File changed while awaiting approval. No edit was made; read the latest version first.')
+            return {'path':str(path), 'unchanged':True, 'sha256':snapshot['sha256']}
+        preview = []
+        for line in difflib.unified_diff((before or '').splitlines(keepends=True),
+                content.splitlines(keepends=True), fromfile=str(path), tofile=str(path)):
+            preview.append(line.replace('\\', '\\\\').replace('\r', '\\r').replace('\ufeff', '\\uFEFF'))
+            if not line.endswith('\n'):
+                preview.append('\n\\ No newline at end of file\n')
+        diff = ''.join(preview)
+        self._ask(ApprovalRequest('Approve this file edit?', f'Path: {path}\n\n{diff}', 'write',
+            'The complete diff is shown below. Preview escapes backslashes, carriage returns (\\r) and BOM (\\uFEFF). Existing contents will be backed up locally.'))
         backup = None
         if old_bytes is not None:
             backup_dir = self.data_dir / 'file-backups'
@@ -162,19 +384,15 @@ class ToolExecutor:
             fd = os.open(backup, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             with os.fdopen(fd,'wb') as file:
                 file.write(old_bytes); file.flush(); os.fsync(file.fileno())
-        fd, temporary = tempfile.mkstemp(prefix='.letracode-', dir=path.parent)
         try:
-            with os.fdopen(fd,'wb') as file:
-                file.write(content.encode('utf-8')); file.flush(); os.fsync(file.fileno())
-            os.chmod(temporary, mode)
-            if self.cancel.is_set():
-                raise Denied('Cancelled before saving.')
-            os.replace(temporary, path)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
-        return {'path':str(path),'written_characters':len(content),'backup':str(backup) if backup else None}
+            saved = source_files.publish(path, content.encode('utf-8'), snapshot['sha256'],
+                mode=snapshot['mode'], cancel=self.cancel)
+        except InterruptedError as error:
+            raise Denied(str(error)) from error
+        return {'path':saved['path'],'written_characters':len(content),'backup':str(backup) if backup else None,
+                'sha256':saved['sha256']}
 
-    def _run_command(self, args):
+    def _command_parameters(self, args):
         command = self._str(args, 'command', 12000)
         cwd = self._path(args, 'cwd').resolve(strict=True)
         if not cwd.is_dir():
@@ -185,6 +403,18 @@ class ToolExecutor:
         reason = args.get('reason','')
         if not isinstance(reason, str):
             raise ValueError('Reason must be text.')
+        return command, cwd, timeout, reason
+
+    def execution_arguments(self, name, args):
+        """Normalize the actual command identity before checking saved effects."""
+        if name != 'run_command':
+            return args
+        self._validate_arguments(name, args)
+        command, cwd, timeout, _ = self._command_parameters(args)
+        return {'command': command, 'cwd': str(cwd), 'timeout': timeout}
+
+    def _run_command(self, args):
+        command, cwd, timeout, reason = self._command_parameters(args)
         self._ask(ApprovalRequest('Run this terminal command?', f'Working directory: {cwd}\nTime limit: {timeout} seconds\nPurpose: {reason[:1000]}\n\n{command}', 'command', 'Runs outside a sandbox with your user account. It can modify or delete files and send data over the network. Approve only a command you understand.'))
         env = {key:os.environ[key] for key in ('PATH','HOME','USER','LOGNAME','LANG','LC_ALL','TERM','TMPDIR','XDG_RUNTIME_DIR') if key in os.environ}
         env.update({'GIT_TERMINAL_PROMPT':'0','PAGER':'cat'})
@@ -227,7 +457,9 @@ class ToolExecutor:
                 pass
             proc.wait(timeout=2)
             proc.stdout.close()
-        return {'output':b''.join(output).decode('utf-8',errors='replace')[:64000], 'exit_code':proc.returncode,'timed_out':timed_out,'cancelled':self.cancel.is_set(),'output_limit_reached':capped}
+        return {'command':command,'cwd':str(cwd),'timeout':timeout,'executed':True,
+                'output':b''.join(output).decode('utf-8',errors='replace')[:64000], 'exit_code':proc.returncode,
+                'timed_out':timed_out,'cancelled':self.cancel.is_set(),'output_limit_reached':capped}
 
     def _web_approval(self, url, query=None):
         validate_url(url)

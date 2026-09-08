@@ -1,4 +1,236 @@
-# LetraCode 0.1.1 — verification and limits
+# LetraCode — verification and limits
+
+Historical milestone record. Its original results and limits are preserved below.
+For the current reliability branch, see [Current implementation state](CURRENT-STATE.md)
+and [Reliability verification](RELIABILITY-VERIFICATION.md).
+
+
+## Supervised coding prerequisites (current development branch)
+
+Worktree: `/home/miceoil/Projects/LetraCode-strand-development`, branch `codex/strand-development-loop`, based on accepted M1a `cdfdf9d19d9e19149d168a0b4942564de10e0f54`. The M1a checkout remains unchanged. The user independently accepted M1a and deferred broader manual KDE checks; this pass addresses the specific source-editing prerequisites, not a new broad M1a review.
+
+Fresh baseline: **220 passed in 86.52 s**. New source, tool and worker tests cover safe publication, versioned small edits, evidence freshness, actual command failures/correction, cancellation and retrieval. The initial source API tests failed because the API was absent; a separate disposable probe against the accepted implementation reproduced actual external-byte loss in all three final-publication races (in-place, atomic replacement and create). Tools established **27 failing cases** before implementation and another **3** for incomplete newline/BOM previews. Worker context tests established **3** stale-source failures and the real coding-loop regression first failed for the missing source hash. Source review then established failing cases for post-publication attribution, untrusted recovery records, unsolicited lock creation and unresponsive busy locks.
+
+Scoped fresh results: source/Strand/document/tools **120 passed in 16.14 s**; worker/coding-loop/tools **68 passed in 40.46 s**. The final command-cancellation synchronization check passed in **0.68 s**. Full verification: **280 passed in 85.19 s**, including all 220 accepted M1a cases and 60 new cases.
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/coding-proof/full
+# 280 passed in 85.19 s; zero failures/skips
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 30 Python files without writing bytecode
+for script in install.sh uninstall.sh packaging/build-rpm.sh; do bash -n "$script" || exit; done
+git diff --check
+# Both exit 0
+```
+
+The shell check deliberately parses each script separately. The historical multi-argument `bash -n install.sh uninstall.sh packaging/build-rpm.sh` below only parsed the first script; the others were positional arguments. This pass corrects the verification command without rewriting historical attribution.
+
+No existing permission was broadened. Source reads fail closed on unfinished adjacent recovery records because repository contents cannot authorize restoration; current authorized rollback and app-owned memory recovery remain separate. Source metadata and locks do not cause writes during inspection, and a busy source recovery lock produces an immediate error. Large/unsafe source files remain explicitly unsupported. Details and remaining recovery limitations: [supervised coding proof](SUPERVISED-CODING-PROOF.md).
+
+Logs and observer scripts are retained under `.stabilization/coding-proof/`; disposable fixtures are under `stabilization-test-data/coding-proof*`. The observer uses native individual approval dialogs and cannot approve a write or command. It rejects a fourth source implementation attempt, enforcing the initial attempt plus two corrections. The real local-model acceptance result is recorded separately in the proof document; prerequisite tests do not establish that Strand can yet complete the coding task.
+
+### Real-Strand acceptance result — failed before an edit
+
+Prerequisite code commit: `483fb00083adf5f5b7a2890ca3bae4d3af4d2d2b`. The real existing Qwen model ran through the native development application with disposable data and a separate clone without remotes. Across two turns (one explicit continuation), it issued 18 completed tool actions and received six individual native command approvals. It repeatedly inspected source/tests, ran an actual full **baseline** suite (**280 passed in 92.96 s**, exit 0), then hit the pre-existing **300-second inference deadline** before completing its first proposed test edit. Zero source/test edits or correction attempts occurred; the coding acceptance did not pass. Context usage remained below the configured limit. The engine stopped and no `llama-server` process remained.
+
+One earlier focused baseline command produced **35 fixture setup errors in 0.48 s**, exit 1: Codex's preparation script omitted the disposable pytest parent directory. Codex corrected that fixture setup only, recorded the event and fixed the preparation script. The model also correctly diagnosed the error and requested an approved directory-creation command. This setup error is separate from model behavior, application correctness and the required failing feature regression, which was never authored. The approved `cat` and `mkdir` commands exceeded the literal pinned Git/Python command list; there was no blanket approval.
+
+The final read-only audit confirms unchanged target HEAD/index/staged fixture and unchanged untracked sentinel. `strand.patch` is empty. No completed model-authored patch exists to review or integrate. Model coding accuracy, an actual fail/fix/pass loop and truthful final completion remain unverified; native command approvals and saved continuation were exercised. The real run does not substitute for scripted edit/cancel/recovery coverage or the separate Codex compile/shell/whitespace checks above.
+
+Exact commands, actual outputs, model/runtime settings, full transcript/requests, operator attribution and remaining limitations are recorded in [Supervised coding proof](SUPERVISED-CODING-PROOF.md), with raw evidence under `stabilization-test-data/coding-proof/acceptance-01/`. The observed deadline is unchanged from accepted M1a; this pass leaves the recorded failure for independent review rather than expanding into runtime tuning.
+
+Final Codex checks after recording the outcome: all **30 project Python files** and the **three disposable observer helpers** compile without bytecode writes; each shell script passes its separate `bash -n`; `git diff --check` passes. The only tracked changes after `483fb00` are these review documents, so the prerequisite's full 280-test result remains applicable. A structural comparison confirms `_list_files` is unchanged from accepted M1a. The accepted checkout is still clean at `cdfdf9d`; the original checkout is still at `45092f1` with its two pre-existing untracked cache directories preserved.
+
+## Strand M1a Undo lifecycle stabilization (current)
+
+Started from clean `codex/strand-m1a` at `932996ce27554647ea29471cc7af93bc5a47f0ae`, preserving the original checkout and all earlier evidence. Fresh baseline: **197 passed in 54.37 s**. The earlier report correctly identified tied timestamps and random receipt IDs, but its “safe conflict” observation did not cover repeated identical content or interrupted receipts. This pass reproduced those cases and the connected interface behavior before fixing them.
+
+| Root cause | Change and regression coverage |
+|---|---|
+| Whole-second dates plus random IDs are not save order. | Persist a positive increasing sequence in every new receipt, allocated under the existing root operation lock and including prepared attempts. Tests freeze all dates, deliberately reverse UUID order, reopen stores and dialogs, move the clock backward, allocate from concurrent Store instances, and restore from ZIP. No timestamp or UUID decides new-save chronology. |
+| A matching after-hash could authorize an older receipt after B → C → B. | Compute the latest confirmed change for each file and enforce eligibility again inside backend Undo before the existing backup/hash/protected-write checks. Stale receipts remain visible but fail explicitly; the latest save can be undone correctly. Scope filtering still precedes the limit. Existing 51-unrelated-save coverage and new tied-clock project/global isolation cases exercise the actual Undo button. |
+| A prepared receipt was treated as saved solely because current bytes matched its proposal. | Link each new receipt to its exact safe-write transaction and require its completion record and original hash to confirm an interrupted finalization. A failed attempt followed by an external matching edit stays unconfirmed. An unresolved later write blocks an older receipt until a newer confirmed sequence exists. Existing killed-process/journal/backup recovery tests remain in the suite. |
+| Legacy records lack durable chronology; hash transitions can falsely connect external edits. | Use only explicit `undo_of` dependencies to establish a legacy head (or a sole finalized receipt). Ambiguous ordinary histories, cycles, disconnected saves and unresolved later writes remain visible without a default and refuse Undo. Tests include a falsely connected Undo/external-edit sequence, explicit legacy Undo chains, and a fresh confirmed save restoring availability. No guessed timestamp/hash ordering is written back into old records. |
+| Undo autosaved pending drafts, changed selection on failure, left Reload history stale, or hid a failed reload behind success. Conversation Undo also saved unrelated editors. | Keep the draft separately and require explicit Save/Reload before Undo. Preserve the selected receipt on failure and show the legitimate conflict. Refresh after Reload and keep unavailable-file diagnostics. Only refresh the affected conversation memory pane, retaining native current-chat receipt authorization. Real offscreen Qt controls cover tied defaults, repeated save/Undo, close/reopen, external edits, dirty drafts, stale selection, unavailable files, ambiguous/unconfirmed history and unrelated scopes. |
+
+Regression evidence: the first backend red run produced **6 failures** at the original behavior; the first UI ordering/selection/reload run produced **3 failures**, with **5 more** draft/legacy/link failures and **1** stale-Reload failure in later red runs. During implementation review, additional tests reproduced **2** unresolved-later-write failures and **1** false legacy chronology failure before those paths were corrected. These runs are recorded separately rather than presented as one baseline suite. The conservative legacy rule deliberately changes the initial simple hash-chain expectation: content transitions cannot prove chronology after unrecorded external edits. The final tests exercise both refusal and recovery through a fresh confirmed save.
+
+Fresh commands and results, from `/home/miceoil/Projects/LetraCode-strand-m1a`:
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/undo-lifecycle/baseline
+# 197 passed in 54.37 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_strand.py --basetemp=stabilization-test-data/undo-lifecycle/backend-final
+# 49 passed in 12.09 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_strand.py tests/test_strand_ui.py tests/test_ui.py --basetemp=stabilization-test-data/undo-lifecycle/focused
+# 95 passed in 31.80 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/undo-lifecycle/full
+# 220 passed in 76.10 s; zero failures/skips; 23 new cases, earlier coverage retained
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 27 Python files without writing bytecode
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+git diff --check
+# Both exit 0
+```
+
+Logs are retained under `.stabilization/undo-lifecycle/`, including `baseline.log`, `backend-red.log`, `backend-green.log`, `unresolved-red.log`, `legacy-red.log`, `backend-final.log`, `ui-red.log`, `ui-additional-red.log`, `ui-reload-red.log`, `ui-green.log`, `focused.log` and `full.log`. Disposable fixtures are under `stabilization-test-data/undo-lifecycle*`. Scoped backend review also checked no-op save order, explicit legacy Undo-of-Undo reopening, external-gap refusal and mismatched completion proof with synthetic fixtures in `stabilization-test-data/undo-lifecycle-review/`. A separate scoped UI read-through and run passed all 46 UI tests with disposable fixtures. These internal checks are not a substitute for the requested independent review.
+
+**Real-model testing:** none in this pass. Receipt order, filesystem authorization and Qt selection do not depend on inference. The Qwen observations below retain their historical attribution.
+
+**Remaining limits/manual review:** interactive KDE keyboard/dialog behavior and the user's preferred external editor still need a manual check. The automated suite uses actual Qt widgets offscreen, real disposable files/SQLite databases, and process-interruption fixtures; no physical power-loss or storage-failure experiment was performed. New history orders recorded saves, not arbitrary external filesystem activity. A completely unrecorded external change that returns to identical bytes cannot generally be distinguished by a content hash; existing retained-inode checks still protect the write races they cover. Ambiguous legacy history cannot have its missing chronology reconstructed safely and needs deliberate recovery from retained files/receipts, or a fresh confirmed Save for subsequent Undo operations. That Save does not retroactively make uncertain old receipts eligible. Undo of an Undo is redo of that selected change; this pass does not add a cascading undo stack, automatic history pruning, or recovery UI. Existing size/filesystem/recovery limits remain.
+
+The installed app, live database, real writing and working model were not modified. No dependency installation, model run, push, merge, M1b or training was performed. The fix is a separate local commit on `codex/strand-m1a`, stopping for independent review.
+
+## Historical second Strand M1a stabilization — three remaining P2 findings (`932996c`)
+
+The ordering limitation reported in this historical section was addressed by the later Undo lifecycle pass above.
+
+Started from clean `codex/strand-m1a` at `cc7b48db0434bd86ba35b4c5c35dfbd5f9c62e04`. Fresh baseline: **183 passed in 43.68 s**. The latest independent review confirmed the previous five scenarios were resolved and identified these three older defects; it found no confirmed regression introduced by `cc7b48d`. The earlier 132- and 183-test results below retain their original attribution.
+
+All three supplied reproduction scripts were present and inspected before execution. Copies/adaptations used disposable fixtures inside this worktree; the original `/tmp` scripts were not modified.
+
+| Finding | Root cause and repair | Failing regression and fresh result |
+|---|---|---|
+| Migration rollback loses external corrections | A hash/content check followed by pathname unlink could delete an intervening replacement, and unlinking also detached open editor descriptors. Roll back SQLite while retaining prepared files and their actual inodes. Retry reuses matching files and explicitly refuses conflicting nonempty legacy memory; it never rewrites retained matching files. | The supplied probe lost all three external corrections and silently restored legacy text on retry. Four regression cases failed before repair; now all four pass. Cover in-place/atomic edits at the old unlink boundary, writes through a descriptor after failure, conflict on retry, original DB/backup preservation, and late descriptor writes after a successful matching retry. The prior test expecting deletion was changed deliberately: retaining recoverable files is now the safety invariant. |
+| Context packing stops on an optional-context plateau | Equal text at adjacent allowances did not mean further reduction was exhausted. Remove that early exit and the ten-attempt cap; halve the finite optional allowance until a request fits or zero has been tried. Core instructions and the current request remain intact. | The supplied fallback-counter case measured 34813 tokens at allowances 20000 and 10000, 32852 at 5000, and **32073 / 32768** at 2500. Before repair the worker paused; afterward it generated once and completed. Two regression cases failed before repair and now pass, including a truly oversized request that exhausts reductions through zero and safely pauses. |
+| Unrelated saves hide a project's Undo entries | The global limit was applied before scope filtering. `receipts(limit=50, *, scope=None, project_id=None)` now validates the scope/project pair and filters before sorting/limiting; the dialog supplies its selected scope. Unfiltered callers retain their existing behavior. | One project save followed by 51 global saves showed zero project entries before repair and one afterward. Actual UI Undo restores that project's original memory while global/other-project memory stays unchanged. Nine new cases failed before repair and pass afterward, covering the menu, per-scope limits, compatibility and invalid scope/project pairs. |
+
+Fresh verification commands, run from `/home/miceoil/Projects/LetraCode-strand-m1a`:
+
+```bash
+mkdir -p .stabilization/pass2 stabilization-test-data/pass2
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_store.py -k 'partial_migration_failure or migration_rollback' --basetemp=stabilization-test-data/pass2/migration-final
+# 4 passed, 26 deselected in 1.60 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/pass2-worker-targeted tests/test_worker.py tests/test_tools.py
+# 34 passed in 15.84 s
+
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q tests/test_strand.py tests/test_strand_ui.py tests/test_ui.py --basetemp=stabilization-test-data/pass2-undo-pytest-full
+# 72 passed in 22.09 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/pass2/full
+# 197 passed in 52.30 s; zero failures/skips
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 27 Python files without writing bytecode
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+git diff --check
+# Both exit 0
+```
+
+The full suite includes all previous five-finding regressions plus **14 new cases**. Logs are retained in `.stabilization/pass2/`: `baseline-tests.log`, `migration-original-red.log`, `migration-tests-{red,green,final}.log`, `context-plateau-original-{red,green}.log`, `worker-targeted-green.log`, `undo-scope-{probe,tests}-{red,green}.log`, `undo-scope-fulltests.log`, and `full-tests-final.log`. The initial copies and corrected context/Undo harnesses are retained alongside their logs or in `stabilization-test-data/pass2-*`. No live-data migration or installed-app test was run.
+
+**Real-model testing:** no new inference run in this pass. The reported packing defect uses the supported fallback counter; its exact request and measured counts were reproduced through the actual worker with a deterministic engine substitute. Existing tests also cover runtime-counted intact core and true overflow. Migration and scoped Undo require no model. The Qwen observations below remain historical evidence and are not presented as fresh verification.
+
+**Remaining limits:** a failed migration leaves SQLite at version 1 with legacy values and its backup, and keeps prepared files at their ordinary paths. External corrections remain recoverable there. A retry conflict still requires deliberate reconciliation before migration can finish; the app does not choose between divergent versions. The Undo menu retains the newest 50 entries **within the selected scope**; older receipts remain on disk, and the receipt API supports limits up to 1000. Interactive KDE dialog/keyboard behavior and physical power-loss/storage-failure behavior were not newly tested. The earlier documented recovery-history, supported-size and filesystem limits still apply. No known unresolved reproduction remains from these three findings.
+
+Independent scoped review also reproduced a **separate, pre-existing Undo ordering issue**: receipt timestamps have whole-second precision and equal dates are sorted by random receipt ID. Same-second saves can therefore appear out of order; the default selection may be an older save, whose Undo is safely refused by the content-hash conflict check. This pass fixes filtering before the scope limit, not chronology within a timestamp tie. The ordering issue remains for independent re-review; it is not a confirmed regression from this pass or `cc7b48d`. Fixture evidence is retained under `stabilization-test-data/pass2-receipt-review/`. Microsecond timestamps alone would not repair existing tied history, so no partial ordering change was bundled into these three fixes.
+
+The fixed `<data-dir>/strand` location and default review of model-proposed memory saves are unchanged. No dependency installation, installed-app change, live-data or writing-file edit, model replacement, push, merge, training or M1b work was performed. This pass is a separate local commit for independent re-review.
+
+## Historical first Strand M1a stabilization — September 5, 2026 (`cc7b48d`)
+
+Started from a clean `codex/strand-m1a` checkout at `886ff6632969ba141cfe867faa5039df15cb747e`. The original context-overflow fix remains present. The baseline suite passed again: **132 passed in 7.73 s**. A newer independent review nevertheless reproduced five P2 bugs; the earlier 132-pass results below are historical evidence, not proof that those bugs were absent.
+
+| Finding | Reproduced failure and regression coverage | Stabilized behavior |
+|---|---|---|
+| Commit-time external edit loss | Six initial regressions failed: in-place/atomic editor saves at the final boundary for Save/Undo, create race, and late writes through an open descriptor. | Capture and retain the actual original file, check its bytes, then publish using Linux `RENAME_NOREPLACE`. Never replace a competing name, even during rollback. Later edits to a retained original surface a conflict on read/reopen. |
+| Unsent first message lost | Global/project first sends emptied the composer on conflict. Also tested memory disappearing after chat creation. | Save checks precede chat creation; transfer the draft durably before selecting the new chat. Failed Save/Reload preserves drafts through reopening. |
+| One unavailable project blocks startup | Missing, unreadable, malformed and oversized memory failed project access; Qt startup/reopen cases reproduced failures. | Project lists use metadata only. Affected memory has an explicit unavailable state, path and Reload control; unrelated projects/chats remain usable. Bounded context marks unavailable project memory explicitly. |
+| Deleted project leaves memory | Existing deletion left the active memory path behind. | Archive the original inode and recovery record before deleting database ownership. Test raw malformed/oversized bytes, missing/unsafe paths, late descriptor writes, DB rollback, concurrent recreation, crash recovery and backup inclusion. Resolve pending saves first so receipt inspection cannot resurrect deleted memory. |
+| Earlier evidence references disappear | Three-cycle pause regression lost the first ID on cycle two; oversized legacy checkpoint overflowed a short continuation. Catalog pagination initially chased its own saved output. | Keep 20 recent chat-wide IDs and a count. `list_tool_results` discovers older results with bounded, chat-scoped pages and a stable upper cursor. `read_tool_result` retrieves their original bounded bodies. Test 24 pauses/reopen/compaction, 500 saved legacy results, scope/bounds and pagination completion. |
+
+Additional save regressions kill a disposable child process immediately after capture/publication and halfway through journal/completion-record writes. Recovery control records are published atomically; newly created directories are synced before capture. Backup/restore retains journals and old inodes and still supports Undo. All five reproductions and the integration regressions now pass.
+
+Fresh commands, run from `/home/miceoil/Projects/LetraCode-strand-m1a`:
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider tests/test_strand.py tests/test_store.py tests/test_strand_ui.py tests/test_ui.py tests/test_worker.py tests/test_tools.py --basetemp=stabilization-test-data/targeted
+# 122 passed in 36.12 s
+
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider --basetemp=stabilization-test-data/full
+# 183 passed in 42.29 s; zero failures/skips
+
+python3 - <<'PY'
+from pathlib import Path
+paths = sorted(Path('letracode').rglob('*.py')) + sorted(Path('tests').rglob('*.py')) + sorted(Path('packaging').glob('*.py'))
+for path in paths:
+    compile(path.read_bytes(), str(path), 'exec')
+print(f'Compiled {len(paths)} Python files without writing bytecode')
+PY
+# Compiled 27 Python files without writing bytecode
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+git diff --check
+# Both exit 0
+```
+
+The temporary-data parent `stabilization-test-data/` and evidence directory `.stabilization/` are ignored and inside the worktree. Create the parent with `mkdir -p stabilization-test-data` before reproducing in a fresh checkout. An initial full run used hidden `.stabilization/pytest-full`: two source-reading tests correctly hit sensitive-path restrictions, and a worker waited for approval; that run was interrupted after 159 passes/two failures. Moving **test data** to a visible directory fixed the setup. No application permission rule was weakened. Its log is retained as `.stabilization/full-tests.log`; the successful logs are `full-tests-final.log` and `targeted-tests-final.log`.
+
+**Fresh real-Qwen check:** one actual Worker continuation after 25 **seeded** pause cycles, reopening and compaction. The oldest result ID was absent from the 20 recent checkpoint references, its marker absent from the initial prompt, and older turns omitted. With Computer/Web disabled, Qwen called `list_tool_results`, then `read_tool_result`, and correctly reported `ZETA-73` and saved exit code `7`. The original synthetic command was never executed or rerun; its saved row remained unchanged. Actual request totals were 4692, 4912 and 5268 tokens out of 8192, including 3072 reply and 128 safety tokens. Load 3.41 s; continuation 41.50 s. The owned engine stopped and no `llama-server` process remained.
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. python3 .stabilization/qwen-saved-recovery/probe.py > .stabilization/qwen-saved-recovery/probe.log 2>&1
+# exit 0; results.json: passed=true, engine_stopped=true
+```
+
+This uses the same existing Qwen3.6 GGUF/llama.cpp paths documented below, with an isolated 8192 context, 12 GPU layers, eight threads and temperature 0.7. The probe script, `results.json`, log and engine log remain in `.stabilization/qwen-saved-recovery/`. Subsequent fixes touched file recovery only; the verified worker/tool continuation code did not change. This is a small real-model recovery check, not evidence of general model reliability or 25 autonomous model runs.
+
+**Limits and manual checks:** offscreen Qt tests cover the changed draft, startup, Reload and deletion flows. Interactive KDE keyboard/dialog behavior and reconciliation with the user's preferred external editor still need manual review. Crash tests interrupt processes; no physical power-loss, filesystem corruption or disk-full experiment was performed. Linux/filesystem `renameat2(RENAME_NOREPLACE)` support is required; unsupported operations fail without an overwrite fallback. A save briefly removes the active pathname while retaining its original inode and journal. An editor holding that inode can write later: the data is preserved and the conflict is detected at the next read/reopen, requiring manual reconciliation. Recovery history is retained and grows with saves; no automatic pruning was added. An archived external file beyond the existing 2 MiB limit remains intact, but backup explicitly refuses that unsupported file rather than truncating or omitting it.
+
+Both documented M1a departures were retained: `<data-dir>/strand` keeps isolation/restore straightforward; default review for model memory saves, except the explicit learning-file grant, keeps scope/authorization unambiguous. No evidence linked either choice to these defects. No installation, live-data migration, source-note edit, model replacement, training, push, merge or M1b work occurred. A fresh synthetic manual-review fixture and launch instructions are in [STRAND-M1A-REVIEW.md](STRAND-M1A-REVIEW.md).
+
+## Historical Strand M1a verification on Fedora — September 5, 2026
+
+Historical results from `/home/miceoil/Projects/LetraCode-strand-m1a`, branch `codex/strand-m1a`, based on `45092f1`. At that stage, code was verified at `9496958`; changes through `886ff66` only removed trailing whitespace and documented those results. The five defects described above were discovered afterward. The original checkout, installed app and live data were not updated.
+
+Environment: Fedora 44 KDE Plasma, `/usr/bin/python3` 3.14.7, system PySide6 6.11.2, pytest 8.4.2, SQLite 3.51.2; FTS5 available. No new dependencies or system changes.
+
+- Baseline: **78 passed in 5.80 s**.
+- Final: **132 passed in 7.40 s**, zero failures/skips, using the command below.
+- All 15 application Python files compiled successfully using Python's `compile()` with no bytecode writes. Shell syntax and `git diff --check` passed.
+- Independent review findings were corrected and regression-tested: protected native Undo controls, stable editor cursor/drafts, Retry save checks, bounded/no-follow memory reads, concurrent writes/migration, and token-authoritative core budgeting with explicit omitted-context coverage. Scoped final review reported no remaining findings.
+
+```bash
+QT_QPA_PLATFORM=offscreen PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider
+```
+
+The tests use temporary files/databases and scripted HTTP/model peers. Installer checks redirect all install/update/uninstall destinations into temporary homes; they do not install into the user's account. These tests establish deterministic behavior, not model intelligence.
+
+**Real local inference:** existing GGUF metadata reports Qwen3.6-35B-A3B / qwen35moe / MOSTLY_Q4_K_M; installed llama.cpp reports `0.4.0-dev`, commit `4d91760`. Tested with the configured context 32768, 12 GPU layers, 8 threads, reply reserve 3072 and temperature 0.7, plus an isolated 8192 profile. Actual model checks passed global identity, scoped remember, external correction, conflicting projects, context-heavy continuations at both sizes, and saved-result tool retrieval with external tools disabled. Prompt counts matched the independent input-token endpoint. Actual cancellation stopped the owned engine in 2.40 s. The final core-budget regression also passed on the real model: all 7000 instruction characters were preserved, with 1794 prompt + 3072 reply + 128 safety tokens at context 8192; answer “Strand”, 10.42 s. Every test-owned engine was stopped. No training was attempted.
+
+The context-heavy fixtures contain synthetic file reads; the archived command-output fixture is synthetic and its command was never executed. Small real-model checks do not prove whole-book comprehension, teaching quality or reliable tool use in general.
+
+**Fedora interface:** offscreen Qt tests and inspected renders passed. The actual development entry point opened on Wayland with isolated `ui-demo` data and closed cleanly after capturing its own widget. The captured live widget inherited the desktop dark style and was inspected. Full interactive KDE/dialog/keyboard behavior still requires user review.
+
+Detailed configuration, observations, limitations, safe launch command and manual checklist: [Strand M1a review guide](STRAND-M1A-REVIEW.md). Logs and isolated fixtures are retained at `/home/miceoil/Projects/strand-m1a-review-PGYug9/`, including `automated-tests.log`, `real-model-results.json`, `final-model-results.json`, `core-budget-model-results.json`, `live-launch.log` and engine logs. M1b and M2 were not implemented.
+
+---
+
+## Historical LetraCode 0.1.1 verification (retained attribution)
 
 Verified on September 5, 2026 in an Ubuntu 24.04 x86_64 environment, using Python 3.12 and Qt/PySide6 6.11.2. The installed Fedora application uses Fedora's system Qt, not the development Qt wheel.
 

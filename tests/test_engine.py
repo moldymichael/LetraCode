@@ -66,6 +66,34 @@ class Handler(BaseHTTPRequestHandler):
             "body": request,
         })
         record_path.write_text(json.dumps(records))
+        if self.path == "/apply-template":
+            scenario = request["messages"][-1]["content"]
+            if scenario == "budget-drip":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.close_connection = True
+                self.wfile.write(b'{"prompt":"')
+                for _ in range(30):
+                    self.wfile.write(b'x')
+                    self.wfile.flush()
+                    time.sleep(0.05)
+                self.wfile.write(b'"}')
+                self.wfile.flush()
+                return
+            if scenario == "budget-unsupported":
+                self.send_error(404)
+                return
+            formatted = {"messages": request["messages"],
+                         "thinking": request["chat_template_kwargs"]}
+            if scenario != "budget-blind":
+                formatted["tools"] = request.get("tools", [])
+            self._json({"prompt": json.dumps(formatted)})
+            return
+        if self.path == "/tokenize":
+            self._json({"tokens": [17] * (9000 if "budget-overflow" in request["content"] else 37)})
+            return
         scenario = request["messages"][-1]["content"]
 
         if scenario == "redirect":
@@ -154,6 +182,14 @@ class Handler(BaseHTTPRequestHandler):
         self._event({"choices": [{"delta": {"content": "ok"}, "finish_reason": None}]})
         self._event({"choices": [{"delta": {}, "finish_reason": "stop"}]})
         self._done()
+
+    def _json(self, value):
+        body = json.dumps(value).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _event(self, value):
         self.wfile.write(b"data: " + json.dumps(value).encode() + b"\n\n")
@@ -414,6 +450,7 @@ def test_complete_streams_content_and_collects_fragmented_native_tool_calls(
                 "temperature": 0.25,
                 "chat_template_kwargs": {"enable_thinking": False},
                 "tools": tools,
+                "parallel_tool_calls": False,
             },
         }
     finally:
@@ -536,3 +573,139 @@ def test_complete_honors_external_cancel_event(
     assert not thread.is_alive()
     assert len(outcome) == 1
     assert isinstance(outcome[0], Cancelled)
+
+
+def test_request_usage_formats_tools_thinking_and_reserves_reply(fake_server, gguf_model, tmp_path):
+    from threading import Event
+    engine = make_engine(fake_server, gguf_model, tmp_path / "data")
+    tools = [{"type": "function", "function": {"name": "read_file"}}]
+    messages = [{"role": "user", "content": "Unicode 你好 \\ code"}]
+    try:
+        usage = engine.request_usage(messages, tools, Event(), thinking=True)
+        assert usage.prompt_tokens == 37
+        assert usage.reply_tokens == 321
+        assert usage.safety_tokens > 0
+        assert usage.total_tokens == 37 + 321 + usage.safety_tokens
+        assert usage.method == "runtime tokenizer"
+        records = json.loads(fake_server.with_suffix(".requests.json").read_text())
+        formatted = next(r["body"] for r in records if r["path"] == "/apply-template")
+        assert formatted["messages"] == messages
+        assert formatted["tools"] == tools
+        assert formatted["parallel_tool_calls"] is False
+        assert formatted["chat_template_kwargs"] == {"enable_thinking": True}
+        tokenizer = next(r["body"] for r in records if r["path"] == "/tokenize")
+        assert "read_file" in tokenizer["content"]
+        assert tokenizer["add_special"] is True
+        assert tokenizer["parse_special"] is True
+    finally:
+        engine.stop()
+
+
+@pytest.mark.parametrize("scenario", ["budget-unsupported", "budget-blind"])
+def test_request_usage_fallback_counts_utf8_tools_and_template(fake_server, gguf_model, tmp_path, scenario):
+    from threading import Event
+    engine = make_engine(fake_server, gguf_model, tmp_path / "data")
+    tools = [{"type": "function", "function": {"name": "lookup", "description": "X" * 1000}}]
+    messages = [{"role": "user", "content": scenario}]
+    try:
+        usage = engine.request_usage(messages, tools, Event())
+        assert "estimate" in usage.method
+        assert usage.prompt_tokens >= 1000
+        # The fallback accounts for every UTF-8 byte, including escaped code.
+        unicode_messages = [{"role": "user", "content": "漢" * 1000 + '\\' * 500}]
+        unicode_usage = engine.request_usage(unicode_messages, tools, Event())
+        assert unicode_usage.prompt_tokens > usage.prompt_tokens + 3000
+        plain = engine.request_usage(unicode_messages, None, Event())
+        assert unicode_usage.prompt_tokens >= plain.prompt_tokens + 1000
+    finally:
+        engine.stop()
+
+
+def test_completion_refuses_overflow_before_inference(fake_server, gguf_model, tmp_path):
+    from threading import Event
+    from letracode.engine import ContextOverflowError
+    engine = make_engine(fake_server, gguf_model, tmp_path / "data")
+    try:
+        with pytest.raises(ContextOverflowError):
+            engine.complete([{"role": "user", "content": "budget-overflow"}], None, Event(), lambda _: None)
+        records = json.loads(fake_server.with_suffix(".requests.json").read_text())
+        assert not any(r["path"] == "/v1/chat/completions" for r in records)
+    finally:
+        engine.stop()
+
+
+def test_budget_endpoint_has_wall_clock_deadline(fake_server, gguf_model, tmp_path, monkeypatch):
+    from threading import Event
+    import letracode.engine as module
+    monkeypatch.setattr(module, '_BUDGET_REQUEST_TIMEOUT', 0.15, raising=False)
+    engine = make_engine(fake_server, gguf_model, tmp_path / 'data')
+    try:
+        started=time.monotonic()
+        with pytest.raises(module.EngineError, match='budget.*deadline'):
+            engine.request_usage([{'role':'user','content':'budget-drip'}],None,Event())
+        assert time.monotonic()-started<1.2
+        assert not engine.running
+    finally:
+        engine.stop()
+
+
+@pytest.mark.parametrize('operation', ['completion', 'budget'])
+def test_operation_owns_cancel_watcher_until_teardown_finishes(fake_server, gguf_model, tmp_path, monkeypatch, operation):
+    from threading import Event, Thread
+    import letracode.engine as module
+    engine = make_engine(fake_server, gguf_model, tmp_path / 'data')
+    cancel_started, release, returned = Event(), Event(), Event()
+    cancel = Event()
+    original_cancel = engine.cancel
+
+    def slow_cancel():
+        original_cancel()
+        cancel_started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(engine, 'cancel', slow_cancel)
+    monkeypatch.setattr(module, '_BUDGET_REQUEST_TIMEOUT', 0.15)
+    monkeypatch.setattr(module, '_REQUEST_TIMEOUT', 0.15)
+    outcomes = []
+
+    def run():
+        try:
+            if operation == 'completion':
+                engine.complete([{'role': 'user', 'content': 'drip'}], None, cancel, lambda _: None)
+            else:
+                engine.request_usage([{'role': 'user', 'content': 'budget-drip'}], None, cancel)
+        except (module.EngineError, module.Cancelled) as error:
+            outcomes.append(error)
+        finally:
+            returned.set()
+
+    runner = Thread(target=run)
+    runner.start()
+    try:
+        assert cancel_started.wait(3)
+        assert not returned.wait(0.15), 'Operation returned with a live cancellation watcher'
+    finally:
+        release.set()
+        runner.join(3)
+        engine.stop()
+    assert not runner.is_alive()
+    assert len(outcomes) == 1
+
+
+def test_cancel_after_budgeting_is_reported_as_cancelled_before_generation(fake_server, gguf_model, tmp_path, monkeypatch):
+    from threading import Event
+    from letracode.engine import Cancelled
+    engine = make_engine(fake_server, gguf_model, tmp_path / 'data')
+    count = engine._request_usage
+
+    def cancel_after_count(*args):
+        usage = count(*args)
+        engine.cancel()
+        return usage
+
+    monkeypatch.setattr(engine, '_request_usage', cancel_after_count)
+    try:
+        with pytest.raises(Cancelled):
+            engine.complete([{'role': 'user', 'content': 'plain'}], None, Event(), lambda _: None)
+    finally:
+        engine.stop()

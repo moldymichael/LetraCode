@@ -70,7 +70,7 @@ if $install_deps && ! "$python_bin" -c 'from PySide6 import QtWidgets; import py
     printf 'Unset LETRACODE_PYTHON to use Fedora system Python, then run the installer again.\n' >&2
     exit 1
 fi
-if ! PYTHONPATH="$source_dir${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -m letracode --version >/dev/null; then
+if ! PYTHONPATH="$source_dir${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -P -m letracode --version >/dev/null; then
     printf 'The LetraCode source failed its launch validation; the existing install was not changed.\n' >&2
     exit 1
 fi
@@ -127,7 +127,7 @@ cp -- "$source_dir/uninstall.sh" "$source_dir/README.md" "$source_dir/LICENSE" "
 printf '%s\n' "$MARKER_CONTENT" > "$stage/.letracode-install"
 chmod 0644 "$stage/.letracode-install"
 chmod 0755 "$stage/uninstall.sh"
-PYTHONPATH="$stage${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -m letracode --version >/dev/null
+PYTHONPATH="$stage${PYTHONPATH:+:$PYTHONPATH}" "$python_bin" -P -m letracode --version >/dev/null
 
 if [[ -d "$app_dir" ]]; then
     backup="$(mktemp -d "$data_home/.letracode-app.old.XXXXXX")"
@@ -148,7 +148,7 @@ launcher_tmp="$(mktemp "$bin_home/.letracode-launcher.XXXXXX")"
     printf 'readonly app_dir=%q\n' "$app_dir"
     printf 'readonly python_bin=%q\n' "$python_bin"
     printf 'export PYTHONPATH="$app_dir${PYTHONPATH:+:$PYTHONPATH}"\n'
-    printf 'exec "$python_bin" -m letracode "$@"\n'
+    printf 'exec "$python_bin" -P -m letracode "$@"\n'
 } > "$launcher_tmp"
 chmod 0755 "$launcher_tmp"
 mv -f -- "$launcher_tmp" "$launcher"

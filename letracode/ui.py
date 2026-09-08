@@ -6,6 +6,7 @@ import html
 import json
 import re
 import shutil
+import sqlite3
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, QUrl, Signal
@@ -13,13 +14,29 @@ from PySide6.QtGui import QAction, QDesktopServices, QFontDatabase, QIcon, QKeyS
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QSplitter, QTabWidget, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
+    QSplitter, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget)
 
 from . import __version__
-from .dialogs import ApprovalDialog, LinksDialog, ModelDialog
+from .dialogs import ApprovalDialog, ModelDialog
 from .engine import EngineConfig, LocalEngine
 from .worker import ConversationWorker
+from .store import message_status
+from .memory_ui import MemoryDialog
+from .project_files import ProjectFilesPanel
+
+
+def assistant_html(text, font):
+    """Render model prose, allowing ordinary links but never application actions."""
+    document = QTextDocument()
+    document.setDefaultFont(font)
+    document.setMarkdown(text, QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML)
+    body = re.search(r'<body[^>]*>(.*)</body>', document.toHtml(), re.S)
+    rendered = body.group(1) if body else html.escape(text)
+    # Qt emits normalized double-quoted hrefs; source HTML is already disabled.
+    # App-created receipt links are added separately after this boundary.
+    return re.sub(r'<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
+        lambda match: match.group(2) if QUrl(html.unescape(match.group(1))).scheme().lower() == 'letracode' else match.group(0), rendered, flags=re.S)
 
 
 class SafeBrowser(QTextBrowser):
@@ -173,27 +190,13 @@ class MainWindow(QMainWindow):
 
         self.context_panel = QWidget(); context = QVBoxLayout(self.context_panel)
         context.setContentsMargins(8,12,12,12)
-        context_title = QLabel('Project context')
+        context_title = QLabel('Project files')
         font = context_title.font(); font.setBold(True); context_title.setFont(font)
         context.addWidget(context_title)
-        self.context_hint = QLabel('Shared with every chat in this project.\nEdits save automatically.')
+        self.context_hint = QLabel('Ordinary files and folders, shared across this project’s chats.')
         self.context_hint.setWordWrap(True); context.addWidget(self.context_hint)
-        tabs = QTabWidget()
-        self.context_editors = {}
-        fields = [('Memory','memory','Durable facts, decisions and preferences.'),('Current Context','current_context','What you are working on now, open questions and next steps.'),('Instructions','instructions','How the AI should work with this project.')]
-        for label,key,placeholder in fields:
-            edit = QPlainTextEdit(); edit.setPlaceholderText(placeholder)
-            edit.textChanged.connect(self.schedule_save)
-            tabs.addTab(edit,label); tabs.setTabToolTip(tabs.count()-1,'Current Context' if key=='current_context' else label)
-            self.context_editors[key] = edit
-        context.addWidget(tabs,1)
-        self.links_summary = QLabel(); self.links_summary.setWordWrap(True); context.addWidget(self.links_summary)
-        self.links_button = QPushButton(QIcon.fromTheme('insert-link'),'Linked files & folders…')
-        self.links_button.clicked.connect(self.manage_links)
-        context.addWidget(self.links_button)
-        self.open_project_button = QPushButton(QIcon.fromTheme('folder-open'),'Open linked folder')
-        self.open_project_button.clicked.connect(self.open_project_folder)
-        context.addWidget(self.open_project_button)
+        self.files_panel = ProjectFilesPanel(self.store, self)
+        context.addWidget(self.files_panel, 1)
         self.splitter.addWidget(self.context_panel)
         self.splitter.setSizes([240,700,320])
         self.splitter.setStretchFactor(1,1)
@@ -210,7 +213,8 @@ class MainWindow(QMainWindow):
         file = self.menuBar().addMenu('&File')
         self.mutation_actions = [self.action(file,'New &chat',self.new_chat,'Ctrl+N'), self.action(file,'New &project…',self.new_project,'Ctrl+Shift+N')]
         self.action(file,'&Export chat as Markdown…',self.export_chat,'Ctrl+Shift+E')
-        self.action(file,'Back up all LetraCode data…',self.backup)
+        self.action(file,'Export Evaluation…',self.export_evaluation)
+        self.action(file,'Back up chats, Memory and source backups…',self.backup)
         self.action(file,'Open data folder',lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.store.directory))))
         file.addSeparator(); self.action(file,'&Quit',self.close,'Ctrl+Q')
         chat = self.menuBar().addMenu('&Chat')
@@ -219,12 +223,15 @@ class MainWindow(QMainWindow):
         self.action(chat,'Search chats',lambda:self.search.setFocus(),'Ctrl+K')
         self.action(chat,'Find in conversation…',self.find_in_chat,'Ctrl+F')
         view = self.menuBar().addMenu('&View')
-        self.show_context_action = self.action(view,'Project context',lambda checked:self.context_panel.setVisible(checked))
+        self.show_context_action = self.action(view,'Project files',lambda checked:self.context_panel.setVisible(checked))
         self.show_context_action.setCheckable(True); self.show_context_action.setChecked(True)
         self.action(view,'Zoom in',lambda:self.transcript.zoomIn(),'Ctrl++')
         self.action(view,'Zoom out',lambda:self.transcript.zoomOut(),'Ctrl+-')
         settings = self.menuBar().addMenu('&Settings')
         self.mutation_actions.append(self.action(settings,'Model Setup…',self.model_setup))
+        self.mutation_actions.append(self.action(settings,'Files, saved drafts & history…',self.edit_memory))
+        self.instructions_action = self.action(settings,'Project instructions…',self.edit_instructions)
+        self.mutation_actions.append(self.instructions_action)
         self.action(settings,'Unload model from memory',self.unload_model)
         help_menu = self.menuBar().addMenu('&Help')
         self.action(help_menu,'Getting started',self.getting_started)
@@ -281,22 +288,12 @@ class MainWindow(QMainWindow):
         chat = self.store.chat(chat_id) if chat_id else None
         self.chat_title.setText(chat['title'] if chat else project['title'] if project else 'A little room to think.')
         self.composer.setPlainText(chat['draft'] if chat else self.store.setting('unbound_draft_' + (project_id or 'global'),''))
-        for key,edit in self.context_editors.items():
-            edit.setPlainText(project.get(key,'') if project else '')
-            edit.setEnabled(project is not None)
-        self.links_button.setEnabled(project is not None)
-        self.open_project_button.setEnabled(project is not None)
-        self.context_hint.setText('Shared with every chat in this project.\nEdits save automatically.' if project else 'Choose a project to keep shared Memory, Current Context and Instructions here.')
-        self.refresh_links()
+        self.files_panel.set_project(project_id)
+        self.instructions_action.setEnabled(project is not None and not self.worker)
         self.loading = False
         self.selection_ready = True
         self.store.set_setting('last_chat',chat_id)
         self.render_chat()
-
-    def refresh_links(self):
-        links = self.store.links(self.project_id) if self.project_id else []
-        missing = sum(not Path(p).exists() for p in links)
-        self.links_summary.setText(f'{len(links)} linked file/folder' + ('s' if len(links)!=1 else '') + (f' · {missing} unavailable' if missing else ''))
 
     def schedule_save(self):
         if not self.loading:
@@ -310,8 +307,29 @@ class MainWindow(QMainWindow):
             self.store.set_draft(self.chat_id,self.composer.toPlainText())
         else:
             self.store.set_setting('unbound_draft_' + (self.project_id or 'global'),self.composer.toPlainText())
-        if self.project_id:
-            self.store.update_project(self.project_id,**{key:edit.toPlainText() for key,edit in self.context_editors.items()})
+        return True
+
+    def edit_memory(self):
+        if not self.worker:
+            self.save_editors()
+            self.files_panel.manage_files()
+
+    def edit_instructions(self):
+        if self.worker or self.project_id is None:
+            return
+        project = self.store.project(self.project_id)
+        dialog = QDialog(self)
+        dialog.setWindowTitle('Project instructions')
+        dialog.resize(640, 440)
+        layout = QVBoxLayout(dialog)
+        note = QLabel('How the assistant should work in this project. Files remain project evidence.')
+        note.setWordWrap(True); layout.addWidget(note)
+        editor = QPlainTextEdit(project['instructions']); layout.addWidget(editor)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
+        buttons.accepted.connect(dialog.accept); buttons.rejected.connect(dialog.reject)
+        layout.addWidget(buttons)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self.store.update_project(self.project_id, instructions=editor.toPlainText())
 
     def new_chat(self, checked=False):
         if self.worker:
@@ -369,27 +387,26 @@ class MainWindow(QMainWindow):
         kind,ident = item.data(0,Qt.ItemDataRole.UserRole)
         if kind == 'global':
             return
-        message = 'Delete this project and all its chats and context? Linked files will stay where they are.' if kind=='project' else 'Delete this chat and its messages?'
+        message = 'Delete this project and all its chats and context? Its Memory files and folders, if present, will be archived for recovery. Linked files will stay where they are.' if kind=='project' else 'Delete this chat and its messages?'
         if QMessageBox.question(self,'Delete '+kind+'?',message,QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No) != QMessageBox.StandardButton.Yes:
             return
         self.save_editors()
+        archive = None
+        try:
+            if kind == 'project': archive = self.store.delete_project(ident)
+            else: self.store.delete_chat(ident)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            QMessageBox.warning(self,'Unable to delete '+kind,str(error))
+            return
         self.chat_id = None; self.project_id = None
         self.selection_ready = False
-        if kind == 'project': self.store.delete_project(ident)
-        else: self.store.delete_chat(ident)
         self.show_selection(None,None); self.refresh_tree()
-
-    def manage_links(self):
-        if self.project_id and not self.worker:
-            LinksDialog(self.store,self.project_id,self).exec(); self.refresh_links()
-
-    def open_project_folder(self):
-        if not self.project_id:
-            return
-        links = self.store.links(self.project_id)
-        if links:
-            path = Path(links[0]); path = path if path.is_dir() else path.parent
-            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+        if archive:
+            self.statusBar().showMessage('Project deleted · memory archived at ' + str(archive['path']))
+            if archive.get('warning'):
+                QMessageBox.warning(self,'Project deleted · recovery record warning',archive['warning'])
+        elif kind == 'project':
+            self.statusBar().showMessage('Project deleted · no Memory files were present; Memory was not archived')
 
     def model_setup(self):
         if self.worker:
@@ -413,12 +430,18 @@ class MainWindow(QMainWindow):
             self.model_setup()
             if not self.engine_config.model_path or not self.engine_config.executable:
                 return
+        # Save the unbound conversation draft before selecting
+        # a new chat, whose composer would otherwise start empty.
+        if self.save_editors() is False:
+            return
         if not self.chat_id:
             scope = self.project_id or 'global'
             c = self.store.create_chat('New chat',self.project_id)
+            self.store.set_draft(c,self.composer.toPlainText())
             self.select_chat(c)
             self.store.set_setting('unbound_draft_' + scope,'')
-        self.save_editors()
+        if self.save_editors() is False:
+            return
         chat = self.store.chat(self.chat_id)
         if chat['title'] == 'New chat':
             self.store.rename_chat(self.chat_id,text.splitlines()[0][:60])
@@ -441,11 +464,10 @@ class MainWindow(QMainWindow):
     def set_busy(self,busy):
         for widget in (self.tree,self.search,self.new_chat_button,self.new_project_button,self.model_button,self.composer,self.send_button,self.retry_button,self.mode,self.computer,self.internet,self.actions):
             widget.setEnabled(not busy)
-        for edit in self.context_editors.values():
-            edit.setEnabled(not busy and self.project_id is not None)
-        self.links_button.setEnabled(not busy and self.project_id is not None)
+        self.files_panel.set_busy(busy)
         for action in self.mutation_actions:
             action.setEnabled(not busy)
+        self.instructions_action.setEnabled(not busy and self.project_id is not None)
         self.stop_button.setEnabled(busy)
 
     def queue_render(self):
@@ -460,7 +482,7 @@ class MainWindow(QMainWindow):
         messages = self.store.messages(self.chat_id) if self.chat_id else []
         chunks = []
         if not messages:
-            chunks.append('<h2>What are we working on?</h2><p>Start a conversation, or create a project for work you want to return to.</p><p><b>Projects remember the context you give them.</b><br>Link your files and edit Memory, Current Context and Instructions. Every chat in that project can use them.</p><p><b>You control computer access.</b><br>Review commands, file edits and outgoing web requests before they run.</p>')
+            chunks.append('<h2>What are we working on?</h2><p>Start a conversation, or create a project for work you want to return to.</p><p><b>Projects remember the context you give them.</b><br>Add existing files and folders, or create a note in Project files. Every chat in that project can use them. Set project instructions in Settings.</p><p><b>You control computer access.</b><br>Review commands, file edits and outgoing web requests before they run.</p>')
             if not self.engine_config.model_path:
                 chunks.append('<p><a href="letracode:setup">Choose your local model →</a></p>')
         for message in messages:
@@ -468,21 +490,26 @@ class MainWindow(QMainWindow):
             if role == 'tool':
                 payload = json.loads(message['payload']).get('message',{})
                 result = payload.get('content','')
-                state = 'Denied' if '"denied"' in result else 'Error' if '"error"' in result else 'Complete'
-                chunks.append(f'<p><b>Action · {state}</b> — {html.escape(payload.get("name","tool"))} &nbsp; <a href="letracode:action/{message["id"]}">View details</a></p>')
+                state = message_status(message)
+                chunks.append(f'<p><b>Action · {html.escape(state)}</b> — {html.escape(payload.get("name","tool"))} &nbsp; <a href="letracode:action/{message["id"]}">View details</a></p>')
+                if payload.get('name') == 'remember':
+                    try:
+                        receipt = json.loads(result)
+                        ident = receipt.get('receipt_id') or receipt.get('id')
+                        if ident:
+                            chunks.append('<p><b>Memory saved</b> · ' + html.escape(str(receipt.get('path', ''))) + '<br>' + html.escape(receipt.get('saved_text', '')).replace('\n', '<br>') + f'<br><a href="letracode:undo-memory/{html.escape(ident)}">Undo this save</a></p>')
+                    except (ValueError, TypeError):
+                        pass
                 continue
             name = {'user':'You','assistant':'LetraCode','notice':'Notice'}.get(role,role)
-            state = '' if message['status']=='complete' else f' · {message["status"]}'
+            status = message_status(message)
+            state = f' · {status}' if status else ''
             chunks.append(f'<hr><p><b>{name}{html.escape(state)}</b></p>')
             text = message['content']
             if role == 'user' or role == 'notice':
                 chunks.append('<p>'+html.escape(text).replace('\n','<br>')+'</p>')
             elif text:
-                document = QTextDocument()
-                document.setDefaultFont(self.transcript.font())
-                document.setMarkdown(text,QTextDocument.MarkdownFeature.MarkdownDialectGitHub | QTextDocument.MarkdownFeature.MarkdownNoHTML)
-                body = re.search(r'<body[^>]*>(.*)</body>',document.toHtml(),re.S)
-                chunks.append(body.group(1) if body else html.escape(text))
+                chunks.append(assistant_html(text, self.transcript.font()))
             elif message['status']=='streaming':
                 chunks.append('<p>Working locally…</p>')
         self.transcript.setHtml('\n'.join(chunks))
@@ -514,12 +541,15 @@ class MainWindow(QMainWindow):
         self.worker = None
         if self.approval_dialog: self.approval_dialog.reject()
         self.set_busy(False); self.render_chat(); self.refresh_tree()
+        self.save_editors()
         if worker: worker.deleteLater()
         if self.closing_when_stopped: self.close()
         else: self.composer.setFocus()
 
     def retry_reply(self):
         if self.worker or not self.chat_id:
+            return
+        if self.save_editors() is False:
             return
         rows = self.store.messages(self.chat_id)
         user = next((r for r in reversed(rows) if r['role']=='user'),None)
@@ -537,6 +567,45 @@ class MainWindow(QMainWindow):
 
     def open_link(self,url):
         text = url.toString()
+        if text.startswith('letracode:undo-memory/'):
+            ident = text.removeprefix('letracode:undo-memory/')
+            # Only real saved tool receipts in this chat create Undo authority;
+            # model-written Markdown cannot address arbitrary receipt IDs.
+            allowed = False
+            for row in self.store.messages(self.chat_id) if self.chat_id else []:
+                if row['role'] != 'tool':
+                    continue
+                try:
+                    message = json.loads(row['payload']).get('message', {})
+                    receipt = json.loads(message.get('content', '{}'))
+                    allowed |= message.get('name') == 'remember' and ident == (receipt.get('receipt_id') or receipt.get('id'))
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            if not allowed or self.worker:
+                return
+            try:
+                receipt = self.store.strand.receipt(ident)
+                # A saved editor draft must survive task Undo unchanged. The
+                # file dialog includes missing paths and legacy aliases as well.
+                dialog = MemoryDialog(self.store, receipt.get('project_id'), self)
+                dialog.scope.setCurrentIndex(dialog.scope.findData(receipt.get('project_id')))
+                root = self.store.memory.root_for(receipt.get('project_id'))
+                try:
+                    relative = Path(receipt['path']).relative_to(root).as_posix()
+                    blocked = relative in dialog.saved_drafts()
+                except (KeyError, ValueError):
+                    blocked = bool(dialog.saved_drafts())
+                dialog.deleteLater()
+                if blocked:
+                    self.context_hint.setText('Your editor draft is kept separately. Save or Reload it in Files, saved drafts & history before undoing this change.')
+                    return
+                self.store.strand.undo(ident)
+                self.store.add_message(self.chat_id, 'notice', 'Memory save undone. Previous file contents restored.')
+                self.files_panel.refresh()
+                self.render_chat()
+            except (OSError, ValueError, RuntimeError) as error:
+                QMessageBox.warning(self, 'Memory could not be undone', str(error))
+            return
         if text == 'letracode:setup': self.model_setup(); return
         if text.startswith('letracode:action/'):
             ident = text.rsplit('/',1)[-1]
@@ -560,6 +629,24 @@ class MainWindow(QMainWindow):
         if ok and text and not self.transcript.find(text):
             cursor = self.transcript.textCursor(); cursor.movePosition(cursor.MoveOperation.Start); self.transcript.setTextCursor(cursor)
             self.transcript.find(text)
+
+    def export_evaluation(self):
+        if not self.chat_id:
+            return
+        notes, accepted = QInputDialog.getMultiLineText(self, 'Export Evaluation',
+            'Optional short notes for the evaluator (up to 8,000 characters):\n'
+            'The ZIP includes this saved conversation with privacy omissions.\n'
+            'Review transcript prose and notes before sharing.')
+        if not accepted:
+            return
+        name, _ = QFileDialog.getSaveFileName(self, 'Export Evaluation',
+            str(Path.home() / 'LetraCode-evaluation.zip'), 'ZIP archive (*.zip)')
+        if name:
+            try:
+                self.store.export_evaluation(self.chat_id, Path(name), notes)
+                self.statusBar().showMessage('Evaluation ZIP saved · review before sharing')
+            except (OSError, ValueError, sqlite3.Error) as error:
+                QMessageBox.warning(self, 'Evaluation export failed', str(error))
 
     def export_chat(self):
         if not self.chat_id:
@@ -591,7 +678,7 @@ class MainWindow(QMainWindow):
         self.text_dialog('Engine log',path.read_text(encoding='utf-8',errors='replace')[-100000:] if path.exists() else 'The local engine has not written a log yet.')
 
     def getting_started(self):
-        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\nOn Fedora, the installer installs the system Qt dependency. Install the inference engine with:\n  sudo dnf install llama-cpp\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders, then edit Memory, Current Context and Instructions. They save automatically.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Export chats or back up all app data using File. The backup includes a recovery guide. Linked files and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
+        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\nOn Fedora, the installer installs the system Qt dependency. Install the inference engine with:\n  sudo dnf install llama-cpp\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Use Project files to add existing files and folders, create notes and folders, and open or edit files. Save file applies note edits; navigation and Close keep unsaved note drafts separately. Files, saved drafts & history provides recovery and Undo. Shared files are available across projects. Always-active notes are included automatically; other notes are available to list, search and read when relevant. Set Project instructions in Settings.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
 
     def closeEvent(self,event):
         if self.worker:

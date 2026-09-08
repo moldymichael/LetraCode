@@ -4,16 +4,46 @@ LetraCode is a private desktop chat app for a local AI model. It uses Fedora's
 native Qt/PySide6 packages, follows your KDE style, and keeps conversations on
 your computer. There is no cloud inference, account, or telemetry.
 
+For the development baseline, current capabilities and verification boundaries,
+see [Current implementation state](docs/CURRENT-STATE.md).
+
+## Evaluation export and Memory folders
+
+**File → Export Evaluation…** saves the selected conversation as a portable ZIP
+with a readable transcript, ordered action/evidence records, recorded run
+settings, optional notes, and an explanatory README. Private source/Memory tool
+bodies are replaced by hashes and omission markers. Review conversation prose
+and notes before sharing; free-text secrets cannot all be detected automatically.
+An evaluation bundle is not a restorable backup.
+
+**Project files** puts your notes, folders and linked originals in one visible
+tree. Create notes and folders, attach existing files, or open them in your usual
+application. Text edits use explicit Save; external changes are checked before
+saving, and unsaved drafts and saved-change history remain recoverable.
+Project instructions live in a separate optional dialog.
+
+Existing Memory files stay in place. The former Current Context field is copied
+once to `Current Context.md`, preserving the original database value for recovery.
+A name collision gets a separate legacy filename. These notes become ordinary
+files available to the assistant's file tools. Existing always-active choices
+remain unchanged; advanced file settings and history remain accessible.
+
+Existing Strand files and their hidden recovery/history data migrate to `Memory`;
+your Strand identity remains your own configuration. Read the [migration and
+pre-install checks](docs/EVALUATION-MEMORY.md) before upgrading an existing data
+folder. This update uses the Linux reliability implementation; the separate
+Windows development checkout has not been integrated.
+
 ## Install on Fedora KDE
 
-1. Download `LetraCode-0.1.1.run`.
+1. Download `LetraCode-0.2.1.run`.
 2. Open Dolphin, go to Downloads, right-click an empty area, and choose
    **Open Terminal Here** (Konsole).
 3. Run:
 
    ```bash
-   chmod +x LetraCode-0.1.1.run
-   ./LetraCode-0.1.1.run
+   chmod +x LetraCode-0.2.1.run
+   ./LetraCode-0.2.1.run
    ```
 
 The installer shows the Fedora packages it needs, then uses `sudo dnf install`.
@@ -21,7 +51,7 @@ It installs only for your user. Start **LetraCode** from KDE's application
 launcher, or run `~/.local/bin/letracode` in Konsole.
 
 If you downloaded the source archive instead, extract it, open Konsole in the
-extracted `LetraCode-0.1.1` folder, and run `./install.sh`.
+extracted `LetraCode-0.2.1` folder, and run `./install.sh`.
 
 Version 0.1.1 fixes the Fedora 44 installation failure caused by the unavailable
 `python3-docx` package. It requires only `python3`, `python3-pyside6`, and
@@ -60,9 +90,11 @@ Installed application files live separately in
 `${XDG_DATA_HOME:-~/.local/share}/letracode-app`, so updates and uninstall do not
 delete your conversations.
 
-Choose **File → Back up all LetraCode data** while the app is open. Save the
-snapshot ZIP to your backup drive. It contains a consistent SQLite snapshot,
-human-readable JSON, and a restore guide. To remove the application while
+Choose **File → Back up chats, Memory and source backups** while the app is open. Save the
+snapshot ZIP to your backup drive. It contains a SQLite snapshot, human-readable JSON, Memory files and retained
+recovery history, app-owned pre-edit source backups, and a restore guide.
+Linked originals, model weights, logs and migration snapshots are excluded.
+See the consistency boundary in [the reliability report](docs/RELIABILITY-VERIFICATION.md). To remove the application while
 retaining its data folder, run:
 
 ```bash

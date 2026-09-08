@@ -82,7 +82,7 @@ def test_install_update_launch_and_uninstall_preserve_user_data(tmp_path: Path):
     version = subprocess.run(
         [str(launcher), "--version"], env=env, text=True, capture_output=True, check=True
     )
-    assert version.stdout.strip() == "LetraCode 0.1.1"
+    assert version.stdout.strip() == "LetraCode 0.2.1"
 
     (app_dir / "obsolete-file").write_text("old", encoding="utf-8")
     run_script(source / "install.sh", env, "--no-deps")
@@ -93,7 +93,7 @@ def test_install_update_launch_and_uninstall_preserve_user_data(tmp_path: Path):
     version_after_source_removal = subprocess.run(
         [str(launcher), "--version"], env=env, text=True, capture_output=True, check=True
     )
-    assert version_after_source_removal.stdout.strip() == "LetraCode 0.1.1"
+    assert version_after_source_removal.stdout.strip() == "LetraCode 0.2.1"
 
     uninstall = run_script(app_dir / "uninstall.sh", env)
     assert "User data was kept" in uninstall.stdout
@@ -103,6 +103,20 @@ def test_install_update_launch_and_uninstall_preserve_user_data(tmp_path: Path):
     assert not icon.exists()
     assert not metainfo.exists()
     assert sentinel.read_text(encoding="utf-8") == "my chats"
+
+
+def test_launcher_uses_installed_build_even_inside_another_checkout(tmp_path: Path):
+    env, home, _ = isolated_environment(tmp_path)
+    run_script(ROOT / 'install.sh', env, '--no-deps')
+    checkout = tmp_path / 'older-checkout'
+    package = checkout / 'letracode'
+    package.mkdir(parents=True)
+    (package / '__init__.py').write_text('')
+    (package / '__main__.py').write_text("print('Wrong checkout')")
+    result = subprocess.run([str(home / '.local/bin/letracode'), '--version'],
+        cwd=checkout, env=env, text=True, capture_output=True, check=True)
+    from letracode import __version__
+    assert result.stdout.strip() == 'LetraCode ' + __version__
 
 
 def test_install_refuses_to_replace_unmarked_directory(tmp_path: Path):
@@ -117,6 +131,23 @@ def test_install_refuses_to_replace_unmarked_directory(tmp_path: Path):
     assert result.returncode != 0
     assert "not a LetraCode installation" in result.stderr
     assert valuable.read_text(encoding="utf-8") == "leave this alone"
+
+
+def test_rpm_launcher_uses_packaged_code_inside_another_checkout(tmp_path):
+    from letracode import __version__
+    spec = (ROOT / 'packaging/letracode.spec').read_text()
+    script = spec.split("<<'EOF'\n", 1)[1].split('\nEOF', 1)[0]
+    data = tmp_path / 'share'
+    shutil.copytree(ROOT / 'letracode', data / 'letracode/letracode')
+    launcher = tmp_path / 'rpm-launcher'
+    launcher.write_text(script.replace('%{_datadir}', str(data)).replace('%{_bindir}/python3', sys.executable))
+    checkout = tmp_path / 'checkout'
+    (checkout / 'letracode').mkdir(parents=True)
+    (checkout / 'letracode/__init__.py').write_text('')
+    (checkout / 'letracode/__main__.py').write_text("print('Wrong checkout')")
+    result = subprocess.run(['sh', str(launcher), '--version'], cwd=checkout,
+        text=True, capture_output=True, check=True)
+    assert result.stdout.strip() == 'LetraCode ' + __version__
 
 
 @pytest.mark.parametrize("packaged", [False, True], ids=["source", "run-installer"])
@@ -168,7 +199,7 @@ def test_normal_install_succeeds_with_fedora_44_packages_and_no_docx(tmp_path: P
             [sys.executable, str(ROOT / "packaging/build-release.py"), "--output-dir", str(output)],
             check=True, capture_output=True,
         )
-        installer = output / "LetraCode-0.1.1.run"
+        installer = output / "LetraCode-0.2.1.run"
     installed = run_script(installer, env, check=False)
 
     assert installed.returncode == 0, installed.stdout + installed.stderr
@@ -211,14 +242,14 @@ def test_release_builder_makes_clean_source_archive_and_runnable_installer(tmp_p
         capture_output=True,
         check=True,
     )
-    source_archive = output / "LetraCode-0.1.1.tar.gz"
-    run_installer = output / "LetraCode-0.1.1.run"
+    source_archive = output / "LetraCode-0.2.1.tar.gz"
+    run_installer = output / "LetraCode-0.2.1.run"
     assert source_archive.is_file()
     assert run_installer.stat().st_mode & 0o111
 
     with tarfile.open(source_archive, "r:gz") as archive:
         names = set(archive.getnames())
-    prefix = "LetraCode-0.1.1/"
+    prefix = "LetraCode-0.2.1/"
     assert prefix + "README.md" in names
     assert prefix + "LICENSE" in names
     assert prefix + "tests/test_install.py" in names
@@ -234,5 +265,5 @@ def test_release_builder_makes_clean_source_archive_and_runnable_installer(tmp_p
     version = subprocess.run(
         [str(launcher), "--version"], env=env, text=True, capture_output=True, check=True
     )
-    assert version.stdout.strip() == "LetraCode 0.1.1"
+    assert version.stdout.strip() == "LetraCode 0.2.1"
     run_script(data_home / "letracode-app/uninstall.sh", env)
