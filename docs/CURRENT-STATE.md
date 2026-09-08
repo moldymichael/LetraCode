@@ -3,7 +3,10 @@
 The evaluation export and user-controlled Memory update uses branch
 `codex/evaluation-memory`, based on reliability commit `7863707`.
 See [migration, privacy and pre-install checks](EVALUATION-MEMORY.md) for its
-behavior and verification. This update is not installed over live app data.
+behavior and verification. A reported live migration failure involving deleted
+project history has a focused correction; see
+[migration recovery](MEMORY-MIGRATION-RECOVERY.md). Investigation and correction
+verification left the reported live data unchanged.
 
 The preceding reliability development used branch `codex/strand-reliability`, based on
 `e57b271753b01210e913a6314bdc715b17190f02` (`codex/strand-development-loop`).

@@ -55,6 +55,10 @@ original database snapshot. Conflicting destinations stop migration; the app
 does not merge or overwrite two existing roots. A durable migration record
 allows interrupted migration to resume with the existing files.
 
+A follow-up corrects migration of retained receipts for deleted projects,
+including retries after the root was already renamed. See the
+[failure explanation and exact recovery procedure](MEMORY-MIGRATION-RECOVERY.md).
+
 | Existing Strand data | Location after migration, relative to the app data folder |
 | --- | --- |
 | Identity | `Memory/identity/strand.md` |

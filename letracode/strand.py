@@ -521,6 +521,9 @@ class StrandFiles:
             raise ValueError('Invalid receipt destination')
         return path
 
+    def _recover_receipt_file(self, record, path):
+        recover_file(path)
+
     def receipt(self, receipt_id):
         if not isinstance(receipt_id, str) or not re.fullmatch(r'[a-f0-9]{32}', receipt_id):
             raise ValueError('Invalid receipt ID')
@@ -559,7 +562,7 @@ class StrandFiles:
                 # failed save. Only this receipt's actual write journal proves
                 # publication. Older prepared receipts lack that proof.
                 if record.get('write_id') == receipt_id:
-                    recover_file(path)
+                    self._recover_receipt_file(record, path)
                     journal = path.parent / '.strand-recovery' / path.name / (receipt_id + '.done')
                     raw_done = safe_read(journal, 4096)
                     if raw_done is not None:

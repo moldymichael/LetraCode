@@ -40,6 +40,8 @@ class MemoryFiles(StrandFiles):
                 if not initialize:
                     raise ValueError('Memory registry is missing; restore .memory.json from backup. Existing files were not changed.')
                 self._initialize(legacy)
+            if legacy:
+                self._register_legacy_history()
             self._recover_operations()
             # Each relocation is independently journaled. A restart resumes
             # only a move proven by its retained inode; it never guesses by text.
@@ -204,6 +206,45 @@ class MemoryFiles(StrandFiles):
                         'history_paths': [relative], 'recovery_paths': [], 'deleted': False}
         self._save_metadata(meta, None)
 
+    def _register_legacy_history(self):
+        """Retain identities for legacy project receipts whose file is gone.
+
+        Project deletion archived the note but kept receipts at their original
+        relative destination. Discovery from live files alone misses that
+        ownership. Also run on a prepared migration's existing registry, so a
+        retry preserves the identities already allocated before the failure.
+        """
+        meta, raw = self._metadata()
+        known = {row['project_id'] for row in meta['files'].values()
+                 if row.get('legacy_scope') == 'project'}
+        with safe_directory(self.root / '.receipts') as folder:
+            names = sorted(name for name in os.listdir(folder)
+                           if re.fullmatch(r'[a-f0-9]{32}\.json', name))
+        changed = False
+        for name in names:
+            try:
+                record = json.loads(safe_read(self.root / '.receipts' / name, MAX_RECEIPT_BYTES))
+            except (OSError, ValueError, TypeError, RecursionError):
+                # Normal receipt validation below supplies the exact diagnostic;
+                # invalid data cannot supply a new destination or escape scope.
+                continue
+            if not isinstance(record, dict) or record.get('scope') != 'project':
+                continue
+            project = record.get('project_id')
+            if not isinstance(project, str) or not re.fullmatch(r'[A-Za-z0-9_-]{1,128}', project):
+                continue
+            relative = f'memory/projects/{project}.md'
+            if (record.get('relative_path') != relative or project in known or
+                    os.path.lexists(self.root / relative)):
+                continue
+            meta['files'][uuid.uuid4().hex] = {'path': relative, 'project_id': project,
+                'always_active': False, 'legacy_scope': 'project',
+                'history_paths': [relative], 'recovery_paths': [], 'deleted': True}
+            known.add(project)
+            changed = True
+        if changed:
+            self._save_metadata(meta, raw)
+
     def _alias(self, scope, project_id=None):
         self._project(project_id)
         if (scope == 'project') != (project_id is not None) or scope not in (*self.SCOPES, 'project'):
@@ -364,6 +405,12 @@ class MemoryFiles(StrandFiles):
     def _receipt_group_key(self, row):
         return row.get('file_identity', row['relative_path'])
 
+    def _recover_receipt_file(self, record, path):
+        meta, _ = self._metadata()
+        row = meta['files'][record['file_identity']]
+        if not row['deleted']:
+            super()._recover_receipt_file(record, path)
+
     def receipt(self, receipt_id):
         record = super().receipt(receipt_id)
         if record['status'] != 'unconfirmed' or record.get('write_id') != receipt_id:
@@ -373,7 +420,7 @@ class MemoryFiles(StrandFiles):
         for old in (row or {}).get('recovery_paths', []):
             path = self._checked_storage(old)
             try:
-                recover_file(path)
+                self._recover_receipt_file(record, path)
                 journal = path.parent / '.strand-recovery' / path.name / (receipt_id + '.done')
                 raw = safe_read(journal, 4096)
                 done = json.loads(raw) if raw is not None else {}
