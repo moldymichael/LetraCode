@@ -1,7 +1,7 @@
 # Installed 0.4.0 update
 
 On September 9, 2026, the user's desktop launcher pointed to the per-user
-installation at `~/.local/share/letracode-app`, reporting 0.3.0. Its 29 Python
+installation at `~/.local/share/letracode-app`, reporting 0.3.0. Its 28 Python
 modules matched the unfinished `codex/multi-model-current` worktree exactly.
 That installed build had two-model conversations absent from GitHub main.
 
