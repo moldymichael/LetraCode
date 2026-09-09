@@ -14,13 +14,14 @@ from PySide6.QtGui import QAction, QDesktopServices, QFontDatabase, QIcon, QKeyS
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QSplitter, QTabWidget, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
+    QSpinBox, QSplitter, QTabWidget, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget)
 
 from . import __version__
 from .dialogs import ApprovalDialog, ModelDialog
 from .engine import EngineConfig, LocalEngine
 from .worker import ConversationWorker
+from .dialogue import DialogueWorker, dialogue_participants
 from .store import message_status
 from .memory_ui import MemoryDialog
 from .project_files import ProjectFilesPanel
@@ -64,6 +65,8 @@ class MainWindow(QMainWindow):
         self.chat_id = None
         self.project_id = None
         self.worker = None
+        self.busy = False
+        self.exchange_start_id = None
         self.approval_dialog = None
         self.loading = False
         self.thinking_expanded = {}
@@ -77,7 +80,7 @@ class MainWindow(QMainWindow):
             self.engine_config = EngineConfig()
         if not self.engine_config.executable:
             self.engine_config.executable = shutil.which('llama-server.exe' if is_windows() else 'llama-server') or ''
-        self.engine = LocalEngine(self.engine_config,store.directory)
+        self.engine = LocalEngine(dataclasses.replace(self.engine_config, secondary_model_path=''),store.directory)
         self.setWindowTitle('LetraCode')
         available = self.screen().availableGeometry()
         self.resize(min(1260, available.width() - 32), min(820, available.height() - 64))
@@ -155,6 +158,28 @@ class MainWindow(QMainWindow):
         self.model_label.setTextFormat(Qt.TextFormat.PlainText)
         self.model_label.setWordWrap(True)
         center.addWidget(self.model_label)
+        exchange = QHBoxLayout()
+        self.conversation_mode = QComboBox()
+        self.conversation_mode.addItems(['Single model', 'Two models'])
+        self.conversation_mode.setToolTip('Two local models take turns in one shared conversation. Each exchange stops after the selected number of replies.')
+        exchange.addWidget(self.conversation_mode)
+        self.speaker_label = QLabel('Next speaker')
+        exchange.addWidget(self.speaker_label)
+        self.first_speaker = QComboBox()
+        self.first_speaker.addItems(['Model A', 'Model B'])
+        exchange.addWidget(self.first_speaker)
+        self.replies_label = QLabel('Replies')
+        exchange.addWidget(self.replies_label)
+        self.reply_count = QSpinBox()
+        self.reply_count.setRange(1, 4)
+        self.reply_count.setValue(2)
+        self.reply_count.setToolTip('Total replies in this exchange, alternating between models. The exchange always stops at this limit.')
+        exchange.addWidget(self.reply_count)
+        exchange.addStretch()
+        center.addLayout(exchange)
+        self.dialogue_hint = QLabel('Each exchange stops at the reply limit. Two-model mode has no tools or internet access; Computer can still include project files.')
+        self.dialogue_hint.setWordWrap(True)
+        center.addWidget(self.dialogue_hint)
         self.transcript = SafeBrowser()
         self.transcript.setOpenLinks(False)
         self.transcript.setOpenExternalLinks(False)
@@ -165,9 +190,13 @@ class MainWindow(QMainWindow):
         self.copy_button.clicked.connect(self.copy_reply)
         self.retry_button = QPushButton(QIcon.fromTheme('view-refresh'),'Retry reply')
         self.retry_button.clicked.connect(self.retry_reply)
+        self.continue_button = QPushButton('Continue exchange')
+        self.continue_button.setToolTip('Continue the shared conversation for the selected number of replies. Send or clear your draft first.')
+        self.continue_button.clicked.connect(self.continue_exchange)
         self.learn_button = QPushButton('Learn from reply…')
         self.learn_button.clicked.connect(self.learn_from_reply)
-        row.addWidget(self.copy_button); row.addWidget(self.retry_button); row.addWidget(self.learn_button); row.addStretch()
+        row.addWidget(self.copy_button); row.addWidget(self.retry_button)
+        row.addWidget(self.continue_button); row.addWidget(self.learn_button); row.addStretch()
         self.mode = QComboBox(); self.mode.addItems(['Instant','Thinking'])
         self.mode.setToolTip('Thinking asks compatible models to reason before replying. Emitted thinking appears live in a separate, collapsible block. Support depends on your model and engine.')
         self.mode.setCurrentText(self.store.setting('mode','Instant'))
@@ -177,6 +206,7 @@ class MainWindow(QMainWindow):
         self.composer.setPlaceholderText('Ask a question…   Ctrl+Enter to send; Enter for a new line.')
         self.composer.setMinimumHeight(90); self.composer.setMaximumHeight(180)
         self.composer.textChanged.connect(self.schedule_save)
+        self.composer.textChanged.connect(self.update_conversation_controls)
         self.composer.submitted.connect(self.send)
         center.addWidget(self.composer)
         controls = QHBoxLayout()
@@ -212,6 +242,9 @@ class MainWindow(QMainWindow):
         self.splitter.addWidget(self.context_panel)
         self.splitter.setSizes([240,700,320])
         self.splitter.setStretchFactor(1,1)
+        self.conversation_mode.currentIndexChanged.connect(self.conversation_options_changed)
+        self.first_speaker.currentIndexChanged.connect(self.conversation_options_changed)
+        self.reply_count.valueChanged.connect(self.conversation_options_changed)
 
     def action(self, menu, title, callback, shortcut=None):
         action = QAction(title,self)
@@ -300,11 +333,13 @@ class MainWindow(QMainWindow):
         chat = self.store.chat(chat_id) if chat_id else None
         self.chat_title.setText(chat['title'] if chat else project['title'] if project else 'A little room to think.')
         self.composer.setPlainText(chat['draft'] if chat else self.store.setting('unbound_draft_' + (project_id or 'global'),''))
+        self.load_conversation_options()
         self.files_panel.set_project(project_id)
         self.instructions_action.setEnabled(project is not None and not self.worker)
         self.loading = False
         self.selection_ready = True
         self.store.set_setting('last_chat',chat_id)
+        self.sync_engine()
         self.render_chat()
 
     def schedule_save(self):
@@ -320,6 +355,50 @@ class MainWindow(QMainWindow):
         else:
             self.store.set_setting('unbound_draft_' + (self.project_id or 'global'),self.composer.toPlainText())
         return True
+
+    def conversation_options_key(self):
+        return 'dialogue_' + self.chat_id if self.chat_id else 'dialogue_unbound_' + (self.project_id or 'global')
+
+    def conversation_options(self):
+        return {'enabled': self.conversation_mode.currentIndex() == 1,
+                'first_speaker': self.first_speaker.currentIndex(), 'reply_count': self.reply_count.value()}
+
+    def load_conversation_options(self):
+        options = self.store.setting(self.conversation_options_key(), {})
+        if not isinstance(options, dict):
+            options = {}
+        self.conversation_mode.setCurrentIndex(1 if options.get('enabled') is True else 0)
+        self.first_speaker.setCurrentIndex(1 if options.get('first_speaker') == 1 else 0)
+        count = options.get('reply_count', 2)
+        self.reply_count.setValue(count if type(count) is int and 1 <= count <= 4 else 2)
+
+    def conversation_options_changed(self, *_):
+        if self.loading:
+            return
+        self.store.set_setting(self.conversation_options_key(), self.conversation_options())
+        self.sync_engine()
+        self.render_chat()
+
+    def sync_engine(self):
+        if self.worker or self.training_panel.job is not None:
+            return
+        config = self.engine_config if self.conversation_mode.currentIndex() == 1 else dataclasses.replace(self.engine_config, secondary_model_path='')
+        if config != self.engine.config:
+            self.engine.stop()
+            self.engine = LocalEngine(config, self.store.directory)
+
+    def update_conversation_controls(self):
+        multi = self.conversation_mode.currentIndex() == 1
+        for widget in (self.speaker_label, self.first_speaker, self.replies_label, self.reply_count, self.dialogue_hint, self.continue_button):
+            widget.setVisible(multi)
+        for widget in (self.conversation_mode, self.first_speaker, self.reply_count):
+            widget.setEnabled(not self.busy)
+        self.actions.setEnabled(not self.busy and not multi)
+        self.internet.setEnabled(not self.busy and not multi)
+        has_prompt = bool(self.chat_id and any(m['role'] == 'user' for m in self.store.messages(self.chat_id)))
+        self.continue_button.setEnabled(not self.busy and multi and has_prompt and not self.composer.toPlainText().strip())
+        self.retry_button.setEnabled(not self.busy and not multi and has_prompt)
+        self.retry_button.setToolTip('Use Continue exchange to add model replies without repeating your prompt.' if multi else 'Repeat your last prompt as a new turn; previous replies are kept.')
 
     def edit_memory(self):
         if not self.worker:
@@ -348,6 +427,7 @@ class MainWindow(QMainWindow):
             return
         self.save_editors()
         chat = self.store.create_chat('New chat',self.project_id)
+        self.store.set_setting('dialogue_' + chat, self.conversation_options())
         self.select_chat(chat); self.composer.setFocus()
 
     def new_project(self, checked=False):
@@ -427,11 +507,23 @@ class MainWindow(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.engine.stop()
             self.engine_config = dialog.config()
-            self.engine = LocalEngine(self.engine_config,self.store.directory)
+            config = self.engine_config if self.conversation_mode.currentIndex() == 1 else dataclasses.replace(self.engine_config, secondary_model_path='')
+            self.engine = LocalEngine(config,self.store.directory)
             self.store.set_setting('engine',dataclasses.asdict(self.engine_config))
             self.store.set_setting('training_active_version', None)
             self.render_chat()
-            self.statusBar().showMessage('Model configured. Send a message to load it.')
+            self.statusBar().showMessage('Models configured. Send a message to load the selected conversation mode.')
+
+    def prepare_engine(self):
+        multi = self.conversation_mode.currentIndex() == 1
+        if not self.engine_config.model_path or not self.engine_config.executable or (multi and not self.engine_config.secondary_model_path):
+            self.model_setup()
+            if not self.engine_config.model_path or not self.engine_config.executable or (multi and not self.engine_config.secondary_model_path):
+                if multi:
+                    self.statusBar().showMessage('Choose two different local GGUF models in Model Setup before starting an exchange.')
+                return False
+        self.sync_engine()
+        return True
 
     def send(self):
         if self.worker or self.training_panel.job is not None:
@@ -439,10 +531,8 @@ class MainWindow(QMainWindow):
         text = self.composer.toPlainText().strip()
         if not text:
             return
-        if not self.engine_config.model_path or not self.engine_config.executable:
-            self.model_setup()
-            if not self.engine_config.model_path or not self.engine_config.executable:
-                return
+        if not self.prepare_engine():
+            return
         # Save the unbound conversation draft before selecting
         # a new chat, whose composer would otherwise start empty.
         if self.save_editors() is False:
@@ -450,6 +540,7 @@ class MainWindow(QMainWindow):
         if not self.chat_id:
             scope = self.project_id or 'global'
             c = self.store.create_chat('New chat',self.project_id)
+            self.store.set_setting('dialogue_' + c, self.conversation_options())
             self.store.set_draft(c,self.composer.toPlainText())
             self.select_chat(c)
             self.store.set_setting('unbound_draft_' + scope,'')
@@ -462,21 +553,42 @@ class MainWindow(QMainWindow):
         self.composer.clear(); self.store.set_draft(self.chat_id,'')
         self.start_worker()
 
+    def continue_exchange(self):
+        if self.worker or self.training_panel.job is not None or not self.chat_id or self.conversation_mode.currentIndex() != 1:
+            return
+        if self.composer.toPlainText().strip():
+            self.statusBar().showMessage('Send or clear your draft before continuing the exchange.')
+            return
+        if not any(m['role'] == 'user' for m in self.store.messages(self.chat_id)) or not self.prepare_engine():
+            return
+        if self.save_editors() is False:
+            return
+        self.start_worker()
+
     def start_worker(self):
         if self.worker or self.training_panel.job is not None:
             return
         self.store.set_setting('mode',self.mode.currentText())
         for key,widget in [('computer',self.computer),('internet',self.internet),('actions',self.actions)]:
             self.store.set_setting(key,widget.isChecked())
-        self.worker = ConversationWorker(self.store,self.chat_id,self.engine,self.mode.currentText()=='Thinking',self.internet.isChecked(),self.computer.isChecked(),self.actions.isChecked())
+        self.store.set_setting(self.conversation_options_key(), self.conversation_options())
+        if self.conversation_mode.currentIndex() == 1:
+            rows = self.store.messages(self.chat_id)
+            self.exchange_start_id = rows[-1]['id'] if rows else 0
+            self.worker = DialogueWorker(self.store,self.chat_id,self.engine,thinking=self.mode.currentText()=='Thinking',computer_enabled=self.computer.isChecked(),first_speaker=self.first_speaker.currentIndex(),reply_count=self.reply_count.value())
+        else:
+            self.exchange_start_id = None
+            self.worker = ConversationWorker(self.store,self.chat_id,self.engine,self.mode.currentText()=='Thinking',self.internet.isChecked(),self.computer.isChecked(),self.actions.isChecked())
         self.worker.changed.connect(self.queue_render)
         self.worker.status.connect(self.statusBar().showMessage)
+        self.worker.status.connect(self.queue_render)
         self.worker.approval_needed.connect(self.show_approval)
         self.worker.finished.connect(self.worker_finished)
         self.set_busy(True); self.refresh_tree(); self.render_chat()
         self.worker.start()
 
     def set_busy(self,busy):
+        self.busy = busy
         for widget in (self.tree,self.search,self.new_chat_button,self.new_project_button,self.model_button,self.composer,self.send_button,self.retry_button,self.mode,self.computer,self.internet,self.actions):
             widget.setEnabled(not busy)
         self.files_panel.set_busy(busy)
@@ -486,6 +598,7 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(self.worker is not None)
         self.learn_button.setEnabled(not busy)
         self.training_panel.set_chat_busy(busy)
+        self.update_conversation_controls()
 
     def queue_render(self):
         if not self.render_timer.isActive():
@@ -495,7 +608,17 @@ class MainWindow(QMainWindow):
         model = Path(self.engine_config.model_path).name if self.engine_config.model_path else 'No model selected'
         if self.engine_config.lora_path:
             model += ' + adapter ' + Path(self.engine_config.lora_path).name
-        self.model_label.setText(f'{model}  ·  Local inference' if self.engine_config.model_path else 'Choose a local model in Model Setup to begin.')
+        if self.conversation_mode.currentIndex() == 1:
+            loaded = getattr(self.engine, 'loaded_models', ())
+            a_state = 'loaded' if 'local' in loaded else 'not loaded'
+            b_state = 'loaded' if 'local-b' in loaded else 'not loaded'
+            second = Path(self.engine_config.secondary_model_path).name if self.engine_config.secondary_model_path else 'Choose in Model Setup'
+            state = 'Exchange running' if self.worker else 'Paused · Send or Continue exchange'
+            if self.worker and not all(alias in loaded for alias in ('local', 'local-b')):
+                state = 'Loading models…'
+            self.model_label.setText(f'Model A · {model} · {a_state}\nModel B · {second} · {b_state}\n{state} · {self.reply_count.value()} replies per exchange')
+        else:
+            self.model_label.setText(f'{model}  ·  Local inference' if self.engine_config.model_path else 'Choose a local model in Model Setup to begin.')
         scrollbar = self.transcript.verticalScrollBar()
         previous = scrollbar.value(); bottom = previous >= scrollbar.maximum()-50
         messages = self.store.messages(self.chat_id) if self.chat_id else []
@@ -521,9 +644,17 @@ class MainWindow(QMainWindow):
                         pass
                 continue
             name = {'user':'You','assistant':'LetraCode','notice':'Notice'}.get(role,role)
+            if role == 'assistant':
+                try:
+                    metadata = json.loads(message.get('payload') or '{}')
+                except (TypeError, ValueError):
+                    metadata = {}
+                speaker = metadata.get('speaker') if isinstance(metadata, dict) else None
+                if isinstance(speaker, dict) and isinstance(speaker.get('label'), str):
+                    name = speaker['label']
             status = message_status(message)
             state = f' · {status}' if status else ''
-            chunks.append(f'<hr><p><b>{name}{html.escape(state)}</b></p>')
+            chunks.append(f'<hr><p><b>{html.escape(name)}{html.escape(state)}</b></p>')
             reasoning = ''
             if role == 'assistant':
                 try:
@@ -553,7 +684,7 @@ class MainWindow(QMainWindow):
             chat = self.store.chat(self.chat_id)
             if chat: self.chat_title.setText(chat['title'])
         self.copy_button.setEnabled(any(m['role']=='assistant' and m['content'] for m in messages))
-        self.retry_button.setEnabled(not self.worker and self.training_panel.job is None and any(m['role']=='user' for m in messages))
+        self.update_conversation_controls()
 
     def show_approval(self,pending):
         if pending.event.is_set() or not self.worker:
@@ -574,15 +705,26 @@ class MainWindow(QMainWindow):
     def worker_finished(self):
         worker = self.worker
         self.worker = None
+        if self.exchange_start_id is not None:
+            participants = dialogue_participants(self.engine_config)
+            rows = self.store.messages(self.chat_id)
+            completed = [m for m in rows if m['id'] > self.exchange_start_id and m['role'] == 'assistant' and m['status'] == 'complete']
+            if completed:
+                speaker = json.loads(completed[-1]['payload']).get('speaker', {})
+                for index, participant in enumerate(participants):
+                    if speaker.get('id') == participant['id']:
+                        self.first_speaker.setCurrentIndex(1 - index)
+                        break
+            self.exchange_start_id = None
         if self.approval_dialog: self.approval_dialog.reject()
-        self.set_busy(False); self.render_chat(); self.refresh_tree()
+        self.set_busy(False); self.files_panel.refresh(); self.render_chat(); self.refresh_tree()
         self.save_editors()
         if worker: worker.deleteLater()
         if self.closing_when_stopped: self.close()
         else: self.composer.setFocus()
 
     def retry_reply(self):
-        if self.worker or self.training_panel.job is not None or not self.chat_id:
+        if self.worker or self.training_panel.job is not None or not self.chat_id or self.conversation_mode.currentIndex() == 1:
             return
         if self.save_editors() is False:
             return
@@ -716,7 +858,7 @@ class MainWindow(QMainWindow):
     def unload_model(self):
         if self.worker:
             QMessageBox.information(self,'Model is busy','Stop the current reply before unloading the model.'); return
-        self.engine.stop(); self.statusBar().showMessage('Model unloaded from memory')
+        self.engine.stop(); self.render_chat(); self.statusBar().showMessage('Models unloaded from memory')
 
     def show_log(self):
         path = self.store.directory/'engine.log'

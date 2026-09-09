@@ -4,11 +4,18 @@ The **0.4.0 source update** adds a Fine-Tuning workspace for reviewed datasets,
 offline text-only Llama LoRA optimization, held-out comparisons, GGUF adapter
 conversion, explicit adoption and rollback. Regular chat preserves and displays
 reasoning emitted by compatible models. It starts from GitHub `main` at
-`c9f6392`, preserving the 0.3.0 Strand/Memory behavior below. It does not include
-the divergent unfinished two-model work in the old 0.2.0 checkout.
+`c9f6392`, preserving the 0.3.0 Strand/Memory behavior below. The installed
+0.3.0 two-model additions were then integrated before upgrading the live app.
 See [setup and workflow](FINE-TUNING.md) and
 [verification](FINE-TUNING-VERIFICATION.md). Original worktrees and user models
-are preserved. Current source changes do not replace already installed apps.
+are preserved. The per-user launcher installation was updated and opened after
+combined regression and copied-data checks. See the
+[installed update record](INSTALLED-0.4.0-UPDATE.md).
+
+The local two-model update adds explicit, finite model-to-model exchanges on
+the 0.3.0/schema-3 baseline. See [the integration record](MULTI-MODEL-UPDATE.md)
+and README for controls and verification. Existing Memory, evaluation and
+single-model continuation features remain available.
 
 The **0.3.0 Windows release** adds a self-contained Windows x64 installer and
 portable download to the current app. Windows uses native file handles and
@@ -40,8 +47,8 @@ identify this baseline. Existing worktrees and live app data are preserved.
 The stack is Python 3.11+, PySide6/Qt, SQLite schema **3**, ordinary user-owned
 Memory directories and managed local llama.cpp inference. Guarded storage uses
 Linux descriptor-relative operations or native Windows handles. There is one
-configured model with Instant/Thinking modes; multiple model roles remain a
-future decision.
+configured primary model with Instant/Thinking modes, plus an optional second
+model for explicitly bounded shared conversations.
 
 Existing capabilities include persistent chats/projects/drafts, guarded source
 edits, file hashes, retained recovery inodes, conflict-aware memory saves and

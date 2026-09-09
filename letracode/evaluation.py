@@ -55,7 +55,7 @@ _PATH_KEYS = {'path', 'cwd', 'backup', 'model_path', 'executable', 'root', 'dire
 _CONFIG_FIELDS = {'thinking', 'mode', 'context_size', 'max_tokens', 'temperature', 'gpu_layers',
                   'threads', 'web_enabled', 'computer_enabled', 'use_tools', 'actions_enabled',
                   'internet_enabled', 'model', 'executable', 'model_name', 'engine_name',
-                  'adapter_name', 'training_version'}
+                  'adapter_name', 'training_version', 'conversation_mode'}
 
 README = '''# LetraCode evaluation bundle
 
@@ -214,6 +214,9 @@ class _Projection:
             payload['export_warning'] = raw['export_warning']
         if 'run_configuration' in raw:
             payload['run_configuration'] = self.configuration(raw['run_configuration'])
+        if row['role'] == 'assistant' and isinstance(raw.get('speaker'), dict):
+            payload['speaker'] = {key: self.text(value) for key, value in raw['speaker'].items()
+                                  if key in ('id', 'label', 'model') and isinstance(value, str)}
         reply = raw.get('message') if isinstance(raw.get('message'), dict) else {}
         result = {key: row[key] for key in ('id', 'role', 'status', 'created')}
         result['status_label'] = message_status(row)
@@ -308,7 +311,8 @@ def export_evaluation(store, chat_id, destination, notes=''):
         data = row['payload']
         base = {'message_id': row['id'], 'created': row['created'], 'status': row['status']}
         events.append({**base, 'kind': 'message', 'role': row['role'], 'content': row['content']})
-        transcript.append(f"## {row['role'].title()} · {row['status_label'] or row['status']} · #{row['id']} · {row['created']}\n\n{row['content']}\n")
+        speaker = data.get('speaker', {}).get('label') or row['role'].title()
+        transcript.append(f"## {speaker} · {row['status_label'] or row['status']} · #{row['id']} · {row['created']}\n\n{row['content']}\n")
         reply = data.get('message', {})
         for call in reply.get('tool_calls', []):
             events.append({**base, 'kind': 'action_request', 'request': call})

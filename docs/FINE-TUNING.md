@@ -5,6 +5,12 @@ Its adapters apply to the configured local chat model, including conversations
 using Strand identity, Memory and action tools. Model training and file-based
 Memory are separate: saving a note never trains weights.
 
+The installed two-model workflow is retained. An adopted adapter applies to
+the primary model (Model A) only; Model B remains unadapted. Each speaker's
+emitted thinking stays with its own saved reply. Training blocks both Send and
+Continue exchange until the job ends. Single-model adoption checks the primary
+model without loading the optional second model, while preserving that selection.
+
 ## Prepare a training environment
 
 Training requires a separate Python environment with PyTorch, Transformers,

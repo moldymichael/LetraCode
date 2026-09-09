@@ -369,7 +369,7 @@ class FineTuningPanel(QWidget):
         if run['status'] != 'succeeded' or not report.get('adapter_gguf_sha256'):
             self.error('Select a version with completed evaluation and a converted GGUF adapter.'); return
         answer = QMessageBox.question(self, 'Adopt this version?',
-            'Load this adapter and its selected base GGUF for Chat? The previous model configuration will be saved for rollback. Review the evaluation results before proceeding.',
+            'Load this adapter and its selected base GGUF as Model A for Chat? Model B stays as configured. The previous model configuration will be saved for rollback. Review the evaluation results before proceeding.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
         if answer == QMessageBox.StandardButton.Yes:
             self.start_activation(run_id=self.run_id)
@@ -387,7 +387,8 @@ class FineTuningPanel(QWidget):
         if rollback is None and run_id == self.store.setting('training_active_version'):
             return
         self.main_window.engine.stop()
-        self.job = ActivationWorker(self.repository, self.main_window.engine_config, run_id, rollback, self)
+        self.job = ActivationWorker(self.repository, self.main_window.engine_config, run_id, rollback, self,
+                                    secondary_enabled=self.main_window.conversation_mode.currentIndex() == 1)
         self.job.status.connect(self.progress.setText)
         self.job.failed.connect(self.progress.setText)
         self.job.ready.connect(self.activation_ready)
@@ -399,12 +400,13 @@ class FineTuningPanel(QWidget):
         job = self.job
         if job is None or job.cancelled.is_set() or self.main_window.closing_when_stopped:
             engine.stop(); return
+        selected_config = job.selected_config
         previous = dataclasses.asdict(self.main_window.engine_config)
         previous_version = self.store.setting('training_active_version')
         new_version = job.run_id if job.rollback is None else self.store.setting('training_previous_version')
         try:
             with self.store.connection() as db:
-                for key, value in [('engine', dataclasses.asdict(engine.config)),
+                for key, value in [('engine', dataclasses.asdict(selected_config)),
                     ('training_previous_engine', previous), ('training_active_version', new_version),
                     ('training_previous_version', previous_version)]:
                     db.execute('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
@@ -412,7 +414,7 @@ class FineTuningPanel(QWidget):
         except Exception as error:
             engine.stop(); self.progress.setText(str(error)); return
         self.main_window.engine = engine
-        self.main_window.engine_config = engine.config
+        self.main_window.engine_config = selected_config
         self.main_window.render_chat()
         self.progress.setText('Selected model loaded and saved. Chat will use this configuration after restart.')
 

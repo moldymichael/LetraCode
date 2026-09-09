@@ -602,6 +602,14 @@ class Store:
         chunks = [f"# {chat['title']}\n"]
         for m in self.messages(chat_id):
             title = {'user':'You', 'assistant':'LetraCode', 'tool':'Action', 'notice':'Notice'}.get(m['role'], m['role'])
+            if m['role'] == 'assistant':
+                try:
+                    data = json.loads(m.get('payload') or '{}')
+                    speaker = data.get('speaker') if isinstance(data, dict) else None
+                    if isinstance(speaker, dict) and isinstance(speaker.get('label'), str):
+                        title = speaker['label'] or title
+                except (TypeError, ValueError):
+                    pass
             status = message_status(m)
             suffix = f' · {status}' if status else ''
             chunks.append(f"## {title}{suffix}\n\n{m['content']}\n")

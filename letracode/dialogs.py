@@ -64,7 +64,7 @@ class ModelDialog(QDialog):
     def __init__(self, config: EngineConfig, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Model Setup — LetraCode')
-        self.resize(690, 580)
+        self.resize(690, 660)
         layout = QVBoxLayout(self)
         intro = QLabel('Choose the local engine and model. LetraCode starts and stops the engine for you. Your conversations stay on this computer.')
         intro.setWordWrap(True)
@@ -74,10 +74,12 @@ class ModelDialog(QDialog):
         self.executable.setPlaceholderText(r'C:\llama.cpp\llama-server.exe' if is_windows() else '/usr/bin/llama-server')
         self.model = QLineEdit(config.model_path)
         self.model.setPlaceholderText('Choose a local .gguf instruction/chat model')
+        self.secondary_model = QLineEdit(config.secondary_model_path)
+        self.secondary_model.setPlaceholderText('Optional: a different GGUF for two-model conversations')
         self.lora = QLineEdit(config.lora_path)
-        self.lora.setPlaceholderText('Optional local .gguf LoRA adapter')
-        self.lora.setToolTip('The adapter must match the selected base model. Changing the model keeps this selection; clear it to use only the base model.')
-        for label, field, mode in [('Engine executable',self.executable,'engine'),('Model file',self.model,'model'),('LoRA adapter (optional)',self.lora,'adapter')]:
+        self.lora.setPlaceholderText('Optional local .gguf LoRA adapter for Model A')
+        self.lora.setToolTip('The adapter applies only to Model A and must match its base model. Changing Model A keeps this selection; clear it to use only the base model.')
+        for label, field, mode in [('Engine executable',self.executable,'engine'),('Model A file',self.model,'model'),('Model B file (optional)',self.secondary_model,'model'),('Model A LoRA adapter (optional)',self.lora,'adapter')]:
             row = QWidget(); line = QHBoxLayout(row); line.setContentsMargins(0,0,0,0)
             line.addWidget(field)
             browse = QPushButton('Browse…')
@@ -88,7 +90,7 @@ class ModelDialog(QDialog):
                 clear.clicked.connect(self.lora.clear)
                 line.addWidget(clear)
             form.addRow(label,row)
-        adapter_note = QLabel('An adapter must match its base model. Clear the adapter when selecting an unrelated model.')
+        adapter_note = QLabel('The adapter applies only to Model A and must match its base model. Clear the adapter when selecting an unrelated Model A.')
         adapter_note.setWordWrap(True)
         form.addRow('', adapter_note)
         self.context = QSpinBox(); self.context.setRange(8192,131072); self.context.setSingleStep(4096); self.context.setValue(config.context_size)
@@ -102,6 +104,9 @@ class ModelDialog(QDialog):
         for label, field in [('Context size (tokens)',self.context),('Maximum reply (tokens)',self.tokens),('GPU layers',self.layers),('CPU threads',self.threads),('Temperature',self.temperature)]:
             form.addRow(label,field)
         layout.addLayout(form)
+        memory_note = QLabel('Two-model conversations keep both models loaded and use these settings for each model. Allow enough RAM/VRAM for both weights and context buffers. A current llama.cpp build with multi-model support is required.')
+        memory_note.setWordWrap(True)
+        layout.addWidget(memory_note)
         note = QLabel(engine_setup_help() + ' Then select an instruction/chat GGUF. Model weights are separate downloads and can be several GB. Tool use and Thinking depend on the model and its chat template. If loading fails, check the engine log under Help.')
         note.setWordWrap(True)
         layout.addWidget(note)
@@ -129,16 +134,27 @@ class ModelDialog(QDialog):
         if not executable.is_file() or not os.access(executable, access) or (is_windows() and executable.suffix.lower() != '.exe'):
             QMessageBox.warning(self,'Engine not found','Select an executable llama-server. ' + engine_setup_help())
             return
-        if not model.is_file():
-            QMessageBox.warning(self,'Model not found','Choose an existing local GGUF file.')
-            return
-        try:
-            with model.open('rb') as file:
-                valid = file.read(4) == b'GGUF'
-        except OSError as error:
-            QMessageBox.warning(self,'Cannot read model',str(error)); return
-        if not valid:
-            QMessageBox.warning(self,'Not a GGUF model','The selected file does not have a GGUF header. Choose a complete GGUF model download.'); return
+        models = [('Model A', model)]
+        if self.secondary_model.text().strip():
+            models.append(('Model B', Path(self.secondary_model.text()).expanduser()))
+        for label, path in models:
+            if not path.is_file():
+                QMessageBox.warning(self,'Model not found',f'{label}: choose an existing local GGUF file.')
+                return
+            try:
+                with path.open('rb') as file:
+                    valid = file.read(4) == b'GGUF'
+            except OSError as error:
+                QMessageBox.warning(self,'Cannot read model',str(error)); return
+            if not valid:
+                QMessageBox.warning(self,'Not a GGUF model',f'{label}: the selected file does not have a GGUF header. Choose a complete GGUF model download.'); return
+        if len(models) == 2:
+            try:
+                same = models[0][1].samefile(models[1][1])
+            except OSError as error:
+                QMessageBox.warning(self,'Cannot compare models',str(error)); return
+            if same:
+                QMessageBox.warning(self,'Choose different models','Model A and Model B must be different local GGUF files.'); return
         try:
             validated_lora_path(self.lora.text())
         except EngineError as error:
@@ -149,7 +165,8 @@ class ModelDialog(QDialog):
 
     def config(self):
         adapter = str(Path(self.lora.text()).expanduser().resolve()) if self.lora.text().strip() else ''
-        return EngineConfig(executable=str(Path(self.executable.text()).expanduser().resolve()),model_path=str(Path(self.model.text()).expanduser().resolve()),context_size=self.context.value(),gpu_layers=self.layers.value(),threads=self.threads.value(),max_tokens=self.tokens.value(),temperature=self.temperature.value(),lora_path=adapter)
+        secondary = str(Path(self.secondary_model.text()).expanduser().resolve()) if self.secondary_model.text().strip() else ''
+        return EngineConfig(executable=str(Path(self.executable.text()).expanduser().resolve()),model_path=str(Path(self.model.text()).expanduser().resolve()),secondary_model_path=secondary,context_size=self.context.value(),gpu_layers=self.layers.value(),threads=self.threads.value(),max_tokens=self.tokens.value(),temperature=self.temperature.value(),lora_path=adapter)
 
 
 class LinksDialog(QDialog):

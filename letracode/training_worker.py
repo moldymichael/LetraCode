@@ -246,10 +246,12 @@ class ActivationWorker(QThread):
     ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, repository, engine_config, run_id=None, rollback=None, parent=None):
+    def __init__(self, repository, engine_config, run_id=None, rollback=None, parent=None, *, secondary_enabled=True):
         super().__init__(parent)
         self.repository = repository
         self.original_config = engine_config
+        self.secondary_enabled = secondary_enabled
+        self.selected_config = None
         self.run_id = run_id
         self.rollback = rollback
         self.cancelled = threading.Event()
@@ -283,7 +285,9 @@ class ActivationWorker(QThread):
                 config = dataclasses.replace(self.original_config, model_path=base, lora_path=str(adapter))
             if self.cancelled.is_set():
                 raise Cancelled('Model change stopped.')
-            self.engine = LocalEngine(config, self.repository.store.directory)
+            self.selected_config = config
+            active_config = config if self.secondary_enabled else dataclasses.replace(config, secondary_model_path='')
+            self.engine = LocalEngine(active_config, self.repository.store.directory)
             self.engine.start(self.cancelled, self.status.emit)
             if self.rollback is None:
                 self.status.emit('Checking that model files stayed unchanged during loading…')

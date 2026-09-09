@@ -1,6 +1,6 @@
 """Managed local llama.cpp inference process.
 
-The engine owns one ``llama-server`` child and talks to it only over a
+The engine owns one ``llama-server`` child (a router for two models) and talks to it only over a
 randomly authenticated loopback connection. The public methods are
 synchronous so GUI callers must invoke ``start`` and ``complete`` from a
 worker thread.
@@ -9,6 +9,7 @@ worker thread.
 from __future__ import annotations
 
 import atexit
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import http.client
 import json
@@ -20,6 +21,7 @@ import shutil
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import BinaryIO, Callable
@@ -44,6 +46,15 @@ _MAX_SSE_LINE_BYTES = 4_194_304
 _MAX_OUTPUT_BYTES = 8_388_608
 _MAX_TOOL_BYTES = 2_097_152
 _MAX_TOOL_CALLS = 128
+
+# Linux's parent-death signal follows the thread that forks the child, not
+# the application's lifetime. Qt conversation workers are short lived, so
+# create processes on one persistent stdlib worker. It performs only Popen;
+# loading and inference still run on the caller's background thread.
+_PROCESS_LAUNCHER = (
+    ThreadPoolExecutor(max_workers=1, thread_name_prefix="letracode-process-launch")
+    if sys.platform.startswith("linux") else None
+)
 
 _LINUX_LAUNCHER = """\
 import ctypes
@@ -70,6 +81,7 @@ class EngineConfig:
     max_tokens: int = 2048
     temperature: float = 0.7
     lora_path: str = ""
+    secondary_model_path: str = ""
 
 
 class EngineError(RuntimeError):
@@ -138,8 +150,10 @@ class LocalEngine:
         self._active_connection: http.client.HTTPConnection | None = None
         self._active_response: http.client.HTTPResponse | None = None
         self._diagnostic_tail = ""
-        self._budget_unavailable = False
+        self._budget_unavailable: set[str] = set()
         self._usage_cache = None
+        self._preset_path: Path | None = None
+        self._loaded_models: tuple[str, ...] = ()
         _INSTANCES.add(self)
 
     @property
@@ -147,6 +161,12 @@ class LocalEngine:
         with self._state_lock:
             process = self._process
             return process is not None and process.poll() is None
+
+    @property
+    def loaded_models(self) -> tuple[str, ...]:
+        """Model IDs whose startup was verified, empty after the server stops."""
+        with self._state_lock:
+            return self._loaded_models if self.running else ()
 
     def start(
         self,
@@ -164,6 +184,7 @@ class LocalEngine:
             self._cancel_requested.clear()
             executable, model = self._validated_paths()
             adapter = validated_lora_path(self.config.lora_path)
+            secondary = self._validated_secondary_model(model)
             self._prepare_data_dir()
             port = self._reserve_port()
             token = 'lc_' + secrets.token_urlsafe(32)
@@ -186,7 +207,13 @@ class LocalEngine:
                 "--parallel",
                 "1",
             ]
-            if adapter is not None:
+            if secondary is not None:
+                preset = self._write_model_preset(model, secondary, adapter)
+                arguments[6:8] = [
+                    "--models-preset", str(preset), "--models-max", "2",
+                    "--no-models-autoload", "--offline",
+                ]
+            elif adapter is not None:
                 arguments.extend(["--lora", str(adapter)])
             argv = self._launcher_argv(executable, arguments)
             environment = {
@@ -197,14 +224,16 @@ class LocalEngine:
             on_status("Starting local model server")
             self._append_log("Starting local model server\n")
             try:
-                process = start_process(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    env=environment,
-                )
+                options = {
+                    "stdin": subprocess.DEVNULL, "stdout": subprocess.PIPE,
+                    "stderr": subprocess.STDOUT, "env": environment,
+                }
+                if _PROCESS_LAUNCHER is not None:
+                    process = _PROCESS_LAUNCHER.submit(start_process, argv, **options).result()
+                else:
+                    process = start_process(argv, **options)
             except OSError as exc:
+                self.stop()
                 raise EngineError(f"Could not start the local model executable: {exc}") from exc
 
             with self._state_lock:
@@ -212,7 +241,7 @@ class LocalEngine:
                 self._port = port
                 self._api_token = token
                 self._diagnostic_tail = ""
-                self._budget_unavailable = False
+                self._budget_unavailable.clear()
                 self._usage_cache = None
             self._log_thread = threading.Thread(
                 target=self._pump_log,
@@ -235,10 +264,16 @@ class LocalEngine:
                         self.stop()
                         raise error
                     if self._health_ready(port, token):
+                        if secondary is not None:
+                            self._load_router_models(port, token, cancel, deadline, on_status)
+                        else:
+                            with self._state_lock:
+                                self._loaded_models = ("local",)
                         on_status("Local model ready")
                         return
                     time.sleep(0.05)
             except (Cancelled, EngineError):
+                self.stop()
                 raise
             except (OSError, http.client.HTTPException):
                 if process.poll() is not None:
@@ -252,6 +287,149 @@ class LocalEngine:
             self.stop()
             raise EngineError("Timed out after 180 seconds while loading the local model")
 
+    def _write_model_preset(self, model: Path, secondary: Path, adapter: Path | None = None) -> Path:
+        """Write only the selected models; no user-supplied preset directives."""
+        if adapter is not None:
+            self._validate_router_path(adapter)
+        # A router-wide --lora would be inherited by both models. Restrict the
+        # adapter to Model A's preset, which llama.cpp renders into its argv.
+        primary_adapter = f"lora = {adapter}\n" if adapter is not None else ""
+        content = (
+            f"version = 1\n[local]\nmodel = {model}\n"
+            f"{primary_adapter}"
+            f"[local-b]\nmodel = {secondary}\n"
+        )
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", newline="\n", prefix="router-",
+                suffix=".ini", dir=self.data_dir, delete=False,
+            ) as handle:
+                self._preset_path = Path(handle.name)
+                handle.write(content)
+            return self._preset_path
+        except OSError as exc:
+            self.stop()
+            raise EngineError(f"Could not write the local model preset: {exc}") from exc
+
+    def _load_router_models(
+        self, port: int, token: str, cancel: threading.Event, deadline: float,
+        on_status: Callable[[str], None],
+    ) -> None:
+        """Explicit loads are asynchronous; verify that both workers are ready."""
+        watcher_done = threading.Event()
+        deadline_expired = threading.Event()
+        watcher = threading.Thread(
+            target=self._watch_external_cancel,
+            args=(cancel, watcher_done, deadline, deadline_expired),
+            name="letracode-router-cancel", daemon=True,
+        )
+        watcher.start()
+        try:
+            states = self._router_model_states(port, token)
+            for model in ("local", "local-b"):
+                self._raise_if_cancelled(cancel)
+                on_status(f"Loading {model} ({'Model A' if model == 'local' else 'Model B'})")
+                if states[model] == "unloaded":
+                    result = self._router_json(port, token, "POST", "/models/load", {"model": model})
+                    if result.get("success") is not True:
+                        raise EngineError(f"The local model router did not accept loading {model}")
+            while time.monotonic() < deadline:
+                self._raise_if_cancelled(cancel)
+                states = self._router_model_states(port, token)
+                with self._state_lock:
+                    self._loaded_models = tuple(
+                        model for model in ("local", "local-b") if states[model] == "loaded"
+                    )
+                if states == {"local": "loaded", "local-b": "loaded"}:
+                    on_status("Model A and Model B loaded")
+                    return
+                cancel.wait(0.05)
+            raise EngineError("Timed out while loading both local models")
+        except (Cancelled, EngineError):
+            if deadline_expired.is_set():
+                raise EngineError("Timed out while loading both local models") from None
+            if cancel.is_set() or self._cancel_requested.is_set():
+                raise Cancelled("Local model startup was cancelled") from None
+            raise
+        finally:
+            watcher_done.set()
+            if watcher is not threading.current_thread():
+                watcher.join()
+
+    def _router_model_states(self, port: int, token: str) -> dict[str, str]:
+        result = self._router_json(port, token, "GET", "/models")
+        entries = result.get("data")
+        if not isinstance(entries, list):
+            raise EngineError("The local model router returned malformed model status")
+        states = {}
+        for entry in entries:
+            if not isinstance(entry, dict):
+                raise EngineError("The local model router returned malformed model status")
+            model = entry.get("id")
+            if model not in ("local", "local-b"):
+                continue
+            status = entry.get("status")
+            if not isinstance(status, dict) or model in states:
+                raise EngineError("The local model router returned malformed model status")
+            if status.get("failed"):
+                raise EngineError(f"The local model router failed to load {model}; check engine.log and available memory")
+            state = status.get("value")
+            if state not in ("unloaded", "loading", "loaded"):
+                raise EngineError(f"The local model router returned invalid status for {model}")
+            states[model] = state
+        if len(states) != 2:
+            raise EngineError("The local model router did not list both configured models; install a current llama.cpp build")
+        return states
+
+    def _router_json(
+        self, port: int, token: str, method: str, path: str, body: dict | None = None,
+    ) -> dict:
+        # The watchdog enforces the whole startup deadline. A short socket
+        # timeout would incorrectly fail a busy host while it spawns a worker.
+        connection = http.client.HTTPConnection(_HOST, port, timeout=_MODEL_LOAD_TIMEOUT)
+        response = None
+        try:
+            with self._state_lock:
+                self._active_connection = connection
+            connection.request(
+                method, path, body=json.dumps(body).encode("utf-8") if body is not None else None,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            with self._state_lock:
+                self._active_response = response
+            if 300 <= response.status < 400:
+                raise EngineError("The local model router attempted an HTTP redirect, which was refused")
+            raw = response.read(_MAX_ERROR_BYTES + 1)
+            if len(raw) > _MAX_ERROR_BYTES:
+                raise EngineError("The local model router response exceeded the size limit")
+            if response.status == 404:
+                raise EngineError("Multi-model conversations require a current llama.cpp build with router support")
+            if not 200 <= response.status < 300:
+                detail = self._error_detail(raw).replace(token, "[REDACTED]")
+                raise EngineError(f"Local model router error (HTTP {response.status}): {detail}")
+            try:
+                result = json.loads(raw)
+            except (ValueError, UnicodeDecodeError) as exc:
+                raise EngineError("The local model router returned malformed JSON") from exc
+            if not isinstance(result, dict):
+                raise EngineError("The local model router returned malformed JSON")
+            return result
+        except (OSError, http.client.HTTPException, ValueError, AttributeError) as exc:
+            raise EngineError(f"Local model router connection failed: {exc}") from exc
+        finally:
+            with self._state_lock:
+                if self._active_connection is connection:
+                    self._active_connection = None
+                if self._active_response is response:
+                    self._active_response = None
+            for stream in (response, connection):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except (OSError, ValueError, AttributeError):
+                        pass
+
     def complete(
         self,
         messages: list[dict],
@@ -259,6 +437,7 @@ class LocalEngine:
         cancel: threading.Event,
         on_delta: Callable[[str], None],
         thinking: bool = False,
+        model: str = "local",
         *,
         on_reasoning: Callable[[str], None] | None = None,
     ) -> dict:
@@ -270,11 +449,12 @@ class LocalEngine:
         deadline_expired = threading.Event()
         connection: http.client.HTTPConnection | None = None
         response: http.client.HTTPResponse | None = None
+        completion_succeeded = False
         try:
             if cancel.is_set():
                 raise Cancelled("Local model completion was cancelled")
             self._cancel_requested.clear()
-            payload = self._completion_payload(messages, tools, thinking)
+            payload = self._completion_payload(messages, tools, thinking, model)
             self.start(cancel)
             if cancel.is_set() or self._cancel_requested.is_set():
                 self.stop()
@@ -332,9 +512,11 @@ class LocalEngine:
                     "The local model server returned a non-streaming response: "
                     + self._error_detail(raw)
                 )
-            return self._read_completion_stream(
+            result = self._read_completion_stream(
                 response, process, cancel, on_delta, deadline, on_reasoning
             )
+            completion_succeeded = True
+            return result
         except Cancelled:
             if deadline_expired.is_set():
                 raise EngineError('Local model completion timed out at its request deadline') from None
@@ -369,8 +551,10 @@ class LocalEngine:
             raise EngineError(f"Local model connection failed: {exc}") from exc
         finally:
             watcher_done.set()
-            if watcher is not None:
+            if watcher is not None and watcher is not threading.current_thread():
                 watcher.join()
+            if self.config.secondary_model_path and not completion_succeeded:
+                self.stop()
             with self._state_lock:
                 if self._active_response is response:
                     self._active_response = None
@@ -389,8 +573,11 @@ class LocalEngine:
             self._operation_lock.release()
 
     def _completion_payload(
-        self, messages: list[dict], tools: list[dict] | None, thinking: bool
+        self, messages: list[dict], tools: list[dict] | None, thinking: bool,
+        model: str = "local",
     ) -> bytes:
+        if model != "local" and not (model == "local-b" and self.config.secondary_model_path):
+            raise EngineError("The requested model is not configured in this local engine")
         if not isinstance(messages, list) or not all(isinstance(item, dict) for item in messages):
             raise EngineError("Messages must be a list of chat message objects")
         if tools is not None and (
@@ -398,7 +585,7 @@ class LocalEngine:
         ):
             raise EngineError("Tools must be a list of tool definition objects")
         body: dict[str, object] = {
-            "model": "local",
+            "model": model,
             "messages": messages,
             "stream": True,
             "max_tokens": self.config.max_tokens,
@@ -418,7 +605,7 @@ class LocalEngine:
             raise EngineError("The chat request is too large for the local engine")
         return payload
 
-    def request_usage(self, messages, tools, cancel, thinking=False) -> RequestUsage:
+    def request_usage(self, messages, tools, cancel, thinking=False, model="local") -> RequestUsage:
         """Count the runtime-formatted prompt without generating model output."""
         if not self._operation_lock.acquire(blocking=False):
             raise EngineError("A local model completion is already in progress")
@@ -426,7 +613,7 @@ class LocalEngine:
             if cancel.is_set():
                 raise Cancelled('Request counting was cancelled')
             self._cancel_requested.clear()
-            payload = self._completion_payload(messages, tools, thinking)
+            payload = self._completion_payload(messages, tools, thinking, model)
             self.start(cancel)
             return self._request_usage(payload, messages, tools, cancel, thinking)
         finally:
@@ -436,9 +623,10 @@ class LocalEngine:
         self._raise_if_cancelled(cancel)
         if self._usage_cache and self._usage_cache[0] == payload:
             return self._usage_cache[1]
-        if not self._budget_unavailable:
+        body = json.loads(payload)
+        model = body['model']
+        if model not in self._budget_unavailable:
             try:
-                body = json.loads(payload)
                 formatted = self._budget_json('/apply-template', body, cancel)
                 prompt = formatted.get('prompt')
                 if not isinstance(prompt, str):
@@ -453,6 +641,7 @@ class LocalEngine:
                     if bare.get('prompt') == prompt:
                         raise _BudgetUnavailable()
                 tokenized = self._budget_json('/tokenize', {
+                    'model': model,
                     'content': prompt, 'add_special': True, 'parse_special': True,
                     'with_pieces': False}, cancel)
                 tokens = tokenized.get('tokens')
@@ -462,7 +651,7 @@ class LocalEngine:
                 self._usage_cache = (payload, usage)
                 return usage
             except _BudgetUnavailable:
-                self._budget_unavailable = True
+                self._budget_unavailable.add(model)
         usage = fallback_usage(messages, tools, self.config.max_tokens, thinking)
         self._usage_cache = (payload, usage)
         return usage
@@ -838,12 +1027,20 @@ class LocalEngine:
             self._process = None
             self._port = None
             self._api_token = None
+            self._loaded_models = ()
+            preset = self._preset_path
+            self._preset_path = None
             response = self._active_response
             connection = self._active_connection
             self._active_response = None
             self._active_connection = None
         if process is not None:
             stop_process(process, timeout=_STOP_TIMEOUT)
+        if preset is not None:
+            try:
+                preset.unlink(missing_ok=True)
+            except OSError:
+                pass
         for stream in (connection, response):
             if stream is not None:
                 try:
@@ -897,6 +1094,39 @@ class LocalEngine:
         ):
             raise EngineError("Temperature must be a finite number from 0 through 5")
         return executable, model
+
+    def _validated_secondary_model(self, primary: Path) -> Path | None:
+        setting = self.config.secondary_model_path
+        if not isinstance(setting, str):
+            raise EngineError("The second local model path must be a string")
+        if not setting:
+            return None
+        try:
+            secondary = Path(setting).expanduser().resolve()
+            if not secondary.is_file() or not os.access(secondary, os.R_OK):
+                raise EngineError("The second local model file is missing or not readable")
+            with secondary.open("rb") as handle:
+                if handle.read(4) != b"GGUF":
+                    raise EngineError("The second local model is not a valid GGUF file")
+            if primary == secondary or primary.samefile(secondary):
+                raise EngineError("Choose two different local model files for a multi-model conversation")
+        except (OSError, ValueError) as exc:
+            raise EngineError(f"Could not read the second local model: {exc}") from exc
+        for model in (primary, secondary):
+            self._validate_router_path(model)
+        return secondary
+
+    @staticmethod
+    def _validate_router_path(path: Path) -> None:
+        # llama.cpp's INI parser does not support quoted/escaped comment markers.
+        # Reject paths it would truncate or interpret as a new directive.
+        value = str(path)
+        if (len(value.encode("utf-8")) > 32768 or value != value.rstrip()
+                or any(char in value for char in "\r\n\x00;#")):
+            raise EngineError(
+                "The model or adapter path cannot be represented in a llama.cpp router preset; "
+                "move or rename files to remove #, ;, line breaks, or trailing whitespace"
+            )
 
     @staticmethod
     def _validate_number(name: str, value: object, minimum: int, maximum: int) -> None:
@@ -953,6 +1183,7 @@ class LocalEngine:
         ):
             return EngineError(
                 "The local model server rejected required flags; install a current llama.cpp build"
+                + (" with router support for multi-model conversations" if self.config.secondary_model_path else "")
             )
         detail = f": {diagnostic[-2000:]}" if diagnostic else ""
         return EngineError(

@@ -8,7 +8,12 @@ were downloaded during verification.
 
 ## Complete application verification
 
-On the final integrated 0.4.0 source tree:
+After incorporating the existing installed two-model features, the complete
+suite passed **900 tests, 16 skipped, 6 existing fork warnings in 57.76 seconds**.
+The updated launcher installation is verified in
+[the installed update record](INSTALLED-0.4.0-UPDATE.md).
+
+Before that installed-feature integration, the fine-tuning source tree passed:
 
 - `QT_QPA_PLATFORM=offscreen python3 -m pytest -q`: **812 passed, 16 skipped,
   6 warnings in 49.45 seconds**. Skips cover platform-specific tests and the

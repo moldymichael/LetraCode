@@ -59,8 +59,26 @@ def repair_tool_history(turn):
 
 def protocol_messages(messages):
     """Keep saved-result references out of the chat protocol's message keys."""
-    return [{key: value for key, value in message.items() if key not in ('saved_result_id', '_row_id')}
-            for message in messages]
+    result = []
+    for message in messages:
+        clean = {key: value for key, value in message.items()
+                 if key not in ('saved_result_id', '_row_id', '_speaker')}
+        if (message.get('_speaker') and result and result[-1]['role'] == 'assistant'
+                and not result[-1].get('tool_calls')):
+            # Keep per-row IDs during packing; merge only at the wire boundary
+            # so strict templates can alternate user/assistant roles.
+            result[-1]['content'] = (result[-1].get('content') or '') + '\n\n' + clean['content']
+        else:
+            result.append(clean)
+    return result
+
+
+def attributed_message(row, payload):
+    speaker = payload.get('speaker')
+    if row['role'] == 'assistant' and isinstance(speaker, dict):
+        return {'role': 'assistant', '_speaker': True, 'content':
+                f'Conversation contribution from {speaker.get("label", "Other model")}:\n{row["content"]}'}
+    return dict(payload.get('message') or {'role': row['role'], 'content': row['content']})
 
 
 def compact_tool_results(turn, budget, *, prefix=None, measure=None):
@@ -170,7 +188,7 @@ def conversation_messages(rows, system, budget, *, measure=None):
             current = []
         if row['status'] in ('error', 'streaming', 'interrupted'):
             continue
-        message = dict(payload.get('message') or {'role': row['role'], 'content': row['content']})
+        message = attributed_message(row, payload)
         if (row['role'] == 'assistant' and row['status'] == 'incomplete'
                 and payload.get('task_outcome') == 'source_incomplete'
                 and not message.get('tool_calls')):
@@ -214,8 +232,8 @@ def conversation_messages(rows, system, budget, *, measure=None):
         for row in required:
             if row['id'] in included:
                 continue
-            saved = row_payload(row).get('message') if row['role'] != 'user' else None
-            message = dict(saved or {'role': row['role'], 'content': row['content']})
+            message = attributed_message(row, row_payload(row)) if row['role'] != 'user' else {
+                'role': 'user', 'content': row['content']}
             message['_row_id'] = row['id']
             if row['role'] == 'tool':
                 message['saved_result_id'] = row['id']
@@ -326,6 +344,13 @@ class ConversationWorker(QThread):
 
     def request_stop(self):
         self._cancel('user_stop')
+
+    def wait_for_stop(self):
+        with self._stop_lock:
+            self._finished = True
+            cancel_thread = self._cancel_thread
+        if cancel_thread is not None:
+            cancel_thread.join()
 
     def _cancel(self, reason):
         with self._stop_lock:

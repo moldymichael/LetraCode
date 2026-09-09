@@ -28,6 +28,38 @@ The 0.3.0 downloads linked below predate these additions. Build this checkout
 with `python3 packaging/build-release.py` for 0.4.0 source/Fedora archives;
 the GitHub workflow also builds native Windows installer and portable artifacts.
 
+## Two-model conversations
+
+In **Model Setup**, select two different local GGUF files, then choose **Two
+models** above the conversation. This uses the [llama.cpp multi-model router](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#using-multiple-models)
+and requires a current compatible `llama-server`. Single model mode still works
+with older compatible engines. Both models use the shared inference settings;
+allow enough memory for both weights and context buffers.
+
+Choose the next speaker and 1–4 total replies (default 2). Each model sees the
+preceding reply and can respond to it. The exchange always pauses at the selected
+limit. **Continue exchange** explicitly starts another bounded exchange without
+repeating your message. Send or clear your draft before continuing. **Stop**
+cancels the exchange; use **Unload model from memory** while idle to release
+both models. Reopening a chat never starts an exchange automatically.
+
+Two-model mode has no Actions or Internet tools. Computer still gates optional
+linked source excerpts; explicitly always-active Memory retains the current app's
+context behavior. Required user intent, referenced plans, and the latest reply
+stay intact. Older optional dialogue copies can be omitted, with a visible notice;
+if required context cannot fit, start a new chat with the complete shorter request.
+Runtime token accounting uses the selected model, and requests have an additional
+24,000-byte transcript limit. Full messages remain saved with their original
+speaker labels in chat, Markdown, backups and evaluation exports.
+
+Two-model router presets cannot represent paths with `#`, `;`, line breaks or
+trailing whitespace; choose another local path if needed. Model downloads and
+newer engine binaries remain separate setup steps.
+
+Fine-Tuning and thinking remain available alongside two-model conversations.
+An adopted LoRA adapter applies to Model A; Model B keeps its own base weights.
+Thinking is saved and displayed separately for each speaker that emits it.
+
 ## Evaluation export and Memory folders
 
 **File → Export Evaluation…** saves the selected conversation as a portable ZIP
