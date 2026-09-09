@@ -1,7 +1,10 @@
 # Install in a separate Python environment with compatible PyTorch wheels, never the desktop Qt runtime.
-# Install the selected llama.cpp checkout's conversion requirements there as well.
+# Select a CUDA PyTorch build first for QLoRA. Check CUDA again after installing converter dependencies.
+# Some llama.cpp requirement files select CPU Torch or older dependency versions.
 torch>=2.6,<3
 transformers>=4.51,<6
 peft>=0.15,<1
 safetensors>=0.5,<1
 sentencepiece>=0.2,<1
+accelerate>=1.4,<2
+bitsandbytes>=0.45,<1

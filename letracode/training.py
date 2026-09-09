@@ -35,6 +35,10 @@ class TrainingConfig:
     batch_size: int = 1
     seed: int = 42
     device: str = 'cpu'
+    # Defaults preserve the meaning of snapshots created before QLoRA support.
+    training_method: str = 'lora'
+    gradient_accumulation_steps: int = 1
+    gradient_checkpointing: bool = False
 
     def validate(self):
         python = Path(self.python_executable).expanduser()
@@ -52,6 +56,7 @@ class TrainingConfig:
         bounds = (
             ('epochs', self.epochs, 1, 100), ('rank', self.rank, 1, 256),
             ('max_length', self.max_length, 8, 8192), ('batch_size', self.batch_size, 1, 64),
+            ('gradient_accumulation_steps', self.gradient_accumulation_steps, 1, 128),
             ('seed', self.seed, 0, 2**31 - 1),
         )
         for name, value, minimum, maximum in bounds:
@@ -62,6 +67,12 @@ class TrainingConfig:
             raise ValueError('learning_rate must be a finite number greater than 0 and at most 0.1')
         if not isinstance(self.device, str) or self.device not in ('cpu', 'cuda'):
             raise ValueError("device must be 'cpu' or 'cuda'")
+        if not isinstance(self.training_method, str) or self.training_method not in ('lora', 'qlora'):
+            raise ValueError("training_method must be 'lora' or 'qlora'")
+        if type(self.gradient_checkpointing) is not bool:
+            raise ValueError('gradient_checkpointing must be true or false')
+        if self.training_method == 'qlora' and self.device != 'cuda':
+            raise ValueError('4-bit QLoRA requires an NVIDIA CUDA GPU; select CUDA or full-precision LoRA')
 
     def to_dict(self):
         self.validate()

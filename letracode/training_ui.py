@@ -99,17 +99,34 @@ class FineTuningPanel(QWidget):
 
     def _training_tab(self):
         page = QWidget(); form = QVBoxLayout(page)
-        help_text = QLabel('Choose a separate training Python with PyTorch, Transformers and PEFT installed, plus the original local Hugging Face training weights. This backend supports text-only Llama models. A GGUF chat file alone cannot be trained. Start with a small model that fits your RAM or GPU.')
+        help_text = QLabel('4-bit QLoRA reduces the memory needed for training with NF4 double quantization. It needs an NVIDIA CUDA GPU and a separate training Python with PyTorch, Transformers, PEFT, Accelerate and bitsandbytes installed. Choose original, unquantized text-only Llama safetensors weights. A GGUF chat file alone cannot be trained.')
         help_text.setWordWrap(True); form.addWidget(help_text)
         paths = QFormLayout(); self.fields = {}
         saved = self.store.setting('training_config', {})
+        if not isinstance(saved, dict):
+            saved = {}
         defaults = dataclasses.asdict(TrainingConfig(python_executable='', base_model=''))
+        if not saved:
+            defaults.update(training_method='qlora', device='cuda',
+                            gradient_accumulation_steps=4, gradient_checkpointing=True)
+        training_python = Path.home() / '.local/share/letracode-training-qlora/bin/python'
+        if not saved.get('python_executable') and training_python.is_file():
+            defaults['python_executable'] = str(training_python)
+        method = QComboBox()
+        method.addItem('4-bit QLoRA (NVIDIA GPU)', 'qlora')
+        method.addItem('LoRA (full precision)', 'lora')
+        method.setCurrentIndex(method.findData(saved.get('training_method', defaults['training_method'])))
+        self.fields['training_method'] = method
+        paths.addRow('Training method', method)
         for name, label, kind in (
             ('python_executable', 'Training Python', 'python'),
             ('base_model', 'Training model folder', 'directory'),
             ('base_gguf', 'Matching chat GGUF (for adoption)', 'gguf'),
             ('llama_cpp_dir', 'llama.cpp source folder (for conversion)', 'directory')):
-            field = QLineEdit(str(saved.get(name, defaults.get(name, '')))); self.fields[name] = field
+            value = saved.get(name, defaults.get(name, ''))
+            if name == 'python_executable' and not value:
+                value = defaults[name]
+            field = QLineEdit(str(value)); self.fields[name] = field
             row = QWidget(); horizontal = QHBoxLayout(row); horizontal.setContentsMargins(0, 0, 0, 0)
             horizontal.addWidget(field)
             button = QPushButton('Browse…'); horizontal.addWidget(button)
@@ -120,17 +137,36 @@ class FineTuningPanel(QWidget):
         for name, label, low, high in (('epochs', 'Passes through training data', 1, 100),
                                      ('rank', 'LoRA rank', 1, 256),
                                      ('max_length', 'Maximum example length (tokens)', 32, 8192),
-                                     ('batch_size', 'Batch size', 1, 64),
+                                     ('batch_size', 'Examples in memory at once', 1, 64),
+                                     ('gradient_accumulation_steps', 'Batches per learning update', 1, 128),
                                      ('seed', 'Reproducibility seed', 0, 2147483647)):
             field = QSpinBox(); field.setRange(low, high); field.setValue(saved.get(name, defaults[name]))
             self.fields[name] = field; settings.addRow(label, field)
         rate = QDoubleSpinBox(); rate.setDecimals(6); rate.setRange(.000001, .1); rate.setSingleStep(.0001)
         rate.setValue(saved.get('learning_rate', defaults['learning_rate'])); self.fields['learning_rate'] = rate
         settings.addRow('Learning rate', rate)
-        device = QComboBox(); device.addItems(['cpu', 'cuda']); device.setCurrentText(saved.get('device', 'cpu'))
+        device = QComboBox(); device.addItems(['cpu', 'cuda']); device.setCurrentText(saved.get('device', defaults['device']))
+        if method.currentData() == 'qlora':
+            device.setCurrentText('cuda')
+            device.setEnabled(False)
         self.fields['device'] = device; settings.addRow('Compute device', device)
+        checkpointing = QCheckBox('Save memory by recomputing activations (slower)')
+        checkpointing.setChecked(saved.get('gradient_checkpointing', defaults['gradient_checkpointing']))
+        self.fields['gradient_checkpointing'] = checkpointing
+        settings.addRow('Gradient checkpointing', checkpointing)
+        self.effective_batch = QLabel(); self.effective_batch.setWordWrap(True)
+        settings.addRow(self.effective_batch)
+        self.update_effective_batch()
+        method.currentIndexChanged.connect(self.training_method_changed)
+        for field in self.fields.values():
+            signal = (field.textChanged if isinstance(field, QLineEdit) else
+                      field.currentIndexChanged if isinstance(field, QComboBox) else
+                      field.toggled if isinstance(field, QCheckBox) else field.valueChanged)
+            signal.connect(self.persist_configuration)
+        self.fields['batch_size'].valueChanged.connect(self.update_effective_batch)
+        self.fields['gradient_accumulation_steps'].valueChanged.connect(self.update_effective_batch)
         form.addWidget(advanced)
-        warning = QLabel('Training reads only approved examples and local weights. Larger settings need more memory. Training runs do not download models or packages. Conversion also needs the selected llama.cpp checkout’s Python dependencies in the training environment.')
+        warning = QLabel('Training reads only approved examples and local weights. Larger models and longer examples still need more memory. QLoRA does not guarantee better answers: compare held-out results before adoption. Training runs do not download models or packages. Conversion also needs the selected llama.cpp checkout’s Python dependencies in the training environment.')
         warning.setWordWrap(True); form.addWidget(warning)
         self.review_check = QCheckBox('I reviewed the approved examples and selected the matching model files.')
         form.addWidget(self.review_check)
@@ -292,8 +328,33 @@ class FineTuningPanel(QWidget):
     def configuration(self):
         values = {}
         for name, field in self.fields.items():
-            values[name] = field.text().strip() if isinstance(field, QLineEdit) else field.currentText() if isinstance(field, QComboBox) else field.value()
+            if isinstance(field, QLineEdit):
+                values[name] = field.text().strip()
+            elif isinstance(field, QCheckBox):
+                values[name] = field.isChecked()
+            elif isinstance(field, QComboBox):
+                values[name] = field.currentData() if name == 'training_method' else field.currentText()
+            else:
+                values[name] = field.value()
         return TrainingConfig(**values)
+
+    def persist_configuration(self, *_):
+        # Keep incomplete setup too; paths are validated only when a run starts.
+        self.store.set_setting('training_config', dataclasses.asdict(self.configuration()))
+
+    def training_method_changed(self, *_):
+        qlora = self.fields['training_method'].currentData() == 'qlora'
+        device = self.fields['device']
+        if qlora:
+            device.setCurrentText('cuda')
+            self.fields['gradient_checkpointing'].setChecked(True)
+        device.setEnabled(not qlora)
+
+    def update_effective_batch(self, *_):
+        size = self.fields['batch_size'].value() * self.fields['gradient_accumulation_steps'].value()
+        self.effective_batch.setText(f'Effective batch: up to {size} examples per learning update. '
+                                    'Accumulation increases the batch without keeping every example in memory; '
+                                    'the last update can contain fewer examples.')
 
     def start_training(self):
         if self.job is not None or self.chat_busy:
@@ -339,8 +400,34 @@ class FineTuningPanel(QWidget):
         text = f"Version {run['id']}\nStatus: {run['status']}\nCreated: {run['created']}\n"
         if self.store.setting('training_active_version') == run['id']:
             text += 'Active in Chat\n'
+        details = report.get('training_details') or {}
+        config = run['config']
+        method = details.get('training_method', config.get('training_method', 'lora'))
+        method_label = '4-bit QLoRA (NVIDIA GPU)' if method == 'qlora' else 'LoRA (full precision)'
+        text += '\nTraining method: ' + method_label + '\n'
+        quantization = details.get('quantization', 'nf4-double' if method == 'qlora' else 'none')
+        text += 'Base weight precision: ' + ('4-bit NF4 with double quantization' if quantization == 'nf4-double' else 'full precision') + '\n'
+        dtype = details.get('compute_dtype', 'float32' if method == 'lora' else 'selected when training starts')
+        text += 'Compute precision: ' + str(dtype) + '\n'
+        batch = details.get('effective_batch_size', config.get('batch_size', 1) * config.get('gradient_accumulation_steps', 1))
+        text += f'Effective batch: up to {batch} examples per learning update\n'
+        checkpointing = details.get('gradient_checkpointing', config.get('gradient_checkpointing', False))
+        text += 'Gradient checkpointing: ' + ('on' if checkpointing else 'off') + '\n'
+        memory = report.get('memory') or {}
+        if memory:
+            for key, label in (('base_model_bytes', 'Base model footprint'),
+                               ('peak_allocated_bytes', 'Peak GPU allocation'),
+                               ('peak_reserved_bytes', 'Peak GPU reservation')):
+                value = memory.get(key)
+                if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                    unit, scale = ('GiB', 1024 ** 3) if value >= 1024 ** 3 else ('MiB', 1024 ** 2)
+                    text += f'{label}: {value / scale:.2f} {unit}\n'
+        elif report:
+            text += 'Memory measurements were not recorded for this version.\n'
         if report:
             text += f"\nHeld-out response loss\nBase: {report['base_loss']:.6f}\nCandidate: {report['candidate_loss']:.6f}\n"
+            if method == 'qlora':
+                text += 'Both evaluations use the same 4-bit base; the candidate adds the trained adapter.\n'
             text += '\nThis comparison does not establish overall task quality.\n'
             if report.get('conversion_error'):
                 text += '\nAdapter conversion: ' + report['conversion_error'] + '\n'

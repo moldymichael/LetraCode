@@ -176,3 +176,75 @@ def test_training_records_are_included_in_readable_backup(tmp_path):
         assert len(data['training_examples']) == 2
         assert data['training_runs'][0]['id'] == run['id']
         assert 'training' in archive.read('RESTORE.txt').decode().lower()
+
+
+def qlora_report():
+    return {
+        'training_details': {'training_method': 'qlora', 'quantization': 'nf4-double',
+                             'compute_dtype': 'float16', 'target_modules': 'all-linear',
+                             'gradient_checkpointing': True, 'gradient_accumulation_steps': 4,
+                             'effective_batch_size': 8, 'device': 'cuda',
+                             'quantized_layer_count': 7, 'device_name': 'Test GPU',
+                             'base_frozen': True, 'trainable_parameter_count': 100,
+                             'total_parameter_count': 1000},
+        'memory': {'base_model_bytes': 1000, 'peak_allocated_bytes': 2000,
+                   'peak_reserved_bytes': 3000},
+        'package_versions': {'torch': '2', 'transformers': '5', 'peft': '1',
+                             'safetensors': '1', 'bitsandbytes': '1', 'accelerate': '1'},
+    }
+
+
+def qlora_config():
+    return {'training_method': 'qlora', 'device': 'cuda', 'batch_size': 2,
+            'gradient_accumulation_steps': 4, 'gradient_checkpointing': True}
+
+
+def test_report_validation_accepts_quantized_training_and_legacy_reports():
+    from letracode.training_worker import validate_training_report
+    validate_training_report(qlora_report(), qlora_config())
+    validate_training_report({'package_versions': {}}, {'batch_size': 1, 'device': 'cpu'})
+
+
+@pytest.mark.parametrize('change', [
+    lambda r: r.pop('training_details'),
+    lambda r: r['training_details'].update(training_method='lora'),
+    lambda r: r['training_details'].update(quantization='none'),
+    lambda r: r['training_details'].update(compute_dtype='float32'),
+    lambda r: r['training_details'].update(target_modules=['q_proj', 'v_proj']),
+    lambda r: r['training_details'].update(gradient_checkpointing=False),
+    lambda r: r['training_details'].update(gradient_accumulation_steps=1),
+    lambda r: r['training_details'].update(effective_batch_size=2),
+    lambda r: r['training_details'].update(device='cpu'),
+    lambda r: r['training_details'].update(quantized_layer_count=0),
+    lambda r: r['training_details'].update(base_frozen=False),
+    lambda r: r['training_details'].update(trainable_parameter_count=1000),
+    lambda r: r['memory'].update(peak_allocated_bytes=-1),
+    lambda r: r['memory'].update(peak_reserved_bytes=1000),
+    lambda r: r['package_versions'].pop('bitsandbytes'),
+    lambda r: r['package_versions'].pop('accelerate'),
+])
+def test_report_cannot_claim_qlora_without_matching_runtime_evidence(change):
+    from letracode.training_worker import validate_training_report
+    report = qlora_report()
+    change(report)
+    with pytest.raises(ValueError):
+        validate_training_report(report, qlora_config())
+
+
+@pytest.mark.parametrize('reported_steps,expected_status', [(2, 'succeeded'), (3, 'failed')])
+def test_worker_checks_optimizer_steps_after_accumulation_and_last_partial_group(tmp_path, monkeypatch, reported_steps, expected_status):
+    from letracode.training import TrainingConfig
+    from letracode.training_worker import TrainingWorker
+    repo, original = prepared_run(tmp_path)
+    repo.save_example('Second training question', 'Reviewed answer', approved=True)
+    repo.save_example('Third training question', 'Reviewed answer', approved=True)
+    config = TrainingConfig(**dict(original['config'], training_method='qlora', device='cuda',
+                                  gradient_accumulation_steps=2, gradient_checkpointing=True))
+    run = repo.create_run(config)
+    details = qlora_report()
+    details['training_details'].update(gradient_accumulation_steps=2, effective_batch_size=2)
+    details['optimization_steps'] = reported_steps
+    source = SUCCESS_BACKEND + '\nreport.update(' + repr(details) + ')\n(p/"report.json").write_text(json.dumps(report))\n'
+    backend_peer(tmp_path, monkeypatch, source)
+    TrainingWorker(repo, run['id']).run()
+    assert repo.run(run['id'])['status'] == expected_status

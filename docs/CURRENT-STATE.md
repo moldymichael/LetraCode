@@ -1,5 +1,14 @@
 # Current implementation state
 
+The **0.5.0 QLoRA update** adds explicit CUDA 4-bit NF4 training with double
+quantization, all-linear adapters, gradient checkpointing and token-weighted
+accumulation. New training setup recommends QLoRA; existing full-precision runs
+retain their meaning. Reports include precision, effective batch and measured
+CUDA memory. Real GPU optimization, GGUF conversion, adoption, inference and
+rollback passed on a generated model. See [QLoRA verification](QLORA-VERIFICATION.md)
+and [setup](FINE-TUNING.md). The in-use per-user launcher is updated to 0.5.0;
+its installed modules and preserved data were checked before reopening it.
+
 The **0.4.0 source update** adds a Fine-Tuning workspace for reviewed datasets,
 offline text-only Llama LoRA optimization, held-out comparisons, GGUF adapter
 conversion, explicit adoption and rollback. Regular chat preserves and displays

@@ -88,6 +88,53 @@ def file_hash(path, cancel=None):
     return digest.hexdigest()
 
 
+def validate_training_report(report, config):
+    """Keep old LoRA reports readable; require runtime evidence for QLoRA."""
+    method = config.get('training_method', 'lora')
+    accumulation = config.get('gradient_accumulation_steps', 1)
+    checkpointing = config.get('gradient_checkpointing', False)
+    details = report.get('training_details')
+    if details is None and method == 'lora' and accumulation == 1 and not checkpointing:
+        return
+    if not isinstance(details, dict):
+        raise ValueError('Training report is missing its training method and memory details.')
+    expected = {'training_method': method,
+                'quantization': 'nf4-double' if method == 'qlora' else 'none',
+                'target_modules': 'all-linear' if method == 'qlora' else ['q_proj', 'v_proj'],
+                'gradient_checkpointing': checkpointing,
+                'gradient_accumulation_steps': accumulation,
+                'effective_batch_size': config['batch_size'] * accumulation,
+                'device': config.get('device', 'cpu')}
+    for key, value in expected.items():
+        if type(details.get(key)) is not type(value) or details[key] != value:
+            raise ValueError(f'Training report {key} does not match the configured training method.')
+    dtypes = ('float16', 'bfloat16') if method == 'qlora' else ('float32',)
+    if details.get('compute_dtype') not in dtypes:
+        raise ValueError('Training report has an incompatible computation dtype.')
+    count = details.get('quantized_layer_count')
+    if type(count) is not int or (count <= 0 if method == 'qlora' else count != 0):
+        raise ValueError('Training report did not verify the expected quantized layers.')
+    trainable, total = details.get('trainable_parameter_count'), details.get('total_parameter_count')
+    if (details.get('base_frozen') is not True or type(trainable) is not int or type(total) is not int
+            or not 0 < trainable < total):
+        raise ValueError('Training report did not verify frozen base weights and trainable adapters.')
+    if method == 'qlora':
+        if config.get('device') != 'cuda':
+            raise ValueError('QLoRA report requires CUDA training.')
+        versions = report.get('package_versions', {})
+        if any(not isinstance(versions.get(name), str) or not versions[name]
+               for name in ('bitsandbytes', 'accelerate')):
+            raise ValueError('QLoRA report is missing bitsandbytes or accelerate package versions.')
+    memory = report.get('memory')
+    if (not isinstance(memory, dict)
+            or any(type(memory.get(key)) is not int or memory[key] < 0
+                   for key in ('base_model_bytes', 'peak_allocated_bytes', 'peak_reserved_bytes'))
+            or memory['base_model_bytes'] <= 0
+            or memory['peak_reserved_bytes'] < memory['peak_allocated_bytes']
+            or (config.get('device') == 'cuda' and memory['peak_allocated_bytes'] <= 0)):
+        raise ValueError('Training report has invalid model or GPU memory measurements.')
+
+
 def read_report(directory, cancel, run):
     raw = safe_read(directory / 'report.json', 2 * 1024 * 1024)
     if not raw:
@@ -102,7 +149,9 @@ def read_report(directory, cancel, run):
     for field in ('optimization_steps', 'eval_response_tokens'):
         if type(report.get(field)) is not int or report[field] <= 0:
             raise ValueError(f'Training report needs a positive {field} count.')
-    expected_steps = run['config']['epochs'] * math.ceil(len(run['examples']['train']) / run['config']['batch_size'])
+    config = run['config']
+    expected_steps = config['epochs'] * math.ceil(len(run['examples']['train']) /
+                                                 (config['batch_size'] * config.get('gradient_accumulation_steps', 1)))
     if report['optimization_steps'] != expected_steps:
         raise ValueError('Training report does not contain the configured optimization steps.')
     comparisons = report.get('eval_examples')
@@ -119,6 +168,7 @@ def read_report(directory, cancel, run):
             or any(not isinstance(versions.get(name), str) or not versions[name]
                    for name in ('torch', 'transformers', 'peft', 'safetensors'))):
         raise ValueError('Training report is missing package versions.')
+    validate_training_report(report, config)
     provenance = report.get('provenance')
     if not isinstance(provenance, dict):
         raise ValueError('Training report is missing dataset provenance.')

@@ -136,3 +136,99 @@ def test_deleting_example_does_not_resurrect_its_draft(tmp_path):
     assert reopened.training_panel.examples_list.count() == 0
     assert reopened.training_panel.prompt.toPlainText() == ''
     reopened.close()
+
+
+def test_new_training_setup_recommends_qlora_and_discovers_local_environment(tmp_path, monkeypatch):
+    from pathlib import Path
+    training_python = tmp_path / '.local/share/letracode-training-qlora/bin/python'
+    training_python.parent.mkdir(parents=True)
+    training_python.touch()
+    monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(Store(tmp_path / 'data'))
+    panel = window.training_panel
+    config = panel.configuration()
+    assert config.training_method == 'qlora'
+    assert config.device == 'cuda'
+    assert config.gradient_accumulation_steps == 4
+    assert config.gradient_checkpointing is True
+    assert config.python_executable == str(training_python)
+    assert not panel.fields['device'].isEnabled()
+    assert '4 examples' in panel.effective_batch.text()
+    window.close()
+
+
+def test_saved_legacy_training_setup_is_not_silently_changed(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data')
+    store.set_setting('training_config', {'python_executable': '/custom/python',
+        'base_model': '/custom/model', 'device': 'cpu', 'batch_size': 2})
+    window = MainWindow(store)
+    panel = window.training_panel
+    config = panel.configuration()
+    assert config.training_method == 'lora'
+    assert config.device == 'cpu'
+    assert config.gradient_accumulation_steps == 1
+    assert config.gradient_checkpointing is False
+    assert config.python_executable == '/custom/python'
+    assert panel.fields['device'].isEnabled()
+    window.close()
+
+
+def test_switching_to_qlora_selects_cuda_and_persists_all_settings_before_training(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    store = Store(tmp_path / 'data')
+    store.set_setting('training_config', {'device': 'cpu'})
+    window = MainWindow(store)
+    panel = window.training_panel
+    mode = panel.fields['training_method']
+    mode.setCurrentIndex(mode.findData('qlora'))
+    assert panel.configuration().device == 'cuda'
+    assert panel.configuration().gradient_checkpointing is True
+    panel.fields['batch_size'].setValue(3)
+    panel.fields['gradient_accumulation_steps'].setValue(5)
+    panel.fields['python_executable'].setText('/selected/training/python')
+    assert '15 examples' in panel.effective_batch.text()
+    assert panel.repository.runs() == []
+    window.close()
+    reopened = MainWindow(Store(tmp_path / 'data'))
+    restored = reopened.training_panel.configuration()
+    assert restored.training_method == 'qlora'
+    assert restored.device == 'cuda'
+    assert restored.gradient_checkpointing is True
+    assert restored.gradient_accumulation_steps == 5
+    assert restored.batch_size == 3
+    assert restored.python_executable == '/selected/training/python'
+    reopened.close()
+
+
+def test_version_results_show_training_precision_memory_and_legacy_runs(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = MainWindow(Store(tmp_path / 'data'))
+    panel = window.training_panel
+    run = {'id': 'test-version', 'status': 'succeeded', 'created': '2026-09-09',
+        'config': {'training_method': 'qlora', 'device': 'cuda', 'batch_size': 1,
+                   'gradient_accumulation_steps': 4},
+        'report': {'base_loss': 2.5, 'candidate_loss': 2.3,
+            'training_details': {'training_method': 'qlora', 'quantization': 'nf4-double',
+                'compute_dtype': 'float16', 'effective_batch_size': 4,
+                'gradient_checkpointing': True, 'target_modules': 'all-linear', 'device': 'cuda'},
+            'memory': {'base_model_bytes': 1024**3, 'peak_allocated_bytes': 2 * 1024**3,
+                       'peak_reserved_bytes': 3 * 1024**3}}}
+    panel.show_run(run)
+    text = panel.results.toPlainText()
+    assert '4-bit QLoRA' in text
+    assert 'NF4 with double quantization' in text
+    assert 'float16' in text
+    assert 'Effective batch: up to 4 examples' in text
+    assert 'Base model footprint: 1.00 GiB' in text
+    assert 'Peak GPU allocation: 2.00 GiB' in text
+    assert 'same 4-bit base' in text
+    run['config'] = {'device': 'cpu'}
+    run['report'] = {'base_loss': 2.5, 'candidate_loss': 2.3}
+    panel.show_run(run)
+    legacy = panel.results.toPlainText()
+    assert 'LoRA (full precision)' in legacy
+    assert 'Memory measurements were not recorded' in legacy
+    assert 'Base: 2.500000' in legacy
+    window.close()

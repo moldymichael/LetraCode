@@ -10,7 +10,7 @@ fi
 "${LETRACODE_BUILD_PYTHON:-python3}" "$root/packaging/build-release.py" --output-dir "$root/dist"
 topdir="${LETRACODE_RPM_TOPDIR:-$root/build/rpmbuild}"
 mkdir -p "$topdir"/{BUILD,BUILDROOT,RPMS,SOURCES,SPECS,SRPMS}
-cp -- "$root/dist/LetraCode-0.4.0.tar.gz" "$topdir/SOURCES/"
+cp -- "$root/dist/LetraCode-0.5.0.tar.gz" "$topdir/SOURCES/"
 cp -- "$root/packaging/letracode.spec" "$topdir/SPECS/"
 rpmbuild -ba --define "_topdir $topdir" "$topdir/SPECS/letracode.spec"
 mkdir -p "$root/dist"

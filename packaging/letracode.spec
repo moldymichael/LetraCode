@@ -1,5 +1,5 @@
 Name:           letracode
-Version:        0.4.0
+Version:        0.5.0
 Release:        1%{?dist}
 Summary:        Private local AI conversations with project context
 License:        MIT
@@ -53,6 +53,9 @@ PYTHONPATH=%{buildroot}%{_datadir}/letracode %{_bindir}/python3 -P -m letracode 
 %{_metainfodir}/io.letracode.LetraCode.metainfo.xml
 
 %changelog
+* Wed Sep 09 2026 LetraCode contributors - 0.5.0-1
+- Add CUDA 4-bit QLoRA with memory reporting and accumulated training.
+
 * Wed Sep 09 2026 LetraCode contributors - 0.4.0-1
 - Local fine-tuning workspace, reviewed LoRA versions and visible chat thinking
 

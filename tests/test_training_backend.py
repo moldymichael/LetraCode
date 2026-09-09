@@ -185,3 +185,127 @@ def test_backend_rejects_normalized_duplicate_prompts(tmp_path):
     (tmp_path / 'eval.jsonl').write_text('{"prompt":" same PROMPT ","response":"yes"}\n')
     with pytest.raises(ValueError, match='Duplicate prompt'):
         backend().load_datasets(tmp_path)
+
+
+@pytest.mark.parametrize('change,field', [
+    ({'training_method': 'int8'}, 'training_method'),
+    ({'training_method': 'qlora', 'device': 'cpu'}, 'CUDA'),
+    ({'gradient_accumulation_steps': 0}, 'gradient_accumulation_steps'),
+    ({'gradient_accumulation_steps': True}, 'gradient_accumulation_steps'),
+    ({'gradient_accumulation_steps': 129}, 'gradient_accumulation_steps'),
+    ({'gradient_checkpointing': 'yes'}, 'gradient_checkpointing'),
+])
+def test_backend_rejects_invalid_qlora_configuration_before_loading(tmp_path, change, field):
+    model = tmp_path / 'model'
+    model.mkdir()
+    (model / 'config.json').write_text('{"model_type":"llama"}')
+    (model / 'model.safetensors').write_bytes(b'fixture')
+    (tmp_path / 'config.json').write_text(json.dumps({'base_model': str(model), **change}))
+    (tmp_path / 'train.jsonl').write_text('{"prompt":"train","response":"yes"}\n')
+    (tmp_path / 'eval.jsonl').write_text('{"prompt":"eval","response":"yes"}\n')
+    with pytest.raises(ValueError, match=field):
+        backend().run_training(tmp_path)
+
+
+def test_qlora_uses_fp16_on_turing_even_when_bf16_emulation_is_available():
+    from types import SimpleNamespace
+    torch = SimpleNamespace(float16='fp16', bfloat16='bf16', cuda=SimpleNamespace(
+        get_device_capability=lambda index: (7, 5), is_bf16_supported=lambda: True))
+    assert backend().cuda_compute_dtype(torch) == 'fp16'
+    torch.cuda.get_device_capability = lambda index: (8, 0)
+    assert backend().cuda_compute_dtype(torch) == 'bf16'
+
+
+def test_accumulation_matches_token_weighted_full_batch_and_final_partial_group():
+    torch = pytest.importorskip('torch')
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    trainer = backend()
+    # Unequal response lengths expose averaging microbatch means incorrectly.
+    rows = [{'labels': [-100] + [1] * count, 'target': .01 * (index + 1)}
+            for index, count in enumerate((1, 4, 2, 3, 1))]
+
+    class LossModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+        def forward(self, rows):
+            losses = [(self.weight - row['target']) ** 2 for row in rows]
+            counts = [len(row['labels']) - 1 for row in rows]
+            return SimpleNamespace(loss=sum(loss * count for loss, count in zip(losses, counts)) / sum(counts))
+
+    def run(batch_size, accumulation):
+        model = LossModel()
+        optimizer = torch.optim.SGD(model.parameters(), lr=.1)
+        scaler = torch.amp.GradScaler('cuda', enabled=False)
+        result = trainer.train_epoch(torch, model, rows, lambda values: {'rows': values}, optimizer,
+                                     scaler, nullcontext, batch_size, accumulation)
+        return model.weight.detach(), result
+
+    accumulated, result = run(1, 3)
+    full_batch, full_result = run(3, 1)
+    assert result == full_result == 2
+    assert torch.allclose(accumulated, full_batch, atol=1e-7)
+    assert accumulated > 0
+
+
+def test_adapter_verification_rejects_accidentally_trainable_base_weights():
+    from types import SimpleNamespace
+    adapter = SimpleNamespace(requires_grad=True)
+    frozen = SimpleNamespace(requires_grad=False)
+    model = SimpleNamespace(named_parameters=lambda: [('layer.lora_A.default.weight', adapter),
+                                                      ('layer.base_layer.weight', frozen)],
+                            get_nb_trainable_parameters=lambda: (8, 100))
+    assert backend().verify_adapter_parameters(model) == (8, 100)
+    frozen.requires_grad = True
+    with pytest.raises(RuntimeError, match='base weights'):
+        backend().verify_adapter_parameters(model)
+
+
+def test_fp16_scale_overflow_retries_group_without_counting_skipped_updates():
+    torch = pytest.importorskip('torch')
+    from types import SimpleNamespace
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.linear = torch.nn.Linear(1, 1, bias=False)
+            torch.nn.init.zeros_(self.linear.weight)
+        def forward(self, x):
+            return SimpleNamespace(loss=torch.nn.functional.mse_loss(self.linear(x), torch.tensor([[100.0]])))
+    model = Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=.001)
+    applied = []
+    optimizer.register_step_post_hook(lambda *args: applied.append(True))
+    scaler = torch.amp.GradScaler('cpu', init_scale=1024.0)
+    steps = backend().train_epoch(torch, model, [{'labels': [-100, 1]}],
+                                  lambda rows: {'x': torch.ones(1, 1)}, optimizer, scaler,
+                                  lambda: torch.autocast('cpu', dtype=torch.float16), 1, 1)
+    assert steps == len(applied) == 1
+    assert scaler.get_scale() < 1024
+    assert torch.isfinite(model.linear.weight).all()
+    assert model.linear.weight.item() > 0
+
+
+def test_persistent_nonfinite_gradients_stop_without_applying_an_update():
+    torch = pytest.importorskip('torch')
+    from contextlib import nullcontext
+    from types import SimpleNamespace
+    class Model(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.tensor(0.0))
+            self.calls = 0
+        def forward(self):
+            self.calls += 1
+            return SimpleNamespace(loss=self.weight.sqrt())
+    model = Model()
+    optimizer = torch.optim.SGD(model.parameters(), lr=.001)
+    applied = []
+    optimizer.register_step_post_hook(lambda *args: applied.append(True))
+    with pytest.raises(RuntimeError, match='persisted'):
+        backend().train_epoch(torch, model, [{'labels': [-100, 1]}], lambda rows: {},
+                              optimizer, torch.amp.GradScaler('cpu', init_scale=1024.0),
+                              nullcontext, 1, 1)
+    assert 1 < model.calls <= 13
+    assert not applied
+    assert model.weight.item() == 0

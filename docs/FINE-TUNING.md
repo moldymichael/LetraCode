@@ -1,6 +1,6 @@
 # Fine-Tuning and chat thinking
 
-LetraCode 0.4.0 adds a separate Fine-Tuning workspace to the current Strand app.
+LetraCode 0.5.0 adds CUDA 4-bit QLoRA to the Fine-Tuning workspace introduced in 0.4.0.
 Its adapters apply to the configured local chat model, including conversations
 using Strand identity, Memory and action tools. Model training and file-based
 Memory are separate: saving a note never trains weights.
@@ -14,12 +14,13 @@ model without loading the optional second model, while preserving that selection
 ## Prepare a training environment
 
 Training requires a separate Python environment with PyTorch, Transformers,
-PEFT, safetensors and sentencepiece. The desktop app does not install these
-packages or download models when training starts. For a CPU environment, from
-an extracted source tree:
+PEFT, accelerate, bitsandbytes, safetensors and sentencepiece. The desktop app
+does not install these packages or download models when training starts. Create
+an environment from an extracted source tree:
 
 ```bash
 python3 -m venv ~/letracode-training
+# First install the CUDA PyTorch build appropriate for your GPU and driver.
 ~/letracode-training/bin/python -m pip install -r packaging/training-requirements.txt
 ```
 
@@ -32,9 +33,18 @@ py -m venv "$env:USERPROFILE\letracode-training"
 ```
 
 Package installation requires internet access. Training itself uses local files
-and offline mode. For CUDA, install a PyTorch build compatible with your GPU and
-driver in that same environment before selecting `cuda`. The default is CPU.
-The packaged desktop runtime remains separate from the training environment.
+and offline mode. Follow the [PyTorch installer](https://pytorch.org/get-started/locally/)
+for a CUDA build compatible with your GPU and driver, then install the remaining
+requirements in that environment. New configurations recommend **4-bit QLoRA
+(NVIDIA GPU)**; previously saved full-precision settings retain their meaning.
+Ordinary LoRA supports CPU or CUDA. QLoRA requires CUDA and fails with a clear
+message if unavailable; it never silently changes training method.
+
+The packaged desktop runtime remains separate. On Linux, an existing
+`~/.local/share/letracode-training-qlora/bin/python` is offered automatically
+when no training Python was saved. Some llama.cpp conversion requirements select
+a CPU Torch build or incompatible older dependencies. Review their constraints
+before installation and verify `torch.cuda.is_available()` afterwards.
 
 Choose the environment's Python executable, not LetraCode.exe or pythonw.exe.
 The training model folder must contain original **unquantized, text-only Llama**
@@ -44,11 +54,24 @@ Remote custom code is disabled. Qwen, Mistral, Gemma, multimodal, quantized and
 adapter-only training folders are rejected by this first backend. They may
 still be used as normal GGUF chat models when supported by llama.cpp.
 
-The trainer uses float32 base weights and LoRA adapters on q_proj/v_proj. Base
-weights alone need approximately four bytes per parameter, plus activations,
-optimizer state and runtime memory. Start with a small model. Running a large
-quantized GGUF in chat does not establish that its original weights fit for
-training. Out-of-memory failures preserve the failed run and logs.
+**4-bit QLoRA** loads those original weights into NF4 with double quantization,
+freezes the base, and trains adapters on the model's linear layers. Native BF16
+compute is used when the GPU supports it; otherwise FP16 with gradient scaling
+is used, including on the RTX 2060 SUPER. Gradient checkpointing trades extra
+computation for lower activation memory. Accumulation combines several small
+batches into an optimizer update, weighted by supervised response tokens.
+The final partial group is included. These choices follow the
+[Transformers bitsandbytes guide](https://huggingface.co/docs/transformers/quantization/bitsandbytes)
+and [PEFT QLoRA guide](https://huggingface.co/docs/peft/developer_guides/quantization).
+
+**LoRA (full precision)** retains float32 base weights and q_proj/v_proj adapters.
+Base weights alone use approximately four bytes per parameter. In QLoRA,
+quantized linear weights use about half a byte per parameter plus quantization
+metadata; embeddings, adapters, activations and runtime buffers also need memory.
+Actual whole-model savings depend on architecture and settings. Start with
+microbatch 1, accumulation 4, length 512 and rank 8. Running a large GGUF in chat
+does not establish that its training weights fit this GPU. A 35B model's nominal
+4-bit weights alone exceed 8 GiB. Failed runs and logs remain available.
 
 ## Review examples
 
@@ -82,7 +105,8 @@ requirements in the training environment; use its own requirements documentation
 The GGUF must derive from the same original model weights. A compatible shape
 alone cannot establish that two models have matching weights.
 
-Review epochs, rank, length, batch size, seed, learning rate and device, select
+Review method, epochs, rank, length, microbatch, accumulation, checkpointing,
+seed, learning rate and device, select
 the review checkbox, and choose **Start local fine-tuning**. Each run snapshots
 approved training/evaluation examples and its configuration. Overlong examples
 fail with an explanation rather than silently dropping response tokens.
@@ -94,8 +118,14 @@ runs interrupted; it never automatically restarts training.
 sample outputs and provenance. Loss excludes prompt tokens and is measured on
 the same held-out responses before and after optimization. Lower loss on that
 set is narrow evidence; compare sample answers and test real Strand tasks.
-The report includes package versions, dataset/model/adapter hashes and the
-number of optimization steps. **Open run folder** exposes logs and artifacts.
+In QLoRA both baseline and candidate use the same quantized base; the baseline
+is not an unquantized-model benchmark. The report includes training precision,
+effective batch, model footprint, peak PyTorch CUDA allocated/reserved memory,
+package versions, dataset/model/adapter hashes and optimization steps. CUDA
+figures cover this training process's allocator, not total system GPU usage.
+QLoRA makes training more memory efficient; better answers still depend on the
+base model, reviewed examples and evaluation. **Open run folder** exposes logs
+and artifacts.
 
 Conversion failure keeps the PEFT adapter and comparison report, but disables
 adoption. After a successful conversion, choose **Adopt selected version**.
@@ -136,3 +166,4 @@ records does not restore missing weights or restart jobs.
 Read the [verification record](FINE-TUNING-VERIFICATION.md) for automated tests
 and the tiny local model proof. That fixture establishes working optimization,
 conversion and inference plumbing; it is not evidence of useful model quality.
+See [QLoRA verification](QLORA-VERIFICATION.md) for the CUDA upgrade evidence.

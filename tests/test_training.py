@@ -187,3 +187,42 @@ def test_run_lifecycle_is_terminal_and_recovery_is_explicit(tmp_path):
     assert finished['report']['candidate_loss'] == 1.2
     with pytest.raises(ValueError, match='terminal'):
         repo.update_run(second['id'], 'failed', error='late')
+
+
+def test_qlora_configuration_requires_cuda_and_preserves_accumulation_snapshot(tmp_path):
+    with pytest.raises(ValueError, match='QLoRA.*CUDA'):
+        config(tmp_path, training_method='qlora').validate()
+    selected = config(tmp_path, training_method='qlora', device='cuda',
+                      gradient_accumulation_steps=4, gradient_checkpointing=True)
+    snapshot = selected.to_dict()
+    assert snapshot['training_method'] == 'qlora'
+    assert snapshot['gradient_accumulation_steps'] == 4
+    assert snapshot['gradient_checkpointing'] is True
+    repo = repository(tmp_path)
+    approved_splits(repo)
+    run = repo.create_run(selected)
+    assert repo.verify_run_snapshot(run['id'])['config'] == snapshot
+
+
+@pytest.mark.parametrize('changes,field', [
+    ({'training_method': 'int8'}, 'training_method'),
+    ({'training_method': []}, 'training_method'),
+    ({'gradient_accumulation_steps': 0}, 'gradient_accumulation_steps'),
+    ({'gradient_accumulation_steps': 129}, 'gradient_accumulation_steps'),
+    ({'gradient_accumulation_steps': True}, 'gradient_accumulation_steps'),
+    ({'gradient_checkpointing': 'true'}, 'gradient_checkpointing'),
+])
+def test_new_training_options_reject_invalid_values(tmp_path, changes, field):
+    with pytest.raises(ValueError, match=field):
+        config(tmp_path, **changes).validate()
+
+
+def test_legacy_training_configuration_keeps_full_precision_cpu_defaults(tmp_path):
+    saved = config(tmp_path).to_dict()
+    for key in ('training_method', 'gradient_accumulation_steps', 'gradient_checkpointing'):
+        saved.pop(key, None)
+    restored = TrainingConfig(**saved)
+    assert restored.training_method == 'lora'
+    assert restored.device == 'cpu'
+    assert restored.gradient_accumulation_steps == 1
+    assert restored.gradient_checkpointing is False
