@@ -73,6 +73,15 @@ class Handler(BaseHTTPRequestHandler):
         record_path.write_text(json.dumps(records))
         if self.path == "/apply-template":
             scenario = request["messages"][-1]["content"]
+            if (
+                len(request["messages"]) >= 2
+                and all(message["role"] == "assistant" for message in request["messages"][-2:])
+            ):
+                self._json({"error": {
+                    "message": "Cannot have 2 or more assistant messages at the end of the list.",
+                    "type": "invalid_request_error",
+                }}, status=422 if scenario == "budget-invalid-422" else 400)
+                return
             if scenario == "budget-drip":
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
@@ -87,8 +96,13 @@ class Handler(BaseHTTPRequestHandler):
                 self.wfile.write(b'"}')
                 self.wfile.flush()
                 return
-            if scenario == "budget-unsupported":
-                self.send_error(404)
+            unsupported_status = {
+                "budget-unsupported": 404,
+                "budget-unsupported-405": 405,
+                "budget-unsupported-501": 501,
+            }.get(scenario)
+            if unsupported_status is not None:
+                self.send_error(unsupported_status)
                 return
             formatted = {"messages": request["messages"],
                          "thinking": request["chat_template_kwargs"]}
@@ -97,6 +111,13 @@ class Handler(BaseHTTPRequestHandler):
             self._json({"prompt": json.dumps(formatted)})
             return
         if self.path == "/tokenize":
+            for status in (400, 422):
+                if "budget-tokenize-invalid-" + str(status) in request["content"]:
+                    self._json({"error": {
+                        "message": "Invalid tokenizer content",
+                        "type": "invalid_request_error",
+                    }}, status=status)
+                    return
             self._json({"tokens": [17] * (9000 if "budget-overflow" in request["content"] else 37)})
             return
         scenario = request["messages"][-1]["content"]
@@ -188,9 +209,9 @@ class Handler(BaseHTTPRequestHandler):
         self._event({"choices": [{"delta": {}, "finish_reason": "stop"}]})
         self._done()
 
-    def _json(self, value):
+    def _json(self, value, status=200):
         body = json.dumps(value).encode()
-        self.send_response(200)
+        self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
@@ -608,7 +629,47 @@ def test_request_usage_formats_tools_thinking_and_reserves_reply(fake_server, gg
         engine.stop()
 
 
-@pytest.mark.parametrize("scenario", ["budget-unsupported", "budget-blind"])
+@pytest.mark.parametrize("endpoint", ["/apply-template", "/tokenize"])
+@pytest.mark.parametrize("status", [400, 422])
+def test_budget_request_error_does_not_disable_runtime_tokenizer(
+    fake_server, gguf_model, tmp_path, endpoint, status,
+):
+    from threading import Event
+    from letracode.engine import EngineError
+
+    engine = make_engine(fake_server, gguf_model, tmp_path / "data")
+    if endpoint == "/apply-template":
+        messages = [
+            {"role": "user", "content": "Continue the conversation"},
+            {"role": "assistant", "content": "First partial answer"},
+            {"role": "assistant", "content": f"budget-invalid-{status}"},
+        ]
+        diagnostic = "Cannot have 2 or more assistant messages at the end of the list."
+    else:
+        messages = [{"role": "user", "content": f"budget-tokenize-invalid-{status}"}]
+        diagnostic = "Invalid tokenizer content"
+    try:
+        with pytest.raises(EngineError, match=diagnostic) as error:
+            engine.request_usage(messages, None, Event())
+        assert f"HTTP {status}" in str(error.value)
+        assert engine.running
+
+        valid_messages = [{"role": "user", "content": "A valid next request"}]
+        usage = engine.request_usage(valid_messages, None, Event())
+        assert usage.method == "runtime tokenizer"
+        assert usage.prompt_tokens == 37
+        records = json.loads(fake_server.with_suffix(".requests.json").read_text())
+        assert records[-2]["path"] == "/apply-template"
+        assert records[-2]["body"]["messages"] == valid_messages
+        assert records[-1]["path"] == "/tokenize"
+        assert not any(r["path"] == "/v1/chat/completions" for r in records)
+    finally:
+        engine.stop()
+
+
+@pytest.mark.parametrize("scenario", [
+    "budget-unsupported", "budget-unsupported-405", "budget-unsupported-501", "budget-blind",
+])
 def test_request_usage_fallback_counts_utf8_tools_and_template(fake_server, gguf_model, tmp_path, scenario):
     from threading import Event
     engine = make_engine(fake_server, gguf_model, tmp_path / "data")

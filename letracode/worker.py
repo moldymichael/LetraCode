@@ -146,6 +146,7 @@ def conversation_messages(rows, system, budget, *, measure=None):
     """
     measure = measure or (lambda messages: len(json.dumps(messages, ensure_ascii=False)))
     turns, current = [], []
+    at_segment_boundary = False
     intent, required, checkpoint = resolve_intent(rows)
     for row in rows:
         payload = row_payload(row)
@@ -160,6 +161,7 @@ def conversation_messages(rows, system, budget, *, measure=None):
                 if current:
                     turns.append(current)
                     current = []
+                at_segment_boundary = True
             continue
         if row['role'] == 'user':
             if current:
@@ -168,6 +170,12 @@ def conversation_messages(rows, system, budget, *, measure=None):
         if row['status'] in ('error', 'streaming', 'interrupted'):
             continue
         message = dict(payload.get('message') or {'role': row['role'], 'content': row['content']})
+        if (row['role'] == 'assistant' and row['status'] == 'incomplete'
+                and payload.get('task_outcome') == 'source_incomplete'
+                and not message.get('tool_calls')):
+            # Keep rejected answers and their exposure records in storage, not
+            # as assistant prefills (or consecutive assistant tails) on retry.
+            continue
         message['_row_id'] = row.get('id')
         if row['role'] == 'user':
             # Saved user rows, not payload copies or summaries, carry intent.
@@ -175,7 +183,10 @@ def conversation_messages(rows, system, budget, *, measure=None):
         if row['role'] == 'tool':
             message['saved_result_id'] = row.get('id')
         current.append(message)
-    if current:
+        at_segment_boundary = False
+    if current or at_segment_boundary:
+        # The first request after rollover already has a new, empty segment.
+        # Older completed segments may yield space before its first reply exists.
         turns.append(current)
     if checkpoint:
         # Rebuild from all saved rows, including when replaying legacy notices.
@@ -223,11 +234,15 @@ def conversation_messages(rows, system, budget, *, measure=None):
         prefix = required_prefix(turn + following)
         candidate = prefix + turn + following
         if measure(protocol_messages(candidate)) > budget:
-            if selected:
+            if selected and any(selected):
                 break
+            # At an empty rollover, prefer pageable receipts that retain the
+            # latest result for exposure before dropping the completed segment.
             turn = compact_tool_results(turn, budget, prefix=prefix, measure=measure)
             compacted = True
             if measure(protocol_messages(prefix + turn)) > budget:
+                if selected:
+                    break  # Required context in the empty active segment fits.
                 raise ContextOverflowError(
                     'The latest conversation turn, required intent/referenced context and core instructions cannot fit with the enabled '
                     'tools and reserved reply. Nothing was truncated. Increase context size, disable '
