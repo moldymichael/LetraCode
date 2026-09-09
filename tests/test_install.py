@@ -84,7 +84,7 @@ def test_install_update_launch_and_uninstall_preserve_user_data(tmp_path: Path):
     version = subprocess.run(
         [str(launcher), "--version"], env=env, text=True, capture_output=True, check=True
     )
-    assert version.stdout.strip() == "LetraCode 0.3.0"
+    assert version.stdout.strip() == "LetraCode 0.4.0"
 
     (app_dir / "obsolete-file").write_text("old", encoding="utf-8")
     run_script(source / "install.sh", env, "--no-deps")
@@ -95,7 +95,7 @@ def test_install_update_launch_and_uninstall_preserve_user_data(tmp_path: Path):
     version_after_source_removal = subprocess.run(
         [str(launcher), "--version"], env=env, text=True, capture_output=True, check=True
     )
-    assert version_after_source_removal.stdout.strip() == "LetraCode 0.3.0"
+    assert version_after_source_removal.stdout.strip() == "LetraCode 0.4.0"
 
     uninstall = run_script(app_dir / "uninstall.sh", env)
     assert "User data was kept" in uninstall.stdout
@@ -201,7 +201,7 @@ def test_normal_install_succeeds_with_fedora_44_packages_and_no_docx(tmp_path: P
             [sys.executable, str(ROOT / "packaging/build-release.py"), "--output-dir", str(output)],
             check=True, capture_output=True,
         )
-        installer = output / "LetraCode-0.3.0.run"
+        installer = output / "LetraCode-0.4.0.run"
     installed = run_script(installer, env, check=False)
 
     assert installed.returncode == 0, installed.stdout + installed.stderr
@@ -244,14 +244,14 @@ def test_release_builder_makes_clean_source_archive_and_runnable_installer(tmp_p
         capture_output=True,
         check=True,
     )
-    source_archive = output / "LetraCode-0.3.0.tar.gz"
-    run_installer = output / "LetraCode-0.3.0.run"
+    source_archive = output / "LetraCode-0.4.0.tar.gz"
+    run_installer = output / "LetraCode-0.4.0.run"
     assert source_archive.is_file()
     assert run_installer.stat().st_mode & 0o111
 
     with tarfile.open(source_archive, "r:gz") as archive:
         names = set(archive.getnames())
-    prefix = "LetraCode-0.3.0/"
+    prefix = "LetraCode-0.4.0/"
     assert prefix + "README.md" in names
     assert prefix + "LICENSE" in names
     assert prefix + "tests/test_install.py" in names
@@ -267,5 +267,5 @@ def test_release_builder_makes_clean_source_archive_and_runnable_installer(tmp_p
     version = subprocess.run(
         [str(launcher), "--version"], env=env, text=True, capture_output=True, check=True
     )
-    assert version.stdout.strip() == "LetraCode 0.3.0"
+    assert version.stdout.strip() == "LetraCode 0.4.0"
     run_script(data_home / "letracode-app/uninstall.sh", env)

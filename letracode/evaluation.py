@@ -54,7 +54,8 @@ _SECRET_KEY = re.compile(r'(?i)(?:password|passwd|secret|credential|authorizatio
 _PATH_KEYS = {'path', 'cwd', 'backup', 'model_path', 'executable', 'root', 'directory'}
 _CONFIG_FIELDS = {'thinking', 'mode', 'context_size', 'max_tokens', 'temperature', 'gpu_layers',
                   'threads', 'web_enabled', 'computer_enabled', 'use_tools', 'actions_enabled',
-                  'internet_enabled', 'model', 'executable', 'model_name', 'engine_name'}
+                  'internet_enabled', 'model', 'executable', 'model_name', 'engine_name',
+                  'adapter_name', 'training_version'}
 
 README = '''# LetraCode evaluation bundle
 
@@ -193,7 +194,7 @@ class _Projection:
             item = values.get(key)
             if key not in values:
                 continue
-            if key in ('model', 'executable', 'model_name', 'engine_name') and isinstance(item, str):
+            if key in ('model', 'executable', 'model_name', 'engine_name', 'adapter_name') and isinstance(item, str):
                 result[key] = self.text(PureWindowsPath(item).name)
             elif isinstance(item, str):
                 result[key] = self.text(item)

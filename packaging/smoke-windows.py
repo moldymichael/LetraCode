@@ -170,6 +170,12 @@ def smoke(installer: Path, portable: Path, work: Path) -> dict:
     version = json.loads((app / "version.json").read_text(encoding="utf-8"))["version"]
     if version != installed_version:
         raise RuntimeError("Installer and bundled application versions differ")
+    trainer = app / "_internal/letracode/training_backend.py"
+    if not trainer.is_file() or not (app / "packaging/training-requirements.txt").is_file():
+        raise RuntimeError("The package is missing the standalone local trainer or its dependency list")
+    # The trainer must run under a separately selected Python, outside the frozen app.
+    subprocess.run([sys.executable, str(trainer), "--help"], check=True,
+                   capture_output=True, timeout=30)
     launch_and_close(app / "LetraCode.exe", data, work, "installed-window", env,
                      while_running=lambda child: verify_running_app_protected(child, installer, app, work))
     # Seed real chat rows and ordinary project/recovery files after the packaged

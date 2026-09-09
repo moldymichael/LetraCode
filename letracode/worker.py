@@ -1,6 +1,7 @@
 """One cancellable conversation job. Qt UI work stays on the main thread."""
 from __future__ import annotations
 
+import inspect
 import json
 from pathlib import Path
 import threading
@@ -286,6 +287,14 @@ class ConversationWorker(QThread):
             'web_enabled': bool(web_enabled), 'computer_enabled': bool(computer_enabled),
             'use_tools': bool(use_tools),
         }
+        adapter = getattr(config, 'lora_path', '')
+        if isinstance(adapter, str) and adapter.strip():
+            self.run_configuration['adapter_name'] = Path(adapter).name
+            saved_engine = self.store.setting('engine', {})
+            version = self.store.setting('training_active_version')
+            if (isinstance(saved_engine, dict) and saved_engine.get('lora_path') == adapter
+                    and isinstance(version, str) and version):
+                self.run_configuration['training_version'] = version
         for key in ('context_size', 'max_tokens', 'gpu_layers', 'threads', 'temperature'):
             value = getattr(config, key, None)
             if type(value) in (int, float):
@@ -383,12 +392,30 @@ class ConversationWorker(QThread):
         return ident
 
     def run(self):
-        message_id, draft = None, ''
+        message_id, draft, reasoning = None, '', ''
+        stream_payload = {}
+
+        def save_partial(status='streaming'):
+            if message_id is not None:
+                data = dict(stream_payload)
+                if reasoning:
+                    data['reasoning'] = reasoning
+                self.store.update_message(message_id, draft, status, payload=data)
+
         rounds = 0
         timer = None
         try:
             if self.cancel_event.is_set():
                 raise Cancelled()
+            # Preserve compatibility with integrations implementing the original
+            # completion signature. Never retry a call after a TypeError: it may
+            # have already sent a request or invoked a callback.
+            try:
+                parameters = inspect.signature(self.engine.complete).parameters
+                accepts_reasoning = ('on_reasoning' in parameters or any(
+                    parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters.values()))
+            except (TypeError, ValueError):
+                accepts_reasoning = False
             chat = self.store.chat(self.chat_id)
             if chat is None:
                 return
@@ -551,30 +578,48 @@ class ConversationWorker(QThread):
                     exposure = request_exposure(messages, current)
                     self.progress.reserve_request()
                     rounds = round_index + 1
-                    draft = ''
+                    draft, reasoning = '', ''
                     request_record = self.run_record()
+                    stream_payload = {'continuation': request_record, 'source_exposure_pending': exposure,
+                                      'run_configuration': self.run_configuration}
                     message_id = self.store.add_message(self.chat_id, 'assistant', '', status='streaming',
-                        payload={'continuation': request_record, 'source_exposure_pending': exposure,
-                                 'run_configuration': self.run_configuration})
+                                                        payload=stream_payload)
                     self.changed.emit()
                     last_save = 0.0
 
-                    def delta(text):
-                        nonlocal draft, last_save
-                        draft += text
+                    def progress():
+                        nonlocal last_save
                         if time.monotonic() - last_save > 0.12:
-                            self.store.update_message(message_id, draft, 'streaming')
+                            save_partial()
                             self.changed.emit()
                             last_save = time.monotonic()
 
+                    def delta(text):
+                        nonlocal draft
+                        draft += text
+                        progress()
+
+                    def thinking_delta(text):
+                        nonlocal reasoning
+                        reasoning += text
+                        progress()
+
                     self.status.emit('Thinking locally…' if self.thinking else 'Replying locally…')
-                    reply = self.engine.complete(messages, tools or None, self.cancel_event, delta, self.thinking)
+                    callbacks = {'on_reasoning': thinking_delta} if accepts_reasoning else {}
+                    reply = dict(self.engine.complete(messages, tools or None, self.cancel_event,
+                                                      delta, self.thinking, **callbacks))
+                    returned_reasoning = reply.pop('reasoning_content', None) or reply.get('reasoning')
+                    reply.pop('reasoning', None)
+                    if isinstance(returned_reasoning, str) and returned_reasoning:
+                        reasoning = returned_reasoning
                     draft = reply.get('content') or draft
                     calls = reply.get('tool_calls') or []
                     response_id = message_id
                     data = {'message': reply, 'pause_context_closed': False,
                             'continuation': request_record, 'source_exposure': exposure,
                             'request_completed': True, 'run_configuration': self.run_configuration}
+                    if reasoning:
+                        data['reasoning'] = reasoning
                     self.store.update_message(message_id, draft, payload=data)
                     message_id = None
                     if prior_exposure != source_signature(self.store.messages(self.chat_id), 'exposed_ranges'):
@@ -695,22 +740,22 @@ class ConversationWorker(QThread):
                     rounds, automatic=True)
         except ContextOverflowError as error:
             if message_id is not None:
-                self.store.update_message(message_id, draft, 'error')
+                save_partial('error')
             self.pause('context_limit', str(error), rounds)
         except RunHalted as error:
             if message_id is not None:
-                self.store.update_message(message_id, draft, 'interrupted')
+                save_partial('interrupted')
             self.pause(error.reason, error.detail, rounds)
         except Exception as error:
             cancelled = self.cancel_event.is_set() or isinstance(error, Cancelled)
             if cancelled and self.stop_reason == 'time_budget':
                 if message_id is not None:
-                    self.store.update_message(message_id, draft, 'interrupted')
+                    save_partial('interrupted')
                 self.pause('time_budget', f'Run reached its {self.limits.max_seconds:g}-second wall limit, including approval wait.', rounds)
             else:
                 state = 'interrupted' if cancelled else 'error'
                 if message_id is not None:
-                    self.store.update_message(message_id, draft, state)
+                    save_partial(state)
                 if cancelled:
                     rows = self.store.messages(self.chat_id)
                     cursor = next((row['id'] for row in reversed(rows) if row['role'] == 'user'), None)

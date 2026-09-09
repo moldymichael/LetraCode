@@ -26,6 +26,7 @@ from typing import BinaryIO, Callable
 import weakref
 
 from .processes import start_process, stop_process
+from .reasoning import ThinkSplitter
 
 from .budgeting import RequestUsage, fallback_usage
 
@@ -68,10 +69,34 @@ class EngineConfig:
     threads: int = 4
     max_tokens: int = 2048
     temperature: float = 0.7
+    lora_path: str = ""
 
 
 class EngineError(RuntimeError):
     """A configuration, process, or local protocol failure."""
+
+
+def validated_lora_path(value: str) -> Path | None:
+    """Validate one optional GGUF adapter; the engine checks model compatibility."""
+    if not isinstance(value, str):
+        raise EngineError("The LoRA adapter path must be text")
+    if not value.strip():
+        return None
+    try:
+        adapter = Path(value).expanduser().resolve()
+        # llama.cpp splits this option on commas, even with a single argv value.
+        if ',' in value or ',' in str(adapter):
+            raise EngineError("The LoRA adapter path cannot contain commas. Rename or move the file first.")
+        if not adapter.is_file() or not os.access(adapter, os.R_OK):
+            raise EngineError("The configured LoRA adapter is missing or not a readable file")
+        with adapter.open('rb') as handle:
+            if handle.read(4) != b'GGUF':
+                raise EngineError("The configured LoRA adapter is not a valid GGUF file")
+    except (OSError, ValueError, RuntimeError) as exc:
+        if isinstance(exc, EngineError):
+            raise
+        raise EngineError(f"Could not read the configured LoRA adapter: {exc}") from exc
+    return adapter
 
 
 class ContextOverflowError(EngineError):
@@ -138,6 +163,7 @@ class LocalEngine:
             self.stop()
             self._cancel_requested.clear()
             executable, model = self._validated_paths()
+            adapter = validated_lora_path(self.config.lora_path)
             self._prepare_data_dir()
             port = self._reserve_port()
             token = 'lc_' + secrets.token_urlsafe(32)
@@ -160,6 +186,8 @@ class LocalEngine:
                 "--parallel",
                 "1",
             ]
+            if adapter is not None:
+                arguments.extend(["--lora", str(adapter)])
             argv = self._launcher_argv(executable, arguments)
             environment = {
                 key: value
@@ -231,8 +259,10 @@ class LocalEngine:
         cancel: threading.Event,
         on_delta: Callable[[str], None],
         thinking: bool = False,
+        *,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> dict:
-        """Stream one authenticated OpenAI-compatible chat completion."""
+        """Stream an answer and optional model thinking through separate callbacks."""
         if not self._operation_lock.acquire(blocking=False):
             raise EngineError("A local model completion is already in progress")
         watcher_done = threading.Event()
@@ -303,7 +333,7 @@ class LocalEngine:
                     + self._error_detail(raw)
                 )
             return self._read_completion_stream(
-                response, process, cancel, on_delta, deadline
+                response, process, cancel, on_delta, deadline, on_reasoning
             )
         except Cancelled:
             if deadline_expired.is_set():
@@ -523,8 +553,22 @@ class LocalEngine:
         cancel: threading.Event,
         on_delta: Callable[[str], None],
         deadline: float,
+        on_reasoning: Callable[[str], None] | None = None,
     ) -> dict:
         content_parts: list[str] = []
+        reasoning_parts: list[str] = []
+
+        def content_delta(text):
+            content_parts.append(text)
+            on_delta(text)
+
+        def reasoning_delta(text):
+            if text:
+                reasoning_parts.append(text)
+                if on_reasoning is not None:
+                    on_reasoning(text)
+
+        splitter = ThinkSplitter(content_delta, reasoning_delta)
         content_bytes = 0
         tool_parts: dict[int, dict[str, str]] = {}
         tool_bytes = 0
@@ -533,49 +577,54 @@ class LocalEngine:
         event_lines: list[str] = []
         event_size = 0
 
-        while True:
-            self._raise_if_cancelled(cancel)
-            if time.monotonic() >= deadline:
-                self.stop()
-                raise EngineError("Local model completion timed out after 300 seconds")
-            raw_line = response.readline(_MAX_SSE_LINE_BYTES + 1)
-            if not raw_line:
-                break
-            if len(raw_line) > _MAX_SSE_LINE_BYTES:
-                raise EngineError("The local model server sent an oversized stream event")
-            try:
-                line = raw_line.decode("utf-8", errors="strict").rstrip("\r\n")
-            except UnicodeDecodeError as exc:
-                raise EngineError("The local model server sent malformed UTF-8") from exc
-            if not line:
-                if event_lines:
-                    data = "\n".join(event_lines)
-                    event_lines = []
-                    event_size = 0
-                    if data == "[DONE]":
-                        saw_done = True
-                        break
-                    event = self._decode_stream_event(data)
-                    content_bytes, tool_bytes, finish_reason = self._consume_stream_event(
-                        event,
-                        content_parts,
-                        content_bytes,
-                        tool_parts,
-                        tool_bytes,
-                        finish_reason,
-                        on_delta,
-                    )
-                continue
-            if line.startswith(":"):
-                continue
-            if line.startswith("data:"):
-                value = line[5:]
-                if value.startswith(" "):
-                    value = value[1:]
-                event_size += len(value.encode("utf-8"))
-                if event_size > _MAX_SSE_LINE_BYTES:
+        try:
+            while True:
+                self._raise_if_cancelled(cancel)
+                if time.monotonic() >= deadline:
+                    self.stop()
+                    raise EngineError("Local model completion timed out after 300 seconds")
+                raw_line = response.readline(_MAX_SSE_LINE_BYTES + 1)
+                if not raw_line:
+                    break
+                if len(raw_line) > _MAX_SSE_LINE_BYTES:
                     raise EngineError("The local model server sent an oversized stream event")
-                event_lines.append(value)
+                try:
+                    line = raw_line.decode("utf-8", errors="strict").rstrip("\r\n")
+                except UnicodeDecodeError as exc:
+                    raise EngineError("The local model server sent malformed UTF-8") from exc
+                if not line:
+                    if event_lines:
+                        data = "\n".join(event_lines)
+                        event_lines = []
+                        event_size = 0
+                        if data == "[DONE]":
+                            saw_done = True
+                            break
+                        event = self._decode_stream_event(data)
+                        content_bytes, tool_bytes, finish_reason = self._consume_stream_event(
+                            event,
+                            content_bytes,
+                            tool_parts,
+                            tool_bytes,
+                            finish_reason,
+                            splitter.feed,
+                            reasoning_delta,
+                        )
+                    continue
+                if line.startswith(":"):
+                    continue
+                if line.startswith("data:"):
+                    value = line[5:]
+                    if value.startswith(" "):
+                        value = value[1:]
+                    event_size += len(value.encode("utf-8"))
+                    if event_size > _MAX_SSE_LINE_BYTES:
+                        raise EngineError("The local model server sent an oversized stream event")
+                    event_lines.append(value)
+
+        finally:
+            # Keep the final partial tag/text on cancellation or protocol errors.
+            splitter.finish()
 
         self._raise_if_cancelled(cancel)
         if not saw_done:
@@ -600,6 +649,8 @@ class LocalEngine:
             "role": "assistant",
             "content": "".join(content_parts),
         }
+        if reasoning_parts:
+            result["reasoning_content"] = "".join(reasoning_parts)
         if tool_parts:
             calls: list[dict[str, object]] = []
             for index in sorted(tool_parts):
@@ -650,12 +701,12 @@ class LocalEngine:
     def _consume_stream_event(
         self,
         event: dict,
-        content_parts: list[str],
         content_bytes: int,
         tool_parts: dict[int, dict[str, str]],
         tool_bytes: int,
         finish_reason: str | None,
         on_delta: Callable[[str], None],
+        on_reasoning: Callable[[str], None],
     ) -> tuple[int, int, str | None]:
         choices = event.get("choices", [])
         if not isinstance(choices, list):
@@ -675,6 +726,17 @@ class LocalEngine:
             delta = {}
         if not isinstance(delta, dict):
             raise EngineError("The local model server sent a malformed completion delta")
+        for field in ("reasoning_content", "reasoning"):
+            value = delta.get(field)
+            if value is not None and not isinstance(value, str):
+                raise EngineError("The local model server sent malformed reasoning content")
+        # Servers may expose both aliases. Prefer the canonical field once.
+        reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+        if reasoning:
+            content_bytes += len(reasoning.encode("utf-8"))
+            if content_bytes > _MAX_OUTPUT_BYTES:
+                raise EngineError("The local model response exceeded the output size limit")
+            on_reasoning(reasoning)
         content = delta.get("content")
         if content is not None:
             if not isinstance(content, str):
@@ -683,7 +745,6 @@ class LocalEngine:
             if content_bytes > _MAX_OUTPUT_BYTES:
                 raise EngineError("The local model response exceeded the output size limit")
             if content:
-                content_parts.append(content)
                 on_delta(content)
 
         calls = delta.get("tool_calls", [])

@@ -7,6 +7,27 @@ computer. There is no cloud inference, account, or telemetry.
 For the development baseline, current capabilities and verification boundaries,
 see [Current implementation state](docs/CURRENT-STATE.md).
 
+## Fine-Tuning and visible thinking (0.4.0 source build)
+
+Open **Fine-Tuning** to write or import examples, review training and held-out
+evaluation sets, run local LoRA training, compare results, and adopt or roll back
+a model version. **Learn from reply…** creates an editable draft from chat.
+Training uses a separate Python environment and original, unquantized text-only
+Llama weights; a GGUF inference file alone cannot be trained. Models in other
+architectures remain usable for chat but are not supported by this trainer.
+See [Fine-Tuning setup and workflow](docs/FINE-TUNING.md).
+
+Choose **Thinking** in regular chat to request reasoning from compatible local
+models. Emitted thinking streams in its own block; use **Show thinking** or
+**Hide thinking** to expand or collapse it. Saved thinking survives reopening
+and stays separate from the answer, Copy last reply, and future chat context.
+Models that do not emit reasoning continue to show their ordinary answers.
+
+This source tree is version **0.4.0**, based on the current 0.3.0 Strand app.
+The 0.3.0 downloads linked below predate these additions. Build this checkout
+with `python3 packaging/build-release.py` for 0.4.0 source/Fedora archives;
+the GitHub workflow also builds native Windows installer and portable artifacts.
+
 ## Evaluation export and Memory folders
 
 **File → Export Evaluation…** saves the selected conversation as a portable ZIP

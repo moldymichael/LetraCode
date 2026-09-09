@@ -34,6 +34,7 @@ parser.add_argument("--n-gpu-layers", required=True)
 parser.add_argument("--threads", required=True)
 parser.add_argument("--jinja", action="store_true")
 parser.add_argument("--parallel", required=True)
+parser.add_argument("--lora")
 args = parser.parse_args()
 
 own_path = Path(sys.argv[0])
@@ -457,6 +458,7 @@ def test_complete_streams_content_and_collects_fragmented_native_tool_calls(
         assert result == {
             "role": "assistant",
             "content": "Hello",
+            "reasoning_content": "private chain remains private",
             "tool_calls": [{
                 "id": "call_123",
                 "type": "function",

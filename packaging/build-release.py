@@ -42,7 +42,7 @@ def release_files() -> list[Path]:
     files.extend((ROOT / "packaging/licenses").rglob("*.txt"))
     files.extend(ROOT / "packaging" / name for name in (
         "build-windows.py", "windows-launcher.py", "windows.iss",
-        "windows-requirements.txt", "smoke-windows.py",
+        "windows-requirements.txt", "smoke-windows.py", "training-requirements.txt",
     ))
     files.append(ROOT / ".gitattributes")
     missing = [path for path in files if not path.is_file()]

@@ -14,7 +14,7 @@ from PySide6.QtGui import QAction, QDesktopServices, QFontDatabase, QIcon, QKeyS
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
-    QSplitter, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
+    QSplitter, QTabWidget, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget)
 
 from . import __version__
@@ -25,6 +25,7 @@ from .store import message_status
 from .memory_ui import MemoryDialog
 from .project_files import ProjectFilesPanel
 from .platform import engine_setup_help, is_windows
+from .training_ui import FineTuningPanel
 
 
 def assistant_html(text, font):
@@ -65,6 +66,7 @@ class MainWindow(QMainWindow):
         self.worker = None
         self.approval_dialog = None
         self.loading = False
+        self.thinking_expanded = {}
         self.selection_ready = False
         self.closing_when_stopped = False
         config_data = self.store.setting('engine',{})
@@ -90,6 +92,12 @@ class MainWindow(QMainWindow):
         self.render_timer.timeout.connect(self.render_chat)
         self.build_ui()
         self.build_menus()
+        self.workspaces = QTabWidget()
+        self.workspaces.addTab(self.takeCentralWidget(), 'Chat')
+        self.training_panel = FineTuningPanel(store, self)
+        self.workspaces.addTab(self.training_panel, 'Fine-Tuning')
+        self.setCentralWidget(self.workspaces)
+        self.training_panel.busy_changed.connect(self.set_busy)
         self.refresh_tree()
         previous = self.store.setting('last_chat')
         if previous and self.store.chat(previous):
@@ -157,9 +165,11 @@ class MainWindow(QMainWindow):
         self.copy_button.clicked.connect(self.copy_reply)
         self.retry_button = QPushButton(QIcon.fromTheme('view-refresh'),'Retry reply')
         self.retry_button.clicked.connect(self.retry_reply)
-        row.addWidget(self.copy_button); row.addWidget(self.retry_button); row.addStretch()
+        self.learn_button = QPushButton('Learn from reply…')
+        self.learn_button.clicked.connect(self.learn_from_reply)
+        row.addWidget(self.copy_button); row.addWidget(self.retry_button); row.addWidget(self.learn_button); row.addStretch()
         self.mode = QComboBox(); self.mode.addItems(['Instant','Thinking'])
-        self.mode.setToolTip('Thinking asks compatible models to reason before replying. Support depends on your model.')
+        self.mode.setToolTip('Thinking asks compatible models to reason before replying. Emitted thinking appears live in a separate, collapsible block. Support depends on your model and engine.')
         self.mode.setCurrentText(self.store.setting('mode','Instant'))
         row.addWidget(self.mode)
         center.addLayout(row)
@@ -411,7 +421,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage('Project deleted · no Memory files were present; Memory was not archived')
 
     def model_setup(self):
-        if self.worker:
+        if self.worker or self.training_panel.job is not None:
             return
         dialog = ModelDialog(self.engine_config,self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -419,11 +429,12 @@ class MainWindow(QMainWindow):
             self.engine_config = dialog.config()
             self.engine = LocalEngine(self.engine_config,self.store.directory)
             self.store.set_setting('engine',dataclasses.asdict(self.engine_config))
+            self.store.set_setting('training_active_version', None)
             self.render_chat()
             self.statusBar().showMessage('Model configured. Send a message to load it.')
 
     def send(self):
-        if self.worker:
+        if self.worker or self.training_panel.job is not None:
             return
         text = self.composer.toPlainText().strip()
         if not text:
@@ -452,6 +463,8 @@ class MainWindow(QMainWindow):
         self.start_worker()
 
     def start_worker(self):
+        if self.worker or self.training_panel.job is not None:
+            return
         self.store.set_setting('mode',self.mode.currentText())
         for key,widget in [('computer',self.computer),('internet',self.internet),('actions',self.actions)]:
             self.store.set_setting(key,widget.isChecked())
@@ -470,7 +483,9 @@ class MainWindow(QMainWindow):
         for action in self.mutation_actions:
             action.setEnabled(not busy)
         self.instructions_action.setEnabled(not busy and self.project_id is not None)
-        self.stop_button.setEnabled(busy)
+        self.stop_button.setEnabled(self.worker is not None)
+        self.learn_button.setEnabled(not busy)
+        self.training_panel.set_chat_busy(busy)
 
     def queue_render(self):
         if not self.render_timer.isActive():
@@ -478,6 +493,8 @@ class MainWindow(QMainWindow):
 
     def render_chat(self):
         model = Path(self.engine_config.model_path).name if self.engine_config.model_path else 'No model selected'
+        if self.engine_config.lora_path:
+            model += ' + adapter ' + Path(self.engine_config.lora_path).name
         self.model_label.setText(f'{model}  ·  Local inference' if self.engine_config.model_path else 'Choose a local model in Model Setup to begin.')
         scrollbar = self.transcript.verticalScrollBar()
         previous = scrollbar.value(); bottom = previous >= scrollbar.maximum()-50
@@ -507,12 +524,28 @@ class MainWindow(QMainWindow):
             status = message_status(message)
             state = f' · {status}' if status else ''
             chunks.append(f'<hr><p><b>{name}{html.escape(state)}</b></p>')
+            reasoning = ''
+            if role == 'assistant':
+                try:
+                    payload = json.loads(message['payload'])
+                    reasoning = payload.get('reasoning', '') if isinstance(payload, dict) else ''
+                except (ValueError, TypeError):
+                    pass
+                if not isinstance(reasoning, str):
+                    reasoning = ''
+                if reasoning:
+                    expanded = self.thinking_expanded.get(message['id'], message['status'] == 'streaming')
+                    label = 'Thinking…' if message['status'] == 'streaming' and not message['content'] else 'Thinking'
+                    toggle = 'Hide thinking' if expanded else 'Show thinking'
+                    chunks.append(f'<p><b>{label}</b> · <a href="letracode:thinking/{message["id"]}">{toggle}</a></p>')
+                    if expanded:
+                        chunks.append('<blockquote>' + assistant_html(reasoning, self.transcript.font()) + '</blockquote>')
             text = message['content']
             if role == 'user' or role == 'notice':
                 chunks.append('<p>'+html.escape(text).replace('\n','<br>')+'</p>')
             elif text:
                 chunks.append(assistant_html(text, self.transcript.font()))
-            elif message['status']=='streaming':
+            elif message['status']=='streaming' and not reasoning:
                 chunks.append('<p>Working locally…</p>')
         self.transcript.setHtml('\n'.join(chunks))
         scrollbar.setValue(scrollbar.maximum() if bottom else previous)
@@ -520,7 +553,7 @@ class MainWindow(QMainWindow):
             chat = self.store.chat(self.chat_id)
             if chat: self.chat_title.setText(chat['title'])
         self.copy_button.setEnabled(any(m['role']=='assistant' and m['content'] for m in messages))
-        self.retry_button.setEnabled(not self.worker and any(m['role']=='user' for m in messages))
+        self.retry_button.setEnabled(not self.worker and self.training_panel.job is None and any(m['role']=='user' for m in messages))
 
     def show_approval(self,pending):
         if pending.event.is_set() or not self.worker:
@@ -549,7 +582,7 @@ class MainWindow(QMainWindow):
         else: self.composer.setFocus()
 
     def retry_reply(self):
-        if self.worker or not self.chat_id:
+        if self.worker or self.training_panel.job is not None or not self.chat_id:
             return
         if self.save_editors() is False:
             return
@@ -569,6 +602,15 @@ class MainWindow(QMainWindow):
 
     def open_link(self,url):
         text = url.toString()
+        if text.startswith('letracode:thinking/'):
+            ident = text.removeprefix('letracode:thinking/')
+            message = next((m for m in self.store.messages(self.chat_id)
+                            if str(m['id']) == ident and m['role'] == 'assistant'), None) if self.chat_id else None
+            if message:
+                expanded = self.thinking_expanded.get(message['id'], message['status'] == 'streaming')
+                self.thinking_expanded[message['id']] = not expanded
+                self.render_chat()
+            return
         if text.startswith('letracode:undo-memory/'):
             ident = text.removeprefix('letracode:undo-memory/')
             # Only real saved tool receipts in this chat create Undo authority;
@@ -663,6 +705,7 @@ class MainWindow(QMainWindow):
 
     def backup(self):
         self.save_editors()
+        self.training_panel.persist_draft()
         name,_ = QFileDialog.getSaveFileName(self,'Back up LetraCode',str(Path.home()/'LetraCode-backup.zip'),'ZIP archive (*.zip)')
         if name:
             try:
@@ -683,6 +726,12 @@ class MainWindow(QMainWindow):
         self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\n' + engine_setup_help() + '\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Use Project files to add existing files and folders, create notes and folders, and open or edit files. Save file applies note edits; navigation and Close keep unsaved note drafts separately. Files, saved drafts & history provides recovery and Undo. Shared files are available across projects. Always-active notes are included automatically; other notes are available to list, search and read when relevant. Set Project instructions in Settings.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
 
     def closeEvent(self,event):
+        if self.training_panel.job is not None:
+            if not self.closing_when_stopped:
+                answer = QMessageBox.question(self, 'Stop and quit?', 'A training or model change is running. Stop it and quit?', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+                if answer == QMessageBox.StandardButton.Yes:
+                    self.closing_when_stopped = True; self.training_panel.stop()
+            event.ignore(); return
         if self.worker:
             if not self.closing_when_stopped:
                 answer = QMessageBox.question(self,'Stop and quit?','A reply or action is running. Stop it and quit?',QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.No,QMessageBox.StandardButton.No)
@@ -690,6 +739,31 @@ class MainWindow(QMainWindow):
                     self.closing_when_stopped = True; self.stop()
             event.ignore(); return
         self.save_editors()
+        self.training_panel.persist_draft()
         self.store.set_setting('geometry',bytes(self.saveGeometry().toHex()).decode('ascii'))
         self.engine.stop()
         event.accept()
+
+    def learn_from_reply(self):
+        if self.worker or self.training_panel.job is not None or not self.chat_id:
+            return
+        messages = self.store.messages(self.chat_id)
+        for index in range(len(messages) - 1, -1, -1):
+            row = messages[index]
+            if row['role'] != 'assistant' or row['status'] != 'complete' or not row['content'].strip():
+                continue
+            try:
+                payload = json.loads(row['payload'])
+                if (payload.get('message') or {}).get('tool_calls'):
+                    continue
+            except (ValueError, TypeError):
+                continue
+            prompt = next((m['content'] for m in reversed(messages[:index]) if m['role'] == 'user'), '')
+            if prompt:
+                panel = self.training_panel
+                panel.new_example(); panel.prompt.setPlainText(prompt); panel.response.setPlainText(row['content'])
+                panel.example_source = f"chat:{self.chat_id}/message:{row['id']}"
+                panel.persist_draft(); panel.tabs.setCurrentIndex(0)
+                panel.progress.setText('Review and correct this draft. Saving a reply does not establish that it is true.')
+                self.workspaces.setCurrentWidget(panel)
+            return

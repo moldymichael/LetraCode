@@ -638,8 +638,11 @@ class Store:
                 db = sqlite3.connect(copy)
                 db.row_factory = sqlite3.Row
                 try:
+                    tables = ['projects','chats','messages','links','settings']
+                    available = {r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+                    tables.extend(t for t in ('training_examples', 'training_runs') if t in available)
                     exported = {table: [dict(r) for r in db.execute(f'SELECT * FROM {table}')]
-                        for table in ('projects','chats','messages','links','settings')}
+                        for table in tables}
                 finally:
                     db.close()
                 with zipfile.ZipFile(stage, 'w', zipfile.ZIP_DEFLATED) as archive:
@@ -659,7 +662,10 @@ class Store:
                         'Included: the SQLite database, a readable JSON export, ordinary Memory notes/manifests, '
                         'retained memory/history/recovery bytes, and app-owned pre-edit source copies in file-backups/. '
                         'Excluded: linked original source trees, GGUF model weights, temporary runtime files, logs '
-                        'and migration-backups/ database snapshots.\n'
+                        'and migration-backups/ database snapshots. Training examples, configuration, frozen run '
+                        'datasets and results are included in SQLite and JSON. The training/ output directory '
+                        '(adapters, logs and converted models) and original training weights are excluded; '
+                        'back these up separately. Restored runs never restart automatically.\n'
                         'Before opening a restored database, remove or retarget linked source roots and any writable '
                         'destinations to isolated test locations. A copied database retains the original links and settings. '
                         'For a safe test, use sqlite3 /new/folder/letracode.sqlite3 "DELETE FROM links;" and review settings '

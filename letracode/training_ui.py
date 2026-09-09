@@ -1,0 +1,446 @@
+"""A deliberate, local workflow for developing an assistant's model."""
+from __future__ import annotations
+
+import dataclasses
+import json
+from pathlib import Path
+import uuid
+
+from PySide6.QtCore import Qt, Signal, QUrl
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
+    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QListWidget,
+    QListWidgetItem, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea,
+    QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget)
+
+from .training import TrainingConfig, TrainingRepository
+from .training_worker import ActivationWorker, TrainingWorker
+
+
+class FineTuningPanel(QWidget):
+    busy_changed = Signal(bool)
+
+    def __init__(self, store, main_window):
+        super().__init__(main_window)
+        self.store = store
+        self.main_window = main_window
+        self.repository = TrainingRepository(store)
+        self.repository.mark_interrupted()
+        self.job = None
+        self.chat_busy = False
+        self.example_id = None
+        self.example_source = ''
+        self._editor_key = 'draft:' + uuid.uuid4().hex
+        self._drafts = store.setting('training_editor_drafts', {})
+        if not isinstance(self._drafts, dict):
+            self._drafts = {}
+        self.run_id = None
+        self._loading = False
+        layout = QVBoxLayout(self)
+        heading = QLabel('Develop your assistant')
+        font = heading.font(); font.setPointSizeF(font.pointSizeF() + 4); font.setBold(True)
+        heading.setFont(font); layout.addWidget(heading)
+        intro = QLabel('Review examples, train locally, then compare versions before choosing one. Your chat model changes only when you adopt a version.')
+        intro.setWordWrap(True); layout.addWidget(intro)
+        self.tabs = QTabWidget(); layout.addWidget(self.tabs, 1)
+        self._examples_tab()
+        self._training_tab()
+        self._versions_tab()
+        self.progress = QLabel('Ready. No training is running.')
+        self.progress.setTextFormat(Qt.TextFormat.PlainText)
+        self.progress.setWordWrap(True)
+        bottom = QHBoxLayout(); bottom.addWidget(self.progress, 1)
+        self.stop_button = QPushButton('Stop'); self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop)
+        bottom.addWidget(self.stop_button); layout.addLayout(bottom)
+        self.refresh_runs()
+        draft = store.setting('training_editor', {})
+        if isinstance(draft, dict) and draft:
+            self.load_draft(draft, draft.get('key') or draft.get('id') or self._editor_key)
+        self.refresh_examples()
+        self.prompt.textChanged.connect(self.editor_changed)
+        self.response.textChanged.connect(self.editor_changed)
+        self.split.currentIndexChanged.connect(self.editor_changed)
+        # Also invalidate approval for a recovered edit from an older app version.
+        self.editor_changed()
+
+    def _button(self, text, callback, layout):
+        button = QPushButton(text)
+        button.clicked.connect(callback); layout.addWidget(button)
+        return button
+
+    def _examples_tab(self):
+        page = QWidget(); outer = QVBoxLayout(page)
+        hint = QLabel('Examples teach a desired answer to a prompt. Keep evaluation prompts separate so they test behavior the model did not train on. Imported and chat examples start as drafts.')
+        hint.setWordWrap(True); outer.addWidget(hint)
+        body = QSplitter(); outer.addWidget(body, 1)
+        self.examples_list = QListWidget(); self.examples_list.currentItemChanged.connect(self.select_example)
+        body.addWidget(self.examples_list)
+        editor = QWidget(); form = QVBoxLayout(editor)
+        form.addWidget(QLabel('Prompt'))
+        self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText('What should the user ask?')
+        form.addWidget(self.prompt, 1)
+        form.addWidget(QLabel('Desired response'))
+        self.response = QPlainTextEdit(); self.response.setPlaceholderText('Write or correct the answer you want the assistant to learn.')
+        form.addWidget(self.response, 1)
+        self.split = QComboBox(); self.split.addItem('Training example', 'train'); self.split.addItem('Held-out evaluation', 'eval')
+        form.addWidget(self.split)
+        row = QHBoxLayout()
+        self._button('New example', self.new_example, row)
+        self._button('Save draft', self.save_example, row)
+        self._button('Approve example', self.approve_example, row)
+        self._button('Delete', self.delete_example, row)
+        form.addLayout(row); body.addWidget(editor); body.setSizes([280, 650])
+        actions = QHBoxLayout()
+        self._button('Import JSONL…', self.import_examples, actions)
+        self._button('Export examples…', self.export_examples, actions)
+        actions.addStretch(); self.counts = QLabel(); actions.addWidget(self.counts)
+        outer.addLayout(actions); self.tabs.addTab(page, 'Examples')
+
+    def _training_tab(self):
+        page = QWidget(); form = QVBoxLayout(page)
+        help_text = QLabel('Choose a separate training Python with PyTorch, Transformers and PEFT installed, plus the original local Hugging Face training weights. This backend supports text-only Llama models. A GGUF chat file alone cannot be trained. Start with a small model that fits your RAM or GPU.')
+        help_text.setWordWrap(True); form.addWidget(help_text)
+        paths = QFormLayout(); self.fields = {}
+        saved = self.store.setting('training_config', {})
+        defaults = dataclasses.asdict(TrainingConfig(python_executable='', base_model=''))
+        for name, label, kind in (
+            ('python_executable', 'Training Python', 'python'),
+            ('base_model', 'Training model folder', 'directory'),
+            ('base_gguf', 'Matching chat GGUF (for adoption)', 'gguf'),
+            ('llama_cpp_dir', 'llama.cpp source folder (for conversion)', 'directory')):
+            field = QLineEdit(str(saved.get(name, defaults.get(name, '')))); self.fields[name] = field
+            row = QWidget(); horizontal = QHBoxLayout(row); horizontal.setContentsMargins(0, 0, 0, 0)
+            horizontal.addWidget(field)
+            button = QPushButton('Browse…'); horizontal.addWidget(button)
+            button.clicked.connect(lambda _=False, f=field, k=kind: self.browse(f, k))
+            paths.addRow(label, row)
+        form.addLayout(paths)
+        advanced = QGroupBox('Advanced training settings'); settings = QFormLayout(advanced)
+        for name, label, low, high in (('epochs', 'Passes through training data', 1, 100),
+                                     ('rank', 'LoRA rank', 1, 256),
+                                     ('max_length', 'Maximum example length (tokens)', 32, 8192),
+                                     ('batch_size', 'Batch size', 1, 64),
+                                     ('seed', 'Reproducibility seed', 0, 2147483647)):
+            field = QSpinBox(); field.setRange(low, high); field.setValue(saved.get(name, defaults[name]))
+            self.fields[name] = field; settings.addRow(label, field)
+        rate = QDoubleSpinBox(); rate.setDecimals(6); rate.setRange(.000001, .1); rate.setSingleStep(.0001)
+        rate.setValue(saved.get('learning_rate', defaults['learning_rate'])); self.fields['learning_rate'] = rate
+        settings.addRow('Learning rate', rate)
+        device = QComboBox(); device.addItems(['cpu', 'cuda']); device.setCurrentText(saved.get('device', 'cpu'))
+        self.fields['device'] = device; settings.addRow('Compute device', device)
+        form.addWidget(advanced)
+        warning = QLabel('Training reads only approved examples and local weights. Larger settings need more memory. Training runs do not download models or packages. Conversion also needs the selected llama.cpp checkout’s Python dependencies in the training environment.')
+        warning.setWordWrap(True); form.addWidget(warning)
+        self.review_check = QCheckBox('I reviewed the approved examples and selected the matching model files.')
+        form.addWidget(self.review_check)
+        self.start_button = QPushButton('Start local fine-tuning'); self.start_button.clicked.connect(self.start_training)
+        form.addWidget(self.start_button); form.addStretch()
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(page)
+        self.training_form = page; self.tabs.addTab(scroll, 'Train')
+
+    def _versions_tab(self):
+        page = QWidget(); layout = QVBoxLayout(page)
+        split = QSplitter()
+        self.runs_list = QListWidget(); self.runs_list.currentItemChanged.connect(self.select_run)
+        self.results = QPlainTextEdit(); self.results.setReadOnly(True)
+        split.addWidget(self.runs_list); split.addWidget(self.results); split.setSizes([270, 700])
+        layout.addWidget(split, 1)
+        row = QHBoxLayout()
+        self.adopt_button = self._button('Adopt selected version', self.adopt, row)
+        self.rollback_button = self._button('Roll back to previous model', self.rollback, row)
+        self._button('Open run folder', self.open_run, row)
+        layout.addLayout(row)
+        note = QLabel('Held-out loss measures fit to these expected answers; lower is better on this set. Review sample answers and test real tasks before deciding the assistant improved. Previous versions and base weights are kept.')
+        note.setWordWrap(True); layout.addWidget(note)
+        self.tabs.addTab(page, 'Versions & evaluation')
+
+    def browse(self, field, kind):
+        if kind == 'directory':
+            value = QFileDialog.getExistingDirectory(self, 'Choose local folder', field.text())
+        else:
+            value, _ = QFileDialog.getOpenFileName(self, 'Choose local file', field.text(),
+                                                   'GGUF (*.gguf)' if kind == 'gguf' else 'All files (*)')
+        if value:
+            field.setText(value)
+
+    def error(self, error):
+        self.progress.setText(str(error))
+        QMessageBox.warning(self, 'Fine-Tuning', str(error))
+
+    def persist_draft(self):
+        draft = {'id': self.example_id, 'key': self._editor_key,
+            'prompt': self.prompt.toPlainText(), 'response': self.response.toPlainText(),
+            'split': self.split.currentData(), 'source': self.example_source}
+        if self.example_id or draft['prompt'] or draft['response']:
+            self._drafts[self._editor_key] = draft
+        else:
+            self._drafts.pop(self._editor_key, None)
+        self.store.set_setting('training_editor_drafts', self._drafts)
+        self.store.set_setting('training_editor', draft)
+
+    def load_draft(self, draft, key):
+        self._loading = True
+        try:
+            self._editor_key = key
+            self.example_id = draft.get('id')
+            self.example_source = draft.get('source', '')
+            self.prompt.setPlainText(draft.get('prompt', ''))
+            self.response.setPlainText(draft.get('response', ''))
+            self.split.setCurrentIndex(1 if draft.get('split') == 'eval' else 0)
+        finally:
+            self._loading = False
+
+    def editor_changed(self):
+        if self._loading:
+            return
+        if self.example_id:
+            row = next((r for r in self.repository.examples() if r['id'] == self.example_id), None)
+            if row and (self.prompt.toPlainText().strip(), self.response.toPlainText().strip(), self.split.currentData()) != (row['prompt'], row['response'], row['split']):
+                if row['approved']:
+                    self.repository.save_example(row['prompt'], row['response'], split=row['split'],
+                        source=row['source'], example_id=row['id'])
+                self.progress.setText('Unsaved draft retained. Save and approve these edits before training.')
+        self.persist_draft()
+        self.refresh_examples()
+
+    def refresh_examples(self):
+        self.examples_list.blockSignals(True); self.examples_list.clear()
+        rows = self.repository.examples()
+        for row in rows:
+            label = ('Approved' if row['approved'] else 'Draft') + ' · ' + ('Eval' if row['split'] == 'eval' else 'Train')
+            item = QListWidgetItem(label + '\n' + row['prompt'][:100].replace('\n', ' '))
+            item.setData(Qt.ItemDataRole.UserRole, row['id']); self.examples_list.addItem(item)
+            if row['id'] == self.example_id:
+                self.examples_list.setCurrentItem(item)
+        for key, draft in self._drafts.items():
+            if draft.get('id') is not None:
+                continue
+            item = QListWidgetItem('Unsaved draft\n' + draft.get('prompt', '')[:100].replace('\n', ' '))
+            item.setData(Qt.ItemDataRole.UserRole, key); self.examples_list.addItem(item)
+            if key == self._editor_key:
+                self.examples_list.setCurrentItem(item)
+        self.examples_list.blockSignals(False)
+        training = sum(row['approved'] and row['split'] == 'train' for row in rows)
+        evaluation = sum(row['approved'] and row['split'] == 'eval' for row in rows)
+        self.counts.setText(f'Approved: {training} training · {evaluation} evaluation')
+
+    def select_example(self, current, previous=None):
+        if current is None:
+            return
+        # Retain editor text as a draft before switching, including unapproved edits.
+        self.persist_draft()
+        key = current.data(Qt.ItemDataRole.UserRole)
+        row = self._drafts.get(key) or next((r for r in self.repository.examples() if r['id'] == key), None)
+        if row:
+            self.load_draft(row, key)
+            self.persist_draft()
+
+    def new_example(self):
+        self.persist_draft()
+        self.load_draft({}, 'draft:' + uuid.uuid4().hex)
+        self.persist_draft(); self.refresh_examples()
+
+    def save_example(self, checked=False):
+        try:
+            row = self.repository.save_example(self.prompt.toPlainText(), self.response.toPlainText(),
+                split=self.split.currentData(), source=self.example_source, example_id=self.example_id)
+            self._drafts.pop(self._editor_key, None)
+            self.example_id = row['id']; self._editor_key = row['id']
+            self.persist_draft(); self.refresh_examples()
+            self.progress.setText('Example saved. Review and approve it before training.')
+            return row
+        except (ValueError, OSError) as error:
+            self.error(error)
+            return None
+
+    def approve_example(self):
+        row = self.save_example()
+        if row:
+            try:
+                self.repository.save_example(row['prompt'], row['response'], split=row['split'],
+                    approved=True, source=row['source'], example_id=row['id'])
+                self.refresh_examples(); self.progress.setText('Example approved for its selected use.')
+            except ValueError as error:
+                self.error(error)
+
+    def delete_example(self):
+        if self.example_id:
+            self.repository.delete_example(self.example_id)
+        self._drafts.pop(self._editor_key, None)
+        self.load_draft({}, 'draft:' + uuid.uuid4().hex)
+        self.persist_draft(); self.refresh_examples()
+
+    def import_examples(self):
+        path, _ = QFileDialog.getOpenFileName(self, 'Import draft examples', '', 'JSON Lines (*.jsonl)')
+        if path:
+            try:
+                self.repository.import_jsonl(Path(path)); self.refresh_examples()
+                self.progress.setText('Imported as drafts. Review each example before approval.')
+            except (OSError, ValueError) as error:
+                self.error(error)
+
+    def export_examples(self):
+        path, _ = QFileDialog.getSaveFileName(self, 'Export local examples', 'training-examples.jsonl', 'JSON Lines (*.jsonl)')
+        if path:
+            try:
+                self.repository.export_jsonl(Path(path))
+                self.progress.setText('Examples exported. This file contains the full example text.')
+            except (OSError, ValueError) as error:
+                self.error(error)
+
+    def configuration(self):
+        values = {}
+        for name, field in self.fields.items():
+            values[name] = field.text().strip() if isinstance(field, QLineEdit) else field.currentText() if isinstance(field, QComboBox) else field.value()
+        return TrainingConfig(**values)
+
+    def start_training(self):
+        if self.job is not None or self.chat_busy:
+            return
+        if not self.review_check.isChecked():
+            self.error('Review the approved examples and matching model files, then select the checkbox to start.')
+            return
+        try:
+            config = self.configuration()
+            run = self.repository.create_run(config)
+            self.store.set_setting('training_config', dataclasses.asdict(config))
+        except (OSError, ValueError) as error:
+            self.error(error); return
+        self.persist_draft()
+        self.main_window.engine.stop()
+        self.run_id = run['id']
+        self.job = TrainingWorker(self.repository, run['id'], self)
+        self.job.status.connect(self.progress.setText)
+        self.job.finished.connect(self.job_finished)
+        self.busy_changed.emit(True); self.set_chat_busy(True)
+        self.refresh_runs(); self.tabs.setCurrentIndex(2)
+        self.progress.setText('Preparing local training…'); self.job.start()
+
+    def refresh_runs(self):
+        self.runs_list.blockSignals(True); self.runs_list.clear()
+        for row in self.repository.runs():
+            item = QListWidgetItem(f"{row['created']} · {row['status']}\n{row['id'][:12]}")
+            item.setData(Qt.ItemDataRole.UserRole, row['id']); self.runs_list.addItem(item)
+            if row['id'] == self.run_id:
+                self.runs_list.setCurrentItem(item)
+        self.runs_list.blockSignals(False)
+        if self.run_id:
+            self.show_run(self.repository.run(self.run_id))
+        self.update_controls()
+
+    def select_run(self, current, previous=None):
+        if current:
+            self.run_id = current.data(Qt.ItemDataRole.UserRole)
+            self.show_run(self.repository.run(self.run_id)); self.update_controls()
+
+    def show_run(self, run):
+        report = run.get('report') or {}
+        text = f"Version {run['id']}\nStatus: {run['status']}\nCreated: {run['created']}\n"
+        if self.store.setting('training_active_version') == run['id']:
+            text += 'Active in Chat\n'
+        if report:
+            text += f"\nHeld-out response loss\nBase: {report['base_loss']:.6f}\nCandidate: {report['candidate_loss']:.6f}\n"
+            text += '\nThis comparison does not establish overall task quality.\n'
+            if report.get('conversion_error'):
+                text += '\nAdapter conversion: ' + report['conversion_error'] + '\n'
+            for example in report.get('eval_examples', []):
+                text += '\nPrompt: ' + example.get('prompt', '') + '\nExpected: ' + example.get('response', example.get('expected', ''))
+                text += '\nBase: ' + example.get('base_output', '') + '\nCandidate: ' + example.get('candidate_output', '') + '\n'
+        if run.get('error'):
+            text += '\n' + run['error'] + '\n'
+        text += '\nConfiguration\n' + json.dumps(run['config'], ensure_ascii=False, indent=2)
+        if report:
+            text += '\n\nProvenance and report\n' + json.dumps(report, ensure_ascii=False, indent=2)
+        self.results.setPlainText(text)
+
+    def open_run(self):
+        if self.run_id:
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(self.repository.run_directory(self.run_id))))
+
+    def adopt(self):
+        if self.job is not None or self.chat_busy or not self.run_id:
+            return
+        if self.run_id == self.store.setting('training_active_version'):
+            self.progress.setText('This version is already active. The previous model is still available for rollback.')
+            return
+        run = self.repository.run(self.run_id)
+        report = run.get('report') or {}
+        if run['status'] != 'succeeded' or not report.get('adapter_gguf_sha256'):
+            self.error('Select a version with completed evaluation and a converted GGUF adapter.'); return
+        answer = QMessageBox.question(self, 'Adopt this version?',
+            'Load this adapter and its selected base GGUF for Chat? The previous model configuration will be saved for rollback. Review the evaluation results before proceeding.',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
+        if answer == QMessageBox.StandardButton.Yes:
+            self.start_activation(run_id=self.run_id)
+
+    def rollback(self):
+        if self.job is not None or self.chat_busy:
+            return
+        previous = self.store.setting('training_previous_engine')
+        if previous:
+            self.start_activation(rollback=previous)
+
+    def start_activation(self, run_id=None, rollback=None):
+        if self.job is not None or self.chat_busy:
+            return
+        if rollback is None and run_id == self.store.setting('training_active_version'):
+            return
+        self.main_window.engine.stop()
+        self.job = ActivationWorker(self.repository, self.main_window.engine_config, run_id, rollback, self)
+        self.job.status.connect(self.progress.setText)
+        self.job.failed.connect(self.progress.setText)
+        self.job.ready.connect(self.activation_ready)
+        self.job.finished.connect(self.job_finished)
+        self.busy_changed.emit(True); self.set_chat_busy(True)
+        self.job.start()
+
+    def activation_ready(self, engine):
+        job = self.job
+        if job is None or job.cancelled.is_set() or self.main_window.closing_when_stopped:
+            engine.stop(); return
+        previous = dataclasses.asdict(self.main_window.engine_config)
+        previous_version = self.store.setting('training_active_version')
+        new_version = job.run_id if job.rollback is None else self.store.setting('training_previous_version')
+        try:
+            with self.store.connection() as db:
+                for key, value in [('engine', dataclasses.asdict(engine.config)),
+                    ('training_previous_engine', previous), ('training_active_version', new_version),
+                    ('training_previous_version', previous_version)]:
+                    db.execute('INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value',
+                               (key, json.dumps(value)))
+        except Exception as error:
+            engine.stop(); self.progress.setText(str(error)); return
+        self.main_window.engine = engine
+        self.main_window.engine_config = engine.config
+        self.main_window.render_chat()
+        self.progress.setText('Selected model loaded and saved. Chat will use this configuration after restart.')
+
+    def job_finished(self):
+        completed = self.job
+        self.job = None
+        if completed is not None:
+            completed.deleteLater()
+        self.busy_changed.emit(False); self.set_chat_busy(False)
+        self.refresh_runs()
+        if self.main_window.closing_when_stopped:
+            self.main_window.close()
+
+    def stop(self):
+        if self.job is not None:
+            self.progress.setText('Stopping the local process…')
+            self.job.cancel()
+
+    def set_chat_busy(self, busy):
+        self.chat_busy = busy
+        self.update_controls()
+
+    def update_controls(self):
+        busy = self.chat_busy or self.job is not None
+        self.start_button.setEnabled(not busy)
+        self.training_form.setEnabled(not busy)
+        self.stop_button.setEnabled(self.job is not None)
+        run = self.repository.run(self.run_id) if self.run_id else None
+        can_adopt = run and run['id'] != self.store.setting('training_active_version') and run['status'] == 'succeeded' and (run.get('report') or {}).get('adapter_gguf_sha256') and run['config'].get('base_gguf')
+        self.adopt_button.setEnabled(not busy and bool(can_adopt))
+        self.rollback_button.setEnabled(not busy and bool(self.store.setting('training_previous_engine')))

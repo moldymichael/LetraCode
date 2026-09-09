@@ -20,7 +20,7 @@ def test_file_panel_replaces_autosave_tabs_and_keeps_project_scope(tmp_path):
     window = MainWindow(store)
     try:
         window.show_selection(None, project)
-        assert not window.findChildren(QTabWidget)
+        assert not window.context_panel.findChildren(QTabWidget)
         panel = window.files_panel
         assert panel.project_id == project
         assert panel._select_path(store.memory.root_for(project) / 'notes.md')

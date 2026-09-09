@@ -1,5 +1,15 @@
 # Current implementation state
 
+The **0.4.0 source update** adds a Fine-Tuning workspace for reviewed datasets,
+offline text-only Llama LoRA optimization, held-out comparisons, GGUF adapter
+conversion, explicit adoption and rollback. Regular chat preserves and displays
+reasoning emitted by compatible models. It starts from GitHub `main` at
+`c9f6392`, preserving the 0.3.0 Strand/Memory behavior below. It does not include
+the divergent unfinished two-model work in the old 0.2.0 checkout.
+See [setup and workflow](FINE-TUNING.md) and
+[verification](FINE-TUNING-VERIFICATION.md). Original worktrees and user models
+are preserved. Current source changes do not replace already installed apps.
+
 The **0.3.0 Windows release** adds a self-contained Windows x64 installer and
 portable download to the current app. Windows uses native file handles and
 process jobs; Fedora retains its existing filesystem and process behavior.

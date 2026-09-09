@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QDoubleSpin
     QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
     QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
-from .engine import EngineConfig
+from .engine import EngineConfig, EngineError, validated_lora_path
 from .platform import engine_setup_help, is_windows
 
 
@@ -64,7 +64,7 @@ class ModelDialog(QDialog):
     def __init__(self, config: EngineConfig, parent=None):
         super().__init__(parent)
         self.setWindowTitle('Model Setup — LetraCode')
-        self.resize(690, 510)
+        self.resize(690, 580)
         layout = QVBoxLayout(self)
         intro = QLabel('Choose the local engine and model. LetraCode starts and stops the engine for you. Your conversations stay on this computer.')
         intro.setWordWrap(True)
@@ -74,13 +74,23 @@ class ModelDialog(QDialog):
         self.executable.setPlaceholderText(r'C:\llama.cpp\llama-server.exe' if is_windows() else '/usr/bin/llama-server')
         self.model = QLineEdit(config.model_path)
         self.model.setPlaceholderText('Choose a local .gguf instruction/chat model')
-        for label, field, mode in [('Engine executable',self.executable,'engine'),('Model file',self.model,'model')]:
+        self.lora = QLineEdit(config.lora_path)
+        self.lora.setPlaceholderText('Optional local .gguf LoRA adapter')
+        self.lora.setToolTip('The adapter must match the selected base model. Changing the model keeps this selection; clear it to use only the base model.')
+        for label, field, mode in [('Engine executable',self.executable,'engine'),('Model file',self.model,'model'),('LoRA adapter (optional)',self.lora,'adapter')]:
             row = QWidget(); line = QHBoxLayout(row); line.setContentsMargins(0,0,0,0)
             line.addWidget(field)
             browse = QPushButton('Browse…')
             browse.clicked.connect(lambda checked=False, f=field, m=mode: self.browse(f,m))
             line.addWidget(browse)
+            if mode == 'adapter':
+                clear = QPushButton('Clear adapter')
+                clear.clicked.connect(self.lora.clear)
+                line.addWidget(clear)
             form.addRow(label,row)
+        adapter_note = QLabel('An adapter must match its base model. Clear the adapter when selecting an unrelated model.')
+        adapter_note.setWordWrap(True)
+        form.addRow('', adapter_note)
         self.context = QSpinBox(); self.context.setRange(8192,131072); self.context.setSingleStep(4096); self.context.setValue(config.context_size)
         self.context.setToolTip('Space for project evidence, conversation and reply. Larger values use more memory and must be supported by the model.')
         self.tokens = QSpinBox(); self.tokens.setRange(256,16384); self.tokens.setSingleStep(256); self.tokens.setValue(config.max_tokens)
@@ -104,8 +114,11 @@ class ModelDialog(QDialog):
         layout.addWidget(buttons)
 
     def browse(self, field, mode):
-        file_filter = 'GGUF models (*.gguf)' if mode == 'model' else ('Windows executable (*.exe)' if is_windows() else 'All files (*)')
-        file, _ = QFileDialog.getOpenFileName(self, 'Choose local model' if mode=='model' else 'Choose llama-server', field.text() or str(Path.home()), file_filter)
+        file_filter = ('GGUF models (*.gguf)' if mode == 'model' else
+                       'GGUF adapters (*.gguf)' if mode == 'adapter' else
+                       'Windows executable (*.exe)' if is_windows() else 'All files (*)')
+        title = {'model': 'Choose local model', 'adapter': 'Choose local LoRA adapter'}.get(mode, 'Choose llama-server')
+        file, _ = QFileDialog.getOpenFileName(self, title, field.text() or str(Path.home()), file_filter)
         if file:
             field.setText(file)
 
@@ -126,12 +139,17 @@ class ModelDialog(QDialog):
             QMessageBox.warning(self,'Cannot read model',str(error)); return
         if not valid:
             QMessageBox.warning(self,'Not a GGUF model','The selected file does not have a GGUF header. Choose a complete GGUF model download.'); return
+        try:
+            validated_lora_path(self.lora.text())
+        except EngineError as error:
+            QMessageBox.warning(self, 'Invalid LoRA adapter', str(error)); return
         if self.tokens.value() >= self.context.value() // 2:
             QMessageBox.warning(self,'Reply budget too large','Keep the reply budget below half the context size, leaving room for your conversation and files.'); return
         self.accept()
 
     def config(self):
-        return EngineConfig(executable=str(Path(self.executable.text()).expanduser().resolve()),model_path=str(Path(self.model.text()).expanduser().resolve()),context_size=self.context.value(),gpu_layers=self.layers.value(),threads=self.threads.value(),max_tokens=self.tokens.value(),temperature=self.temperature.value())
+        adapter = str(Path(self.lora.text()).expanduser().resolve()) if self.lora.text().strip() else ''
+        return EngineConfig(executable=str(Path(self.executable.text()).expanduser().resolve()),model_path=str(Path(self.model.text()).expanduser().resolve()),context_size=self.context.value(),gpu_layers=self.layers.value(),threads=self.threads.value(),max_tokens=self.tokens.value(),temperature=self.temperature.value(),lora_path=adapter)
 
 
 class LinksDialog(QDialog):

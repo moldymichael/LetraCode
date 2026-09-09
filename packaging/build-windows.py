@@ -114,12 +114,15 @@ def build(output: Path, iscc: str | None = None) -> list[Path]:
                "--name", "LetraCode", "--noupx", "--icon", str(icon),
                "--paths", str(ROOT), "--distpath", str(work / "dist"), "--workpath", str(work / "cache"),
                "--specpath", str(work), "--collect-data", "letracode", "--collect-submodules", "pypdf",
+               "--add-data", str(ROOT / "letracode/training_backend.py") + os.pathsep + "letracode",
                "--hidden-import", "PySide6.QtSvg", str(ROOT / "packaging/windows-launcher.py")]
     subprocess.run(command, cwd=ROOT, check=True)
     bundle = work / "dist/LetraCode"
     for name in ("LICENSE", "README.md"):
         shutil.copy2(ROOT / name, bundle / name)
     shutil.copytree(ROOT / "docs", bundle / "docs", dirs_exist_ok=True)
+    (bundle / "packaging").mkdir(exist_ok=True)
+    shutil.copy2(ROOT / "packaging/training-requirements.txt", bundle / "packaging/training-requirements.txt")
     release_version = version()
     (bundle / "version.json").write_text(json.dumps({"version": release_version, "python": platform.python_version(),
         "architecture": "x64"}, indent=2) + "\n", encoding="utf-8")
