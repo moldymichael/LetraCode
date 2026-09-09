@@ -466,10 +466,13 @@ class LocalEngine:
                 self._active_response = response
             raw = response.read(_MAX_REQUEST_BYTES + 1)
             self._raise_if_cancelled(cancel)
-            if response.status in (400, 404, 405, 422, 501):
+            if response.status in (404, 405, 501):
                 raise _BudgetUnavailable()
             if response.status != 200:
-                raise EngineError(f'Local model budget endpoint failed (HTTP {response.status})')
+                # Rejected requests do not mean the runtime lacks token counting.
+                raise EngineError(
+                    f'Local model budget endpoint {path} failed (HTTP {response.status}): '
+                    f'{self._error_detail(raw)}')
             if len(raw) > _MAX_REQUEST_BYTES:
                 raise _BudgetUnavailable()
             try:

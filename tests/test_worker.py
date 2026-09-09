@@ -72,6 +72,112 @@ def test_incomplete_tool_history_gets_explicit_unknown_outcomes(tmp_path):
     assert 'unknown' in messages[3]['content'].lower()
 
 
+def test_rejected_provisional_answers_are_saved_without_prefilling_recovery(tmp_path):
+    store = Store(tmp_path / 'data'); chat = store.create_chat('Provisional recovery')
+    store.add_message(chat, 'user', 'Fix the bug and verify the changed source.')
+    call = {'id': 'verify', 'type': 'function', 'function': {
+        'name': 'run_command', 'arguments': '{"command": "verify"}'}}
+    store.add_message(chat, 'assistant', '', payload={'message': {
+        'role': 'assistant', 'content': '', 'tool_calls': [call]}})
+    store.add_message(chat, 'tool', 'Saved verification', payload={'message': {
+        'role': 'tool', 'name': 'run_command', 'tool_call_id': 'verify',
+        'content': '{"exit_code": 0, "output": "Four tests passed"}'}})
+    for _ in range(2):
+        store.add_message(chat, 'assistant', 'PROVISIONAL-FINAL-ANSWER', 'incomplete', payload={
+            'message': {'role': 'assistant', 'content': 'PROVISIONAL-FINAL-ANSWER'},
+            'task_outcome': 'source_incomplete', 'request_completed': True,
+            'source_exposure': [], 'pause_context_closed': False})
+        store.add_message(chat, 'notice', 'Edited source still requires read exposure.')
+    saved = store.messages(chat)
+
+    messages, _ = conversation_messages(saved, 'Recover the missing source evidence.', 20000)
+
+    assert messages[-1]['role'] == 'tool'
+    assert 'PROVISIONAL-FINAL-ANSWER' not in json.dumps(messages)
+    assert_paired_tools(messages)
+    assert Store(tmp_path / 'data').messages(chat) == saved
+    assert sum(row['status'] == 'incomplete' for row in saved) == 2
+
+
+def test_provisional_filter_preserves_tool_calls_and_other_incomplete_answers(tmp_path):
+    store = Store(tmp_path / 'data'); chat = store.create_chat('Keep action history')
+    store.add_message(chat, 'user', 'Inspect the source.')
+    store.add_message(chat, 'assistant', 'KEEP-INCOMPLETE-CONTEXT', 'incomplete')
+    call = {'id': 'read', 'type': 'function', 'function': {
+        'name': 'read_file', 'arguments': '{"path": "/source.py"}'}}
+    store.add_message(chat, 'assistant', '', 'incomplete', payload={
+        'message': {'role': 'assistant', 'content': '', 'tool_calls': [call]},
+        'task_outcome': 'source_incomplete'})
+    store.add_message(chat, 'tool', 'Saved source', payload={'message': {
+        'role': 'tool', 'name': 'read_file', 'tool_call_id': 'read', 'content': '{"text": "source"}'}})
+
+    messages, _ = conversation_messages(store.messages(chat), 'System', 20000)
+
+    assert 'KEEP-INCOMPLETE-CONTEXT' in json.dumps(messages)
+    assert messages[-2]['tool_calls'] == [call]
+    assert messages[-1]['tool_call_id'] == 'read'
+    assert_paired_tools(messages)
+
+
+@pytest.mark.parametrize('boundary', [False, True])
+def test_first_request_after_rollover_can_drop_completed_segment(tmp_path, boundary):
+    from letracode.engine import ContextOverflowError
+
+    store = Store(tmp_path / 'data'); chat = store.create_chat('Rollover')
+    store.add_message(chat, 'user', 'Review the project.')
+    store.add_message(chat, 'assistant', 'SELECTED-PLAN: fix blank notes only.')
+    origin = store.add_message(chat, 'user', 'Implement that plan and run the tests.')
+    call = {'id': 'edit', 'type': 'function', 'function': {
+        'name': 'edit_file', 'arguments': json.dumps({'old_text': 'OLD-CODE ' * 1000,
+                                                    'new_text': 'NEW-CODE ' * 1000})}}
+    store.add_message(chat, 'assistant', '', payload={'message': {
+        'role': 'assistant', 'content': '', 'tool_calls': [call]}})
+    result_id = store.add_message(chat, 'tool', 'Saved edit outcome', payload={'message': {
+        'role': 'tool', 'name': 'edit_file', 'tool_call_id': 'edit',
+        'content': '{"path": "/source.py", "sha256": "saved-version"}'}})
+    if boundary:
+        store.add_message(chat, 'notice', 'Continuing into segment 2.', 'continuing', payload={
+            'segment_boundary': True, 'checkpoint': {'reason': 'action_round_limit',
+                'user_message_id': origin, 'last_user_message_id': origin, 'rounds': 10,
+                'continuation': {'version': 1}}})
+        # No model/user message has been added in segment 2 yet.
+        store.add_message(chat, 'notice', 'Saved evidence remains available.')
+        for status in ('error', 'streaming', 'interrupted', 'incomplete'):
+            store.add_message(chat, 'assistant', 'Not an active segment message.', status,
+                              payload={'task_outcome': 'source_incomplete'})
+    saved = store.messages(chat)
+
+    if not boundary:
+        with pytest.raises(ContextOverflowError):
+            conversation_messages(saved, 'System', 3000)
+        return
+    messages, trimmed = conversation_messages(saved, 'System', 3000)
+
+    assert trimmed and len(json.dumps(messages, ensure_ascii=False)) <= 3000
+    assert [m['content'] for m in messages if m['role'] == 'user'] == [
+        'Review the project.', 'Implement that plan and run the tests.']
+    assert 'SELECTED-PLAN' in json.dumps(messages)
+    assert 'OLD-CODE' not in json.dumps(messages)
+    assert f'"saved_result_ids": [{result_id}]' in messages[0]['content']
+    assert 'read_tool_result' in messages[0]['content']
+    assert_paired_tools(messages)
+    assert store.messages(chat) == saved
+
+
+def test_empty_new_segment_cannot_drop_required_user_instructions(tmp_path):
+    from letracode.engine import ContextOverflowError
+
+    store = Store(tmp_path / 'data'); chat = store.create_chat('Required intent')
+    origin = store.add_message(chat, 'user', 'REQUIRED-INSTRUCTION ' * 1000)
+    store.add_message(chat, 'notice', 'Continuing.', 'continuing', payload={
+        'segment_boundary': True, 'checkpoint': {'reason': 'action_round_limit',
+            'user_message_id': origin, 'last_user_message_id': origin,
+            'continuation': {'version': 1}}})
+
+    with pytest.raises(ContextOverflowError):
+        conversation_messages(store.messages(chat), 'System', 3000)
+
+
 def test_excess_tool_requests_are_all_saved_as_not_executed_and_pause(tmp_path):
     class TooMany(ScriptedEngine):
         # Keep this batch-limit fixture independent of schema text growth.
@@ -238,7 +344,9 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
     replay, _ = conversation_messages(reopened.messages(chat), 'Project instructions', 57392)
     assert len(json.dumps(replay, ensure_ascii=False)) <= 57392
     assert_paired_tools(replay)
-    assert replay[-1]['content'] == 'Finished reading the requested files.'
+    # Rejected answers stay in the transcript, but never become retry prefills.
+    assert all(message['content'] != 'Finished reading the requested files.' for message in replay)
+    assert replay[-1]['role'] in ('user', 'tool')
     assert reopened.messages(chat) == rows
 
 
