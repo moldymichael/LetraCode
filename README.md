@@ -242,3 +242,17 @@ for upstream details.
 ## License
 
 LetraCode is available under the MIT License. See `LICENSE`.
+
+## Gemma 4 fine-tuning
+
+The Fine-Tuning area supports text adaptation of original **Gemma 4 E2B-it**
+and **E4B-it** safetensors using CUDA NF4 QLoRA, with frozen per-layer embeddings
+in system RAM. Select a Gemma profile for conservative starting settings.
+The existing Llama workflow remains available. Gemma training requires a newer
+separate training environment; see `packaging/gemma-training-requirements.txt`.
+
+Create the matching Chat GGUF from the same original checkpoint using
+`tools/prepare-gemma-chat.py`; its hash-linked manifest is checked during
+training and adoption. A downloaded QAT GGUF is not a training checkpoint and
+cannot substitute for this pair. See [Gemma setup and measured verification](docs/GEMMA4.md)
+for exact sources, commands, hardware limits, and the real-run results.

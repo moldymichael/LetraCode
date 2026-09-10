@@ -16,6 +16,7 @@ from PySide6.QtCore import QThread, Signal
 from .engine import Cancelled, EngineConfig, LocalEngine
 from .processes import start_process, stop_process
 from .strand import safe_read
+from .training_models import verify_gemma_pair
 
 
 BACKEND_SCRIPT = Path(__file__).with_name('training_backend.py')
@@ -88,13 +89,33 @@ def file_hash(path, cancel=None):
     return digest.hexdigest()
 
 
+def training_model_family(config):
+    """Read architecture from local weights, independently of trainer claims."""
+    base = config.get('base_model')
+    if not base:
+        return 'llama'
+    path = Path(base).expanduser() / 'config.json'
+    if not path.is_file():
+        # Old reports/configurations may no longer have their training folder.
+        return 'llama'
+    with path.open('rb') as stream:
+        raw = stream.read(1024 * 1024 + 1)
+    if len(raw) > 1024 * 1024:
+        raise ValueError('Training model configuration is too large.')
+    model = json.loads(raw)
+    if not isinstance(model, dict):
+        raise ValueError('Training model configuration must be a JSON object.')
+    return 'gemma4' if model.get('model_type') in ('gemma4', 'gemma4_text') else 'llama'
+
+
 def validate_training_report(report, config):
     """Keep old LoRA reports readable; require runtime evidence for QLoRA."""
     method = config.get('training_method', 'lora')
     accumulation = config.get('gradient_accumulation_steps', 1)
     checkpointing = config.get('gradient_checkpointing', False)
+    family = training_model_family(config)
     details = report.get('training_details')
-    if details is None and method == 'lora' and accumulation == 1 and not checkpointing:
+    if details is None and family != 'gemma4' and method == 'lora' and accumulation == 1 and not checkpointing:
         return
     if not isinstance(details, dict):
         raise ValueError('Training report is missing its training method and memory details.')
@@ -105,6 +126,14 @@ def validate_training_report(report, config):
                 'gradient_accumulation_steps': accumulation,
                 'effective_batch_size': config['batch_size'] * accumulation,
                 'device': config.get('device', 'cpu')}
+    if family == 'gemma4':
+        if method != 'qlora' or config.get('device') != 'cuda':
+            raise ValueError('Gemma 4 training requires CUDA 4-bit QLoRA.')
+        expected.update(model_family='gemma4', text_only=True, frozen_ple_cpu=True,
+                        target_modules=['q_proj', 'k_proj', 'v_proj', 'o_proj',
+                                        'gate_proj', 'up_proj', 'down_proj'])
+    elif details.get('model_family') == 'gemma4':
+        raise ValueError('Training report model family does not match the local model architecture.')
     for key, value in expected.items():
         if type(details.get(key)) is not type(value) or details[key] != value:
             raise ValueError(f'Training report {key} does not match the configured training method.')
@@ -133,6 +162,22 @@ def validate_training_report(report, config):
             or memory['peak_reserved_bytes'] < memory['peak_allocated_bytes']
             or (config.get('device') == 'cuda' and memory['peak_allocated_bytes'] <= 0)):
         raise ValueError('Training report has invalid model or GPU memory measurements.')
+
+
+def validate_gemma_source(report, pair):
+    """Bind the trainer's observed source files to the preflight GGUF pair."""
+    source = pair['source']
+    files = source['files']
+    provenance = report['provenance']
+    expected_tokenizer = {name: record['sha256'] for name, record in files.items()
+        if '/' not in name and (name.startswith('tokenizer') or name in (
+            'special_tokens_map.json', 'added_tokens.json', 'chat_template.jinja'))}
+    expected = {'model_config_sha256': files['config.json']['sha256'],
+                'model_weight_manifest': source['weights'],
+                'tokenizer_manifest': expected_tokenizer}
+    for key, value in expected.items():
+        if provenance.get(key) != value:
+            raise ValueError(f'Training source {key} does not match the verified Gemma model pair. Create a new run with unchanged original files.')
 
 
 def read_report(directory, cancel, run):
@@ -229,6 +274,10 @@ class TrainingWorker(QThread):
             directory = repo.run_directory(self.run_id)
             if self.cancelled.is_set():
                 raise Cancelled('Training stopped before launch.')
+            gemma_pair = None
+            if training_model_family(config) == 'gemma4':
+                self.status.emit('Verifying the matching Gemma 4 training weights and chat GGUF…')
+                gemma_pair = verify_gemma_pair(config['base_model'], config.get('base_gguf', ''), self.cancelled)
             base_hash = ''
             if config.get('base_gguf'):
                 self.status.emit('Verifying the base GGUF for this version…')
@@ -268,6 +317,12 @@ class TrainingWorker(QThread):
             repo.verify_run_snapshot(self.run_id)
             report = read_report(directory, self.cancelled, run)
             report['base_gguf_sha256'] = base_hash
+            if gemma_pair is not None:
+                validate_gemma_source(report, gemma_pair)
+                self.status.emit('Checking Gemma 4 source files and chat GGUF stayed unchanged during training…')
+                if verify_gemma_pair(config['base_model'], config.get('base_gguf', ''), self.cancelled) != gemma_pair:
+                    raise ValueError('The Gemma 4 model pair changed during training. The result cannot be accepted.')
+                report['gemma_pair'] = gemma_pair
             if self.cancelled.is_set():
                 raise Cancelled('Training stopped before its result was accepted.')
             repo.update_run(self.run_id, 'succeeded', report=report)
@@ -327,6 +382,16 @@ class ActivationWorker(QThread):
                 base = run['config'].get('base_gguf', '')
                 if not base or not report.get('base_gguf_sha256') or not report.get('adapter_gguf_sha256'):
                     raise ValueError('This version needs a matching base GGUF and a converted adapter before adoption.')
+                details = report.get('training_details') or {}
+                if (training_model_family(run['config']) == 'gemma4' or 'gemma_pair' in report
+                        or details.get('model_family') == 'gemma4'):
+                    recorded_pair = report.get('gemma_pair')
+                    if not isinstance(recorded_pair, dict) or not recorded_pair:
+                        raise ValueError('This Gemma 4 version has no verified model-pair manifest. Create a new training run with matching weights and GGUF.')
+                    self.status.emit('Verifying the Gemma 4 conversion manifest before adoption…')
+                    current_pair = verify_gemma_pair(run['config']['base_model'], base, self.cancelled)
+                    if current_pair != recorded_pair:
+                        raise ValueError('The Gemma 4 model pair changed since training. Adoption was cancelled.')
                 self.status.emit('Verifying this version’s base model and adapter…')
                 if file_hash(base, self.cancelled) != report['base_gguf_sha256']:
                     raise ValueError('The base GGUF changed since training. Adoption was cancelled.')

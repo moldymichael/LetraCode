@@ -1,0 +1,7 @@
+# Separate training runtime only; do not install into the Qt desktop Python.
+# Install a CUDA-enabled PyTorch wheel first. Preserve working Llama environments.
+-r training-requirements.txt
+transformers>=5.17,<6
+peft>=0.20,<1
+bitsandbytes>=0.50.2,<1
+accelerate>=1.15,<2

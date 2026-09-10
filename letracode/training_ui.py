@@ -99,7 +99,7 @@ class FineTuningPanel(QWidget):
 
     def _training_tab(self):
         page = QWidget(); form = QVBoxLayout(page)
-        help_text = QLabel('4-bit QLoRA reduces the memory needed for training with NF4 double quantization. It needs an NVIDIA CUDA GPU and a separate training Python with PyTorch, Transformers, PEFT, Accelerate and bitsandbytes installed. Choose original, unquantized text-only Llama safetensors weights. A GGUF chat file alone cannot be trained.')
+        help_text = QLabel('Train reviewed text responses with local Llama or Gemma 4 E2B/E4B original safetensors weights. 4-bit QLoRA needs an NVIDIA CUDA GPU and a separate training Python with PyTorch, Transformers, PEFT, Accelerate and bitsandbytes. A GGUF chat file alone cannot be trained. The model architecture is detected from the selected training folder.')
         help_text.setWordWrap(True); form.addWidget(help_text)
         paths = QFormLayout(); self.fields = {}
         saved = self.store.setting('training_config', {})
@@ -112,6 +112,12 @@ class FineTuningPanel(QWidget):
         training_python = Path.home() / '.local/share/letracode-training-qlora/bin/python'
         if not saved.get('python_executable') and training_python.is_file():
             defaults['python_executable'] = str(training_python)
+        self.profile = QComboBox()
+        self.profile.addItem('Llama / current custom settings', 'custom')
+        self.profile.addItem('Gemma 4 E2B · first target for 8 GB', 'gemma4-e2b')
+        self.profile.addItem('Gemma 4 E4B · experimental', 'gemma4-e4b')
+        self.profile.setToolTip('Apply starting memory settings without changing model paths, epochs or learning rate. The selected model folder determines the architecture.')
+        paths.addRow('Starting settings', self.profile)
         method = QComboBox()
         method.addItem('4-bit QLoRA (NVIDIA GPU)', 'qlora')
         method.addItem('LoRA (full precision)', 'lora')
@@ -165,7 +171,10 @@ class FineTuningPanel(QWidget):
             signal.connect(self.persist_configuration)
         self.fields['batch_size'].valueChanged.connect(self.update_effective_batch)
         self.fields['gradient_accumulation_steps'].valueChanged.connect(self.update_effective_batch)
+        self.profile.currentIndexChanged.connect(self.apply_profile)
         form.addWidget(advanced)
+        gemma_hint = QLabel('Gemma 4: E2B has more room on an 8 GB GPU. E4B uses frozen embeddings in system RAM to fit short examples; its usual QLoRA baseline is 10 GB VRAM. On the tested RTX 2060 SUPER, a 250-token update fit but 509 tokens ran out of memory. Start at 256 tokens or less, batch 1 and rank 4. Only text responses are trained. Adoption requires a matching GGUF conversion manifest. Compare held-out answers before adoption.')
+        gemma_hint.setWordWrap(True); form.addWidget(gemma_hint)
         warning = QLabel('Training reads only approved examples and local weights. Larger models and longer examples still need more memory. QLoRA does not guarantee better answers: compare held-out results before adoption. Training runs do not download models or packages. Conversion also needs the selected llama.cpp checkout’s Python dependencies in the training environment.')
         warning.setWordWrap(True); form.addWidget(warning)
         self.review_check = QCheckBox('I reviewed the approved examples and selected the matching model files.')
@@ -350,6 +359,17 @@ class FineTuningPanel(QWidget):
             self.fields['gradient_checkpointing'].setChecked(True)
         device.setEnabled(not qlora)
 
+    def apply_profile(self, *_):
+        if self.profile.currentData() not in ('gemma4-e2b', 'gemma4-e4b'):
+            return
+        self.fields['training_method'].setCurrentIndex(self.fields['training_method'].findData('qlora'))
+        self.fields['device'].setCurrentText('cuda')
+        for key, value in (('batch_size', 1), ('rank', 4), ('max_length', 256),
+                           ('gradient_accumulation_steps', 4)):
+            self.fields[key].setValue(value)
+        self.fields['gradient_checkpointing'].setChecked(True)
+        self.persist_configuration()
+
     def update_effective_batch(self, *_):
         size = self.fields['batch_size'].value() * self.fields['gradient_accumulation_steps'].value()
         self.effective_batch.setText(f'Effective batch: up to {size} examples per learning update. '
@@ -381,7 +401,12 @@ class FineTuningPanel(QWidget):
     def refresh_runs(self):
         self.runs_list.blockSignals(True); self.runs_list.clear()
         for row in self.repository.runs():
-            item = QListWidgetItem(f"{row['created']} · {row['status']}\n{row['id'][:12]}")
+            report = row.get('report') or {}
+            details = report.get('training_details') or {}
+            name = f"Gemma 4 {details.get('variant', '')}" if details.get('model_family') == 'gemma4' else row['id'][:12]
+            if report.get('verification_only'):
+                name += ' · synthetic verification'
+            item = QListWidgetItem(f"{row['created']} · {row['status']}\n{name}")
             item.setData(Qt.ItemDataRole.UserRole, row['id']); self.runs_list.addItem(item)
             if row['id'] == self.run_id:
                 self.runs_list.setCurrentItem(item)
@@ -398,10 +423,18 @@ class FineTuningPanel(QWidget):
     def show_run(self, run):
         report = run.get('report') or {}
         text = f"Version {run['id']}\nStatus: {run['status']}\nCreated: {run['created']}\n"
+        if report.get('verification_only'):
+            text += 'Synthetic workflow verification. This version has not been validated for answer quality.\n'
         if self.store.setting('training_active_version') == run['id']:
             text += 'Active in Chat\n'
         details = report.get('training_details') or {}
         config = run['config']
+        if details.get('model_family') == 'gemma4':
+            text += '\nModel family: Gemma 4\nTraining scope: text responses\n'
+            if details.get('frozen_ple_cpu') is True:
+                text += 'Frozen per-layer embeddings: CPU\n'
+            if report.get('gemma_pair'):
+                text += 'Matching base/GGUF conversion: verified for this run\n'
         method = details.get('training_method', config.get('training_method', 'lora'))
         method_label = '4-bit QLoRA (NVIDIA GPU)' if method == 'qlora' else 'LoRA (full precision)'
         text += '\nTraining method: ' + method_label + '\n'
@@ -417,7 +450,9 @@ class FineTuningPanel(QWidget):
         if memory:
             for key, label in (('base_model_bytes', 'Base model footprint'),
                                ('peak_allocated_bytes', 'Peak GPU allocation'),
-                               ('peak_reserved_bytes', 'Peak GPU reservation')):
+                               ('peak_reserved_bytes', 'Peak GPU reservation'),
+                               ('frozen_ple_cpu_bytes', 'Frozen embeddings in system RAM'),
+                               ('peak_process_rss_bytes', 'Peak training process RAM')):
                 value = memory.get(key)
                 if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
                     unit, scale = ('GiB', 1024 ** 3) if value >= 1024 ** 3 else ('MiB', 1024 ** 2)
@@ -425,6 +460,10 @@ class FineTuningPanel(QWidget):
         elif report:
             text += 'Memory measurements were not recorded for this version.\n'
         if report:
+            if details.get('model_family') == 'gemma4':
+                text += 'Generated comparisons: greedy, thinking off, up to 64 new tokens.\n'
+                if details.get('max_train_example_tokens'):
+                    text += f"Longest training example: {details['max_train_example_tokens']} tokens\n"
             text += f"\nHeld-out response loss\nBase: {report['base_loss']:.6f}\nCandidate: {report['candidate_loss']:.6f}\n"
             if method == 'qlora':
                 text += 'Both evaluations use the same 4-bit base; the candidate adds the trained adapter.\n'

@@ -14,6 +14,7 @@ import math
 import os
 from pathlib import Path
 import random
+import re
 import subprocess
 import sys
 
@@ -42,8 +43,28 @@ def validate_model_directory(directory):
     if (directory / 'adapter_config.json').exists():
         raise ValueError('Select original base weights, not an existing adapter directory.')
     config = json.loads((directory / 'config.json').read_text(encoding='utf-8'))
-    if config.get('model_type') != 'llama' or config.get('vision_config') or config.get('quantization_config'):
-        raise ValueError('Only unquantized text-only Llama training weights are supported.')
+    gemma = config.get('model_type') == 'gemma4'
+    text_config = config.get('text_config', {})
+    if gemma:
+        # Keep the standalone backend's original-weight boundary aligned with
+        # desktop pairing without importing Qt or changing script import paths.
+        def quantized(value):
+            if isinstance(value, dict):
+                return any((key in ('quantization_config', 'quantization_status', 'quant_method') and bool(item))
+                           or quantized(item) for key, item in value.items())
+            if isinstance(value, list):
+                return any(quantized(item) for item in value)
+            return isinstance(value, str) and bool(re.search(r'(^|[^a-z])qat([^a-z]|$)', value.lower()))
+
+        if (config.get('architectures') != ['Gemma4ForConditionalGeneration']
+                or text_config.get('model_type') != 'gemma4_text'
+                or (text_config.get('hidden_size'), text_config.get('num_hidden_layers')) not in ((1536, 35), (2560, 42))
+                or text_config.get('hidden_size_per_layer_input') != 256
+                or text_config.get('enable_moe_block') or quantized(config)
+                or re.search(r'(^|[^a-z])qat([^a-z]|$)', str(directory).lower())):
+            raise ValueError('Select original unquantized Gemma 4 E2B-it or E4B-it weights; QAT, draft, MoE and other architectures are unsupported.')
+    elif config.get('model_type') != 'llama' or config.get('vision_config') or config.get('quantization_config'):
+        raise ValueError('Only unquantized text-only Llama or original Gemma 4 E2B/E4B instruct training weights are supported.')
     if not list(directory.glob('*.safetensors')):
         raise ValueError('Local safetensors model weights are required; GGUF and pickle weights cannot be trained.')
     return config
@@ -71,12 +92,13 @@ def load_datasets(run_dir):
     return datasets
 
 
-def encode_example(tokenizer, row, max_length):
+def encode_example(tokenizer, row, max_length, *, gemma=False):
     if not getattr(tokenizer, 'chat_template', None):
-        raise ValueError('A local tokenizer chat template is required for assistant fine-tuning; select matching Llama instruct weights/tokenizer.')
+        raise ValueError('A local tokenizer chat template is required for assistant fine-tuning; select matching instruct weights/tokenizer.')
     messages = [{'role': 'user', 'content': row['prompt']}]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=False)
-    tokens = tokenizer.apply_chat_template(messages + [{'role': 'assistant', 'content': row['response']}], tokenize=True, add_generation_prompt=False, return_dict=False)
+    options = {'enable_thinking': False} if gemma else {}
+    prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=False, **options)
+    tokens = tokenizer.apply_chat_template(messages + [{'role': 'assistant', 'content': row['response']}], tokenize=True, add_generation_prompt=False, return_dict=False, **options)
     if not prompt or tokens[:len(prompt)] != prompt:
         raise ValueError('Tokenizer chat template does not preserve the exact generation prefix; this template is unsupported for response-only training.')
     response = tokens[len(prompt):]
@@ -107,6 +129,46 @@ def cuda_compute_dtype(torch):
     # BF16 emulation is reported as supported on some Turing installations.
     native_bf16 = torch.cuda.get_device_capability(0)[0] >= 8 and torch.cuda.is_bf16_supported()
     return torch.bfloat16 if native_bf16 else torch.float16
+
+
+GEMMA_TARGETS = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
+
+
+def offload_gemma_ple(model, torch):
+    """Keep the frozen PLE table on CPU; transfer selected rows, never the table.
+
+    Accelerate's inference offload would upload this multi-GB table on every
+    forward. Remove those hooks after loading and retain its original scaled
+    embedding implementation with only input/output device transfers.
+    """
+    from accelerate.hooks import remove_hook_from_module
+    remove_hook_from_module(model, recurse=True)
+    ple = model.model.embed_tokens_per_layer
+    if ple.weight.device.type != 'cpu' or ple.weight.is_meta:
+        raise RuntimeError('Gemma per-layer embeddings were not retained in system RAM.')
+    ple.to('cpu')
+    ple.requires_grad_(False)
+    destination = model.model.embed_tokens.weight.device
+    ple.register_forward_pre_hook(lambda module, args: (args[0].to('cpu'),))
+    ple.register_forward_hook(lambda module, args, output: output.to(destination))
+
+
+def load_gemma_model(base, config, options, quantization_config, torch):
+    from transformers import Gemma4ForCausalLM, Gemma4TextConfig
+    # Explicit mapping is required: the original multimodal checkpoint stores
+    # decoder weights under model.language_model, the causal class under model.
+    model, info = Gemma4ForCausalLM.from_pretrained(
+        str(base), config=Gemma4TextConfig(**config['text_config']),
+        key_mapping={r'^model\.language_model\.': 'model.'},
+        output_loading_info=True, **options, quantization_config=quantization_config,
+        device_map={'model.embed_tokens_per_layer': 'cpu', 'model.embed_tokens': 0,
+                    'model.layers': 0, 'model.norm': 0, 'model.rotary_emb': 0,
+                    'model.per_layer_model_projection': 0, 'model.per_layer_projection_norm': 0,
+                    'lm_head': 0}, attn_implementation='sdpa')
+    if info.get('missing_keys') or info.get('mismatched_keys') or info.get('error_msgs'):
+        raise RuntimeError(f'Gemma original decoder weights were not loaded completely: {info}')
+    offload_gemma_ple(model, torch)
+    return model
 
 
 def verify_adapter_parameters(model):
@@ -178,6 +240,7 @@ def run_training(run_dir):
     config = json.loads((run_dir / 'config.json').read_text(encoding='utf-8'))
     base = Path(config['base_model']).expanduser().resolve()
     model_config = validate_model_directory(base)
+    gemma = model_config.get('model_type') == 'gemma4'
     train_rows, eval_rows = load_datasets(run_dir)
     for key, low, high in [('epochs', 1, 100), ('rank', 1, 256), ('max_length', 8, 8192), ('batch_size', 1, 64), ('seed', 0, 2**31 - 1), ('gradient_accumulation_steps', 1, 128)]:
         value = config.get(key, {'epochs': 1, 'rank': 8, 'max_length': 512, 'batch_size': 1, 'seed': 42, 'gradient_accumulation_steps': 1}[key])
@@ -198,6 +261,8 @@ def run_training(run_dir):
         raise ValueError('gradient_checkpointing must be true or false.')
     if method == 'qlora' and device != 'cuda':
         raise ValueError('4-bit QLoRA requires an NVIDIA CUDA GPU; select CUDA or choose regular LoRA for CPU training.')
+    if gemma and (method != 'qlora' or device != 'cuda'):
+        raise ValueError('Gemma 4 text training requires CUDA 4-bit QLoRA with frozen per-layer embeddings in system RAM.')
     if any((run_dir / name).exists() for name in ('adapter', 'adapter.gguf', 'report.json')):
         raise ValueError('Run already contains output; create a fresh run to preserve earlier artifacts.')
     os.environ.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', HF_HUB_DISABLE_TELEMETRY='1')
@@ -210,6 +275,10 @@ def run_training(run_dir):
     if device == 'cuda' and not torch.cuda.is_available():
         raise ValueError('CUDA is unavailable in the selected training Python environment. Install a CUDA-enabled PyTorch build and a compatible NVIDIA driver, or choose regular LoRA on CPU.')
     compute_dtype = cuda_compute_dtype(torch) if method == 'qlora' else torch.float32
+    if gemma:
+        from packaging.version import Version
+        if Version(importlib.metadata.version('transformers')) < Version('5.17.0'):
+            raise RuntimeError('Gemma 4 requires Transformers 5.17.0 or newer for verified text loading and shared-KV checkpointing; use a separate training environment.')
     quantization_config = None
     if method == 'qlora':
         if torch.cuda.get_device_capability(0)[0] < 6:
@@ -221,7 +290,8 @@ def run_training(run_dir):
             from peft import prepare_model_for_kbit_training
             quantization_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type='nf4',
                                                      bnb_4bit_use_double_quant=True,
-                                                     bnb_4bit_compute_dtype=compute_dtype)
+                                                     bnb_4bit_compute_dtype=compute_dtype,
+                                                     llm_int8_enable_fp32_cpu_offload=gemma)
         except (ImportError, OSError, RuntimeError) as exc:
             raise RuntimeError('4-bit QLoRA needs working bitsandbytes and accelerate CUDA packages. Install packaging/training-requirements.txt into the selected training Python environment and check its CUDA compatibility.') from exc
     seed = config.get('seed', 42)
@@ -232,18 +302,23 @@ def run_training(run_dir):
         torch.cuda.reset_peak_memory_stats(0)
     progress('Hashing local model weights and approved dataset snapshots')
     provenance = {'config_sha256': sha256(run_dir / 'config.json'), 'train_sha256': sha256(run_dir / 'train.jsonl'), 'eval_sha256': sha256(run_dir / 'eval.jsonl'), 'base_model': str(base), 'model_config_sha256': sha256(base / 'config.json'), 'model_weight_manifest': {p.name: {'sha256': sha256(p), 'bytes': p.stat().st_size} for p in sorted(base.glob('*.safetensors'))}, 'tokenizer_manifest': {p.name: sha256(p) for p in sorted(base.iterdir()) if p.is_file() and (p.name.startswith('tokenizer') or p.name in ('special_tokens_map.json', 'added_tokens.json', 'chat_template.jinja'))}, 'tokenization': 'local tokenizer chat template; exact generation prefix masked; assistant completion and template terminators contribute loss'}
-    progress('Loading local tokenizer and Llama safetensors weights')
+    progress('Loading local tokenizer and ' + ('Gemma 4 text decoder' if gemma else 'Llama') + ' safetensors weights')
     tokenizer = AutoTokenizer.from_pretrained(str(base), local_files_only=True, trust_remote_code=False)
-    limit = min(config['max_length'], model_config.get('max_position_embeddings', config['max_length']))
-    train = [encode_example(tokenizer, row, limit) for row in train_rows]
-    evaluation = [encode_example(tokenizer, row, limit) for row in eval_rows]
+    text_config = model_config['text_config'] if gemma else model_config
+    limit = min(config['max_length'], text_config.get('max_position_embeddings', config['max_length']))
+    train = [encode_example(tokenizer, row, limit, gemma=gemma) for row in train_rows]
+    evaluation = [encode_example(tokenizer, row, limit, gemma=gemma) for row in eval_rows]
     load_options = dict(local_files_only=True, trust_remote_code=False, use_safetensors=True,
                         torch_dtype=compute_dtype)
     quantized_layers = 0
     if method == 'qlora':
         progress(f'Loading 4-bit NF4 weights with double quantization and {str(compute_dtype).split(".")[-1]} computation')
-        model = LlamaForCausalLM.from_pretrained(str(base), **load_options,
-                                               quantization_config=quantization_config, device_map={'': 0})
+        if gemma:
+            progress('Keeping frozen Gemma per-layer embeddings in system RAM; training only text decoder projections on CUDA')
+            model = load_gemma_model(base, model_config, load_options, quantization_config, torch)
+        else:
+            model = LlamaForCausalLM.from_pretrained(str(base), **load_options,
+                                                   quantization_config=quantization_config, device_map={'': 0})
         for module in model.modules():
             if isinstance(module, bnb.nn.Linear4bit):
                 state = getattr(module.weight, 'quant_state', None)
@@ -294,19 +369,20 @@ def run_training(run_dir):
         with torch.no_grad(), autocast():
             for row in evaluation[:3]:
                 ids = torch.tensor([row['prompt_ids']], dtype=torch.long, device=device)
-                output = current.generate(input_ids=ids, attention_mask=torch.ones_like(ids), do_sample=False, max_new_tokens=min(64, limit - ids.shape[1]), pad_token_id=pad, eos_token_id=tokenizer.eos_token_id)
+                eos = current.generation_config.eos_token_id if gemma else tokenizer.eos_token_id
+                output = current.generate(input_ids=ids, attention_mask=torch.ones_like(ids), do_sample=False, max_new_tokens=min(64, limit - ids.shape[1]), pad_token_id=pad, eos_token_id=eos)
                 result.append(tokenizer.decode(output[0, ids.shape[1]:], skip_special_tokens=True))
         return result
 
     progress('Evaluating unchanged base on held-out responses')
     base_loss, eval_tokens = evaluate(model)
     base_examples = generate(model)
-    target_modules = 'all-linear' if method == 'qlora' else ['q_proj', 'v_proj']
+    target_modules = GEMMA_TARGETS if gemma else ('all-linear' if method == 'qlora' else ['q_proj', 'v_proj'])
     model = get_peft_model(model, LoraConfig(task_type=TaskType.CAUSAL_LM, r=config['rank'], lora_alpha=2 * config['rank'], lora_dropout=0.0, target_modules=target_modules, bias='none'))
     trainable_count, total_count = verify_adapter_parameters(model)
     optimizer = torch.optim.AdamW((p for p in model.parameters() if p.requires_grad), lr=lr)
     scaler = torch.amp.GradScaler('cuda', enabled=method == 'qlora' and compute_dtype == torch.float16,
-                                 init_scale=1024.0)
+                                 init_scale=1.0 if gemma else 1024.0)
     steps = 0
     for epoch in range(config['epochs']):
         model.train()
@@ -319,6 +395,15 @@ def run_training(run_dir):
     progress('Evaluating candidate on identical held-out responses')
     candidate_loss, _ = evaluate(model)
     candidate_examples = generate(model)
+    changed_b = 0
+    for name, parameter in model.named_parameters():
+        if parameter.requires_grad:
+            if not bool(torch.isfinite(parameter).all().item()):
+                raise RuntimeError('Training produced nonfinite adapter weights; candidate cannot be exported.')
+            if '.lora_B.' in name:
+                changed_b += int(torch.count_nonzero(parameter).item())
+    if not changed_b:
+        raise RuntimeError('Training produced no nonzero LoRA B weights; candidate cannot be exported.')
     adapter = run_dir / 'adapter'
     model.save_pretrained(str(adapter), safe_serialization=True)
     provenance['adapter_manifest'] = {p.name: sha256(p) for p in sorted(adapter.iterdir()) if p.is_file()}
@@ -335,9 +420,24 @@ def run_training(run_dir):
                'device': device, 'device_name': torch.cuda.get_device_name(0) if device == 'cuda' else 'CPU',
                'quantized_layer_count': quantized_layers, 'base_frozen': True,
                'trainable_parameter_count': trainable_count, 'total_parameter_count': total_count}
+    if gemma:
+        details.update(model_family='gemma4', text_only=True, frozen_ple_cpu=True,
+                       variant='E2B' if text_config['hidden_size'] == 1536 else 'E4B',
+                       nonzero_lora_b_values=changed_b, generation_max_new_tokens=64,
+                       max_train_example_tokens=max(len(row['input_ids']) for row in train),
+                       max_eval_example_tokens=max(len(row['input_ids']) for row in evaluation),
+                       comparison_runtime='Transformers NF4 original vs NF4 + adapter; greedy, thinking disabled')
     memory = {'base_model_bytes': base_model_bytes,
               'peak_allocated_bytes': int(torch.cuda.max_memory_allocated(0)) if device == 'cuda' else 0,
               'peak_reserved_bytes': int(torch.cuda.max_memory_reserved(0)) if device == 'cuda' else 0}
+    if gemma:
+        ple = model.get_base_model().model.embed_tokens_per_layer.weight
+        memory['frozen_ple_cpu_bytes'] = ple.numel() * ple.element_size()
+        try:
+            import resource
+            memory['peak_process_rss_bytes'] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * (1 if sys.platform == 'darwin' else 1024)
+        except ImportError:
+            pass
     report = {'base_loss': base_loss, 'candidate_loss': candidate_loss, 'eval_response_tokens': eval_tokens, 'eval_examples': [dict(row, base_output=before, candidate_output=after) for row, before, after in zip(eval_rows[:3], base_examples, candidate_examples)], 'adapter_path': str(adapter), 'adapter_gguf': gguf, 'conversion_error': conversion_error, 'package_versions': {name: importlib.metadata.version(name) for name in packages}, 'provenance': provenance, 'optimization_steps': steps, 'training_details': details, 'memory': memory}
     temporary = run_dir / 'report.json.tmp'
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False), encoding='utf-8')

@@ -1,0 +1,268 @@
+{
+  "date": "2026-09-09",
+  "scope": "Small real training and Chat workflow; no answer-quality improvement claim",
+  "models": {
+    "E2B": {
+      "status": "succeeded",
+      "run_id": "c477c181897a4b2c9002ff95133f0485",
+      "training_config": {
+        "python_executable": "/home/miceoil/.local/share/letracode-training-qlora/bin/python",
+        "base_model": "/home/miceoil/bigdrive/Jan/llamacpp/models/gemma-4-E2B-it-HF",
+        "base_gguf": "/home/miceoil/bigdrive/Jan/llamacpp/models/gemma-4-E2B-it-LetraCode-Q4_K_M.gguf",
+        "llama_cpp_dir": "/home/miceoil/llama.cpp-cuda",
+        "epochs": 1,
+        "learning_rate": 0.0002,
+        "rank": 4,
+        "max_length": 256,
+        "batch_size": 1,
+        "seed": 42,
+        "device": "cuda",
+        "training_method": "qlora",
+        "gradient_accumulation_steps": 2,
+        "gradient_checkpointing": true
+      },
+      "memory": {
+        "base_model_bytes": 11945410634,
+        "peak_allocated_bytes": 3619070464,
+        "peak_reserved_bytes": 3791650816,
+        "frozen_ple_cpu_bytes": 9395240960,
+        "peak_process_rss_bytes": 15362134016
+      },
+      "gpu_monitor": {
+        "scope": "whole-device memory including unrelated processes",
+        "sample_count": 61,
+        "peak_used_mib": 4184,
+        "peak_by_phase_mib": {
+          "candidate_activation": 2142,
+          "candidate_after_restart": 2163,
+          "original_chat": 2133,
+          "preflight": 444,
+          "rollback_activation": 528,
+          "training": 4184
+        }
+      },
+      "training_seconds": 47.774104558000545,
+      "base_loss": 6.01791018531436,
+      "candidate_loss": 4.260050648734683,
+      "optimization_steps": 2,
+      "training_details": {
+        "training_method": "qlora",
+        "quantization": "nf4-double",
+        "compute_dtype": "float16",
+        "target_modules": [
+          "q_proj",
+          "k_proj",
+          "v_proj",
+          "o_proj",
+          "gate_proj",
+          "up_proj",
+          "down_proj"
+        ],
+        "gradient_checkpointing": true,
+        "gradient_accumulation_steps": 2,
+        "effective_batch_size": 2,
+        "device": "cuda",
+        "device_name": "NVIDIA GeForce RTX 2060 SUPER",
+        "quantized_layer_count": 276,
+        "base_frozen": true,
+        "trainable_parameter_count": 6039552,
+        "total_parameter_count": 4634608896,
+        "model_family": "gemma4",
+        "text_only": true,
+        "frozen_ple_cpu": true,
+        "variant": "E2B",
+        "nonzero_lora_b_values": 3514360,
+        "generation_max_new_tokens": 64,
+        "comparison_runtime": "Transformers NF4 original vs NF4 + adapter; greedy, thinking disabled"
+      },
+      "adapter_gguf_sha256": "2886e74dd03018ca694de7f0c5a22c8dccb1584ee84fe44c2296cc78a1dd9df3",
+      "restart_persisted": true,
+      "rollback_restart_persisted": true,
+      "original_weights_and_gguf_unchanged": true,
+      "package_versions": {
+        "torch": "2.11.0+cu126",
+        "transformers": "5.17.0",
+        "peft": "0.20.0",
+        "safetensors": "0.8.0",
+        "bitsandbytes": "0.50.2",
+        "accelerate": "1.15.0"
+      },
+      "evidence": "/home/miceoil/Projects/artifacts/evidence/gemma4-2026-09-09/E2B-run/proof.json",
+      "capacity_probe": [
+        {
+          "budget": 256,
+          "actual_tokens": 250,
+          "status": "succeeded",
+          "optimizer_steps": 1,
+          "seconds": 0.9011757373809814,
+          "peak_allocated_bytes": 4414425088,
+          "peak_reserved_bytes": 4620025856,
+          "peak_rss_bytes": 15097610240
+        },
+        {
+          "budget": 512,
+          "actual_tokens": 509,
+          "status": "succeeded",
+          "optimizer_steps": 1,
+          "seconds": 0.8412020206451416,
+          "peak_allocated_bytes": 5502825472,
+          "peak_reserved_bytes": 6224347136,
+          "peak_rss_bytes": 15097610240
+        }
+      ]
+    },
+    "E4B": {
+      "status": "succeeded",
+      "run_id": "44ec859cebdd446092b6dc279babc29e",
+      "training_config": {
+        "python_executable": "/home/miceoil/.local/share/letracode-training-qlora/bin/python",
+        "base_model": "/home/miceoil/bigdrive/Jan/llamacpp/models/gemma-4-E4B-it-HF",
+        "base_gguf": "/home/miceoil/bigdrive/Jan/llamacpp/models/gemma-4-E4B-it-LetraCode-Q4_K_M.gguf",
+        "llama_cpp_dir": "/home/miceoil/llama.cpp-cuda",
+        "epochs": 1,
+        "learning_rate": 0.0002,
+        "rank": 4,
+        "max_length": 256,
+        "batch_size": 1,
+        "seed": 42,
+        "device": "cuda",
+        "training_method": "qlora",
+        "gradient_accumulation_steps": 2,
+        "gradient_checkpointing": true
+      },
+      "memory": {
+        "base_model_bytes": 15947283544,
+        "peak_allocated_bytes": 6354038784,
+        "peak_reserved_bytes": 6494879744,
+        "frozen_ple_cpu_bytes": 11274289152,
+        "peak_process_rss_bytes": 21877280768
+      },
+      "gpu_monitor": {
+        "scope": "whole-device memory including unrelated processes",
+        "sample_count": 76,
+        "peak_used_mib": 6751,
+        "peak_by_phase_mib": {
+          "candidate_activation": 3631,
+          "candidate_after_restart": 3391,
+          "candidate_chat": 549,
+          "original_chat": 3619,
+          "preflight": 431,
+          "rollback_activation": 521,
+          "rollback_chat": 3617,
+          "training": 6751
+        }
+      },
+      "training_seconds": 64.57192336000298,
+      "base_loss": 4.304398525328863,
+      "candidate_loss": 3.1609401362282887,
+      "optimization_steps": 2,
+      "training_details": {
+        "training_method": "qlora",
+        "quantization": "nf4-double",
+        "compute_dtype": "float16",
+        "target_modules": [
+          "q_proj",
+          "k_proj",
+          "v_proj",
+          "o_proj",
+          "gate_proj",
+          "up_proj",
+          "down_proj"
+        ],
+        "gradient_checkpointing": true,
+        "gradient_accumulation_steps": 2,
+        "effective_batch_size": 2,
+        "device": "cuda",
+        "device_name": "NVIDIA GeForce RTX 2060 SUPER",
+        "quantized_layer_count": 343,
+        "base_frozen": true,
+        "trainable_parameter_count": 8720384,
+        "total_parameter_count": 7471733760,
+        "model_family": "gemma4",
+        "text_only": true,
+        "frozen_ple_cpu": true,
+        "variant": "E4B",
+        "nonzero_lora_b_values": 4816043,
+        "generation_max_new_tokens": 64,
+        "max_train_example_tokens": 36,
+        "max_eval_example_tokens": 33,
+        "comparison_runtime": "Transformers NF4 original vs NF4 + adapter; greedy, thinking disabled"
+      },
+      "adapter_gguf_sha256": "4a033d9c1ce4eb7e9922e2c51591d627044e146b686e8fbb2eae14d9f7e7bf46",
+      "restart_persisted": true,
+      "rollback_restart_persisted": true,
+      "original_weights_and_gguf_unchanged": true,
+      "package_versions": {
+        "torch": "2.11.0+cu126",
+        "transformers": "5.17.0",
+        "peft": "0.20.0",
+        "safetensors": "0.8.0",
+        "bitsandbytes": "0.50.2",
+        "accelerate": "1.15.0"
+      },
+      "evidence": "/home/miceoil/Projects/artifacts/evidence/gemma4-2026-09-09/E4B-run/proof.json",
+      "capacity_probe": [
+        {
+          "budget": 256,
+          "actual_tokens": 250,
+          "status": "succeeded",
+          "optimizer_steps": 1,
+          "seconds": 2.0900793075561523,
+          "peak_allocated_bytes": 7178305024,
+          "peak_reserved_bytes": 7556038656,
+          "peak_rss_bytes": 21609771008
+        },
+        {
+          "budget": 512,
+          "actual_tokens": 509,
+          "status": "failed",
+          "error": "OutOfMemoryError: CUDA out of memory. Tried to allocate 1.25 GiB. GPU 0 has a total capacity of 7.61 GiB of which 1.22 GiB is free. Process 2781 has 63.43 MiB memory in use. Process 47642 has 79.14 MiB memory in use. Including non-PyTorch memory, this process has 5.97 GiB memory in use. Of the allocated memory 4.81 GiB is allocated by PyTorch, and 1.04 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf)",
+          "seconds": 0.3339505195617676,
+          "peak_allocated_bytes": 5252306432,
+          "peak_reserved_bytes": 6276775936,
+          "peak_rss_bytes": 21609771008
+        }
+      ]
+    }
+  },
+  "llama_cuda_regression": {
+    "optimization_steps": 16,
+    "base_weights_unchanged": true,
+    "rollback_loaded_without_adapter": true,
+    "training_details": {
+      "training_method": "qlora",
+      "quantization": "nf4-double",
+      "compute_dtype": "float16",
+      "target_modules": "all-linear",
+      "gradient_checkpointing": true,
+      "gradient_accumulation_steps": 2,
+      "effective_batch_size": 2,
+      "device": "cuda",
+      "device_name": "NVIDIA GeForce RTX 2060 SUPER",
+      "quantized_layer_count": 7,
+      "base_frozen": true,
+      "trainable_parameter_count": 2176,
+      "total_parameter_count": 16096
+    },
+    "proof": "/home/miceoil/Projects/artifacts/evidence/gemma4-2026-09-09/Llama-regression/proof.json"
+  },
+  "existing_chat_settings_check": {
+    "status": "succeeded",
+    "context_size": 53248,
+    "gpu_layers": 5,
+    "response": {
+      "role": "assistant",
+      "content": "There are seven days in a week."
+    },
+    "generation_seconds": 1.6913495063781738,
+    "user_settings_changed": false,
+    "run_id": "44ec859cebdd446092b6dc279babc29e"
+  },
+  "tests": {
+    "desktop_passed": 1016,
+    "desktop_skipped": 22,
+    "training_runtime_passed": 50,
+    "affected_ui_after_wording_passed": 34
+  },
+  "installation_manifest": "/home/miceoil/.local/share/letracode-repairs/gemma4-20260909/installation.json"
+}
