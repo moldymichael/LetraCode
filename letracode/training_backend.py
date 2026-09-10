@@ -181,8 +181,24 @@ def verify_adapter_parameters(model):
     return int(trainable_count), int(total_count)
 
 
+def compute_response_loss(torch, model, inputs, *, gemma=False):
+    """Keep full decoder context but project only supervised Gemma positions.
+
+    The native Gemma head still applies its logit softcap and FP32 causal loss.
+    Explicit shifted labels align selected logits with the next response token;
+    a batch uses the union of supervised columns and retains each row's masks.
+    """
+    if not gemma:
+        return model(**inputs).loss
+    shifted = torch.nn.functional.pad(inputs['labels'], (0, 1), value=-100)[:, 1:]
+    positions = (shifted != -100).any(dim=0).nonzero(as_tuple=True)[0]
+    if positions.numel() == 0:
+        raise ValueError('Training/evaluation batch has no assistant response tokens.')
+    return model(**inputs, logits_to_keep=positions, shift_labels=shifted[:, positions]).loss
+
+
 def train_epoch(torch, model, rows, batch, optimizer, scaler, autocast,
-                batch_size, accumulation, on_step=None):
+                batch_size, accumulation, on_step=None, *, gemma=False):
     """Normalize each optimizer update by its actual assistant-token count."""
     steps = 0
     group_size = batch_size * accumulation
@@ -198,7 +214,7 @@ def train_epoch(torch, model, rows, batch, optimizer, scaler, autocast,
                 microbatch = group[start:start + batch_size]
                 tokens = sum(sum(label != -100 for label in row['labels'][1:]) for row in microbatch)
                 with autocast():
-                    loss = model(**batch(microbatch)).loss
+                    loss = compute_response_loss(torch, model, batch(microbatch), gemma=gemma)
                     if not torch.isfinite(loss):
                         raise RuntimeError('Nonfinite training loss; reduce learning rate or review examples.')
                     weighted_loss = loss * (tokens / token_count)
@@ -356,7 +372,7 @@ def run_training(run_dir):
             for start in range(0, len(evaluation), config['batch_size']):
                 inputs = batch(evaluation[start:start + config['batch_size']])
                 tokens = int((inputs['labels'][:, 1:] != -100).sum().item())
-                loss = float(current(**inputs).loss.item())
+                loss = float(compute_response_loss(torch, current, inputs, gemma=gemma).item())
                 if not math.isfinite(loss):
                     raise RuntimeError('Nonfinite evaluation loss; no completed report produced.')
                 total += loss * tokens
@@ -391,7 +407,7 @@ def run_training(run_dir):
         def on_step(epoch_step, loss):
             progress(f'Epoch {epoch + 1}/{config["epochs"]}, step {steps + epoch_step}, response loss {loss:.6f}')
         steps += train_epoch(torch, model, order, batch, optimizer, scaler, autocast,
-                             config['batch_size'], config['gradient_accumulation_steps'], on_step)
+                             config['batch_size'], config['gradient_accumulation_steps'], on_step, gemma=gemma)
     progress('Evaluating candidate on identical held-out responses')
     candidate_loss, _ = evaluate(model)
     candidate_examples = generate(model)
@@ -422,6 +438,7 @@ def run_training(run_dir):
                'trainable_parameter_count': trainable_count, 'total_parameter_count': total_count}
     if gemma:
         details.update(model_family='gemma4', text_only=True, frozen_ple_cpu=True,
+                       loss_strategy='native-softcapped-response-position-logits',
                        variant='E2B' if text_config['hidden_size'] == 1536 else 'E4B',
                        nonzero_lora_b_values=changed_b, generation_max_new_tokens=64,
                        max_train_example_tokens=max(len(row['input_ids']) for row in train),

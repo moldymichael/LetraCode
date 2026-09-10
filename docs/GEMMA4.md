@@ -161,6 +161,32 @@ headroom near 256 tokens. Start with short examples; batch 1 and rank 4 matter.
 The extra 48 GB system RAM makes the CPU PLE approach possible but does not
 replace VRAM for activations/logits.
 
+Those capacity probes computed vocabulary logits for every sequence position.
+The current Gemma trainer keeps every input token in the decoder but computes
+the output head and native softcapped cross-entropy only at positions predicting
+approved assistant tokens. The same selection is used for held-out loss; prompt
+tokens and padding already had zero loss weight. CPU tests with real tiny Gemma
+models compare the loss, every gradient (including non-reentrant shared-KV LoRA),
+and accumulated updates against full-position logits. Weight precision,
+generation and the Llama path are unchanged. This reduces logits memory for
+long prompts with short answers; the earlier 250/509-token measurements do not
+establish the new limit.
+
+On September 10, a separate user-approved E4B pilot completed 48 training examples
+and 8 held-out examples, with no truncation. The longest training example was
+559 tokens, the longest held-out example 410, and the largest training response
+80 tokens. One epoch at rank 4, batch 1, accumulation 4 and learning rate 0.0002
+performed all 12 optimizer updates. Peak PyTorch allocation was 6.35 GiB,
+reservation 6.64 GiB, sampled whole-GPU memory 7,287 MiB, and process RAM
+20.37 GiB. The worker (verification/loading/evaluation/training/export) took
+133.22 seconds. The adapter loaded in installed Chat, survived reopening, and
+rolled back in an isolated store. Both test conditions used the same matching
+Q4_K_M base and fixed 20-question profile; everyday model selection stayed intact.
+This verifies that particular prompt/response shape fits on the 8 GB GPU, not
+all 559-token examples or longer answers. The pilot did not establish a useful
+overall quality gain: shorter answers completed more often but lost important
+details. Private examples, responses and scores remain outside the repository.
+
 Runtime: Torch 2.11.0+cu126, Transformers 5.17.0, PEFT 0.20.0,
 bitsandbytes 0.50.2, Accelerate 1.15.0, safetensors 0.8.0;
 llama.cpp checkout `304665fe7`, driver 610.57.04, RTX 2060 SUPER (SM 7.5).
