@@ -10,6 +10,11 @@ SQLite schema and ordinary-file recovery formats are retained. See the
 [current user guide and verification](STRAND-EXPERIENCE.md). The live installation
 is not automatically replaced by source development.
 
+The user-requested **0.6.0 installation is now complete**, and the canonical
+`/home/miceoil/Projects/LetraCode` checkout and local `main` contain this build.
+The obsolete 0.1.1 local-main baseline was fast-forwarded. See the
+[installation and source correction record](INSTALLED-0.6.0-UPDATE.md).
+
 ## Earlier implementation milestones
 
 The **0.5.0 QLoRA update** adds explicit CUDA 4-bit NF4 training with double

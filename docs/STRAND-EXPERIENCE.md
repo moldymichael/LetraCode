@@ -180,3 +180,5 @@ GPU capacity or that a particular user's examples improve Strand. Earlier
 hardware evidence stays in the dated training verification documents.
 
 No live user chats, documents, models or installation were modified during tests.
+The subsequent user-requested deployment is recorded separately in
+[Installed 0.6.0 update](INSTALLED-0.6.0-UPDATE.md).
