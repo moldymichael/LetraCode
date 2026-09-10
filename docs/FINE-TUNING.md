@@ -1,3 +1,12 @@
+# Current 0.6.0 workflow
+
+The interface is now **Improve → Examples → Prepare and train → Compare and choose**.
+Start with the [beginner guide](STRAND-EXPERIENCE.md). Preparation runs before Chat
+is unloaded, advanced configuration is collapsed, failed conversion can be
+retried from retained artifacts, and adoption requires a current Chat-runtime
+comparison and saved judgment. The technical training requirements below still
+apply; older names and measured runs describe the previous implementation.
+
 # Fine-Tuning and chat thinking
 
 LetraCode 0.5.0 adds CUDA 4-bit QLoRA to the Fine-Tuning workspace introduced in 0.4.0.

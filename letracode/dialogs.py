@@ -10,7 +10,8 @@ from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QFontDatabase
 from PySide6.QtWidgets import (QCheckBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFileDialog, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QListWidget,
-    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget)
+    QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QToolButton, QScrollArea, QComboBox)
 
 from .engine import EngineConfig, EngineError, validated_lora_path
 from .platform import engine_setup_help, is_windows
@@ -63,13 +64,22 @@ class ApprovalDialog(QDialog):
 class ModelDialog(QDialog):
     def __init__(self, config: EngineConfig, parent=None):
         super().__init__(parent)
-        self.setWindowTitle('Model Setup — LetraCode')
-        self.resize(690, 660)
+        self.setWindowTitle('Choose Strand’s local model — LetraCode')
+        self.resize(690, 530)
         layout = QVBoxLayout(self)
-        intro = QLabel('Choose the local engine and model. LetraCode starts and stops the engine for you. Your conversations stay on this computer.')
+        intro = QLabel('Strand needs a local language model and a program to run it. LetraCode starts and stops that program for you. Your notes and conversations stay with Strand when you change models.')
         intro.setWordWrap(True)
         layout.addWidget(intro)
         form = QFormLayout()
+        self.advanced = QWidget()
+        advanced_form = QFormLayout(self.advanced)
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setText('Advanced: performance, adapters and second model')
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.advanced_toggle.setArrowType(Qt.ArrowType.RightArrow)
+        self.advanced_toggle.toggled.connect(self.advanced.setVisible)
+        self.advanced_toggle.toggled.connect(lambda checked: self.advanced_toggle.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow))
         self.executable = QLineEdit(config.executable or shutil.which('llama-server.exe' if is_windows() else 'llama-server') or '')
         self.executable.setPlaceholderText(r'C:\llama.cpp\llama-server.exe' if is_windows() else '/usr/bin/llama-server')
         self.model = QLineEdit(config.model_path)
@@ -78,8 +88,8 @@ class ModelDialog(QDialog):
         self.secondary_model.setPlaceholderText('Optional: a different GGUF for two-model conversations')
         self.lora = QLineEdit(config.lora_path)
         self.lora.setPlaceholderText('Optional local .gguf LoRA adapter for Model A')
-        self.lora.setToolTip('The adapter applies only to Model A and must match its base model. Changing Model A keeps this selection; clear it to use only the base model.')
-        for label, field, mode in [('Engine executable',self.executable,'engine'),('Model A file',self.model,'model'),('Model B file (optional)',self.secondary_model,'model'),('Model A LoRA adapter (optional)',self.lora,'adapter')]:
+        self.lora.setToolTip('The adapter applies only to Strand’s primary model and must match it. Choosing a different primary model clears this selection until you deliberately choose a matching adapter.')
+        for label, field, mode in [('Local engine',self.executable,'engine'),('Strand’s model',self.model,'model'),('Second model (optional)',self.secondary_model,'model'),('Trained adapter (optional)',self.lora,'adapter')]:
             row = QWidget(); line = QHBoxLayout(row); line.setContentsMargins(0,0,0,0)
             line.addWidget(field)
             browse = QPushButton('Browse…')
@@ -89,10 +99,11 @@ class ModelDialog(QDialog):
                 clear = QPushButton('Clear adapter')
                 clear.clicked.connect(self.lora.clear)
                 line.addWidget(clear)
-            form.addRow(label,row)
+            field.setAccessibleName(label)
+            (form if field in (self.executable, self.model) else advanced_form).addRow(label,row)
         adapter_note = QLabel('The adapter applies only to Model A and must match its base model. Clear the adapter when selecting an unrelated Model A.')
         adapter_note.setWordWrap(True)
-        form.addRow('', adapter_note)
+        advanced_form.addRow('', adapter_note)
         self.context = QSpinBox(); self.context.setRange(8192,131072); self.context.setSingleStep(4096); self.context.setValue(config.context_size)
         self.context.setToolTip('Space for project evidence, conversation and reply. Larger values use more memory and must be supported by the model.')
         self.tokens = QSpinBox(); self.tokens.setRange(256,16384); self.tokens.setSingleStep(256); self.tokens.setValue(config.max_tokens)
@@ -102,12 +113,36 @@ class ModelDialog(QDialog):
         self.threads = QSpinBox(); self.threads.setRange(1,128); self.threads.setValue(config.threads)
         self.temperature = QDoubleSpinBox(); self.temperature.setRange(0,2); self.temperature.setSingleStep(0.1); self.temperature.setValue(config.temperature)
         for label, field in [('Context size (tokens)',self.context),('Maximum reply (tokens)',self.tokens),('GPU layers',self.layers),('CPU threads',self.threads),('Temperature',self.temperature)]:
-            form.addRow(label,field)
+            advanced_form.addRow(label,field)
         layout.addLayout(form)
+        self.adapter_status = QLabel('Trained adapter selected: ' + Path(config.lora_path).name + '. Changing the primary model clears it.' if config.lora_path else 'Using the selected model without a trained adapter.')
+        self.adapter_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.adapter_status.setWordWrap(True); layout.addWidget(self.adapter_status)
+        self._model_for_adapter = self.model.text().strip()
+        self.model.textChanged.connect(self.primary_model_changed)
+        self.lora.textChanged.connect(lambda path: self.adapter_status.setText('Trained adapter selected: ' + Path(path).name + '. It must match this primary model.' if path else 'Using the selected model without a trained adapter.'))
+        self.discovered = QComboBox()
+        self.discovered.setAccessibleName('Local models found')
+        self.discovered.addItem('Choose a model already on this computer…', '')
+        self.find_button = QPushButton('Find local models')
+        self.find_button.clicked.connect(self.find_models)
+        self.discovered.activated.connect(lambda index: self.model.setText(self.discovered.itemData(index)) if self.discovered.itemData(index) else None)
+        found_row = QHBoxLayout(); found_row.addWidget(self.discovered, 1); found_row.addWidget(self.find_button)
+        layout.addLayout(found_row)
+        simple = QLabel('For a first chat, leave Advanced settings at their defaults. CPU mode needs no GPU setup. After saving, use Settings → Test local reply to check this exact engine and model. Finding a file does not prove compatibility.')
+        simple.setWordWrap(True); layout.addWidget(simple)
+        layout.addWidget(self.advanced_toggle)
+        advanced_scroll = QScrollArea(); advanced_scroll.setWidgetResizable(True)
+        advanced_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        advanced_scroll.setWidget(self.advanced)
+        advanced_scroll.setVisible(False)
+        self.advanced_toggle.toggled.connect(advanced_scroll.setVisible)
+        layout.addWidget(advanced_scroll, 1)
+        self.advanced.hide()
         memory_note = QLabel('Two-model conversations keep both models loaded and use these settings for each model. Allow enough RAM/VRAM for both weights and context buffers. A current llama.cpp build with multi-model support is required.')
         memory_note.setWordWrap(True)
-        layout.addWidget(memory_note)
-        note = QLabel(engine_setup_help() + ' Then select an instruction/chat GGUF. Model weights are separate downloads and can be several GB. Tool use and Thinking depend on the model and its chat template. If loading fails, check the engine log under Help.')
+        advanced_form.addRow(memory_note)
+        note = QLabel(engine_setup_help() + ' A GGUF is a local model file. Choose a chat/instruction model that fits your computer’s memory. Model weights are separate downloads and can be several GB. The model publisher’s requirements apply.')
         note.setWordWrap(True)
         layout.addWidget(note)
         docs = QPushButton('Open official model / engine guide')
@@ -117,6 +152,35 @@ class ModelDialog(QDialog):
         buttons.accepted.connect(self.validate)
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
+
+    def primary_model_changed(self, value):
+        if value.strip() != self._model_for_adapter:
+            self._model_for_adapter = value.strip()
+            if self.lora.text().strip():
+                self.lora.clear()
+                self.adapter_status.setText('Trained adapter cleared for this model change. Select a compatible one in Advanced only if it was made for this model. Cancel keeps your previous configuration.')
+
+    def find_models(self):
+        # A bounded convenience scan; it neither downloads nor reads whole model weights.
+        roots = [Path.home() / 'Models', Path.home() / 'models', Path.home() / 'Downloads']
+        if self.model.text().strip(): roots.insert(0, Path(self.model.text()).expanduser().parent)
+        found = set(); visited = 0
+        for root in roots:
+            if not root.is_dir(): continue
+            for folder, dirs, names in os.walk(root, followlinks=False):
+                visited += 1
+                if visited > 100: break
+                if len(Path(folder).relative_to(root).parts) >= 2: dirs[:] = []
+                dirs[:] = sorted(d for d in dirs if not d.startswith('.') and not (Path(folder) / d).is_symlink())[:30]
+                for name in sorted(names):
+                    path = Path(folder) / name
+                    if path.suffix.lower() == '.gguf' and path.is_file(): found.add(str(path))
+                    if len(found) >= 100: break
+                if len(found) >= 100: break
+        self.discovered.clear()
+        self.discovered.addItem('Select a found model' if found else 'No models found here — use Browse to choose a file', '')
+        for path in sorted(found)[:100]: self.discovered.addItem(Path(path).name, path)
+        self.discovered.setToolTip('Searched the selected model folder, Models, models and Downloads, up to two subfolders. Other files can be selected with Browse.')
 
     def browse(self, field, mode):
         file_filter = ('GGUF models (*.gguf)' if mode == 'model' else

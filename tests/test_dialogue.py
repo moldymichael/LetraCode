@@ -306,13 +306,16 @@ def test_request_accounting_uses_each_speakers_model(tmp_path):
     assert len(engine.requests) == 2
 
 
-def test_dialogue_preserves_referenced_plan_and_earlier_user_constraints(tmp_path):
+def test_dialogue_preserves_paused_plan_and_earlier_user_constraints(tmp_path):
     from letracode.dialogue import dialogue_messages
+    from letracode.worker import ConversationWorker
     store, ident = chat(tmp_path)
     store.add_message(ident, 'assistant', 'OPTION B: preserve old versions. ' + 'x' * 8000)
     store.add_message(ident, 'user', 'Are you ready?')
     store.add_message(ident, 'assistant', 'Yes, ready.')
     store.add_message(ident, 'user', 'Compare option B together.')
+    ConversationWorker(store, ident, DialogueEngine()).pause('context_limit', 'Paused task')
+    store.add_message(ident, 'user', 'Continue the comparison.')
     with pytest.raises(ValueError, match='context budget'):
         dialogue_messages(store.messages(ident), 'System', {'label': 'Model A'}, 1500)
 
@@ -336,3 +339,56 @@ def test_markdown_export_tolerates_damaged_optional_speaker_metadata(tmp_path, p
     exported = store.export_markdown(ident)
     assert '## LetraCode' in exported
     assert 'Keep this saved reply' in exported
+
+
+@pytest.mark.parametrize('reading', [False, True])
+def test_two_model_context_receipts_match_file_capabilities_and_each_speaker(tmp_path, reading):
+    from letracode.dialogue import DialogueWorker
+    store = Store(tmp_path / 'data')
+    project = store.create_project('Shared discussion')
+    store.update_project(project, instructions='Keep the workspace discussion candid.')
+    store.memory.create_file('active.md', 'SHARED-MEMORY-CONTENT')
+    shared = store.memory.file_snapshot('active.md')
+    store.memory.set_active('active.md', True, shared['sha256'])
+    store.memory.create_file('active.md', 'WORKSPACE-MEMORY-CONTENT', project_id=project)
+    scoped = store.memory.file_snapshot('active.md', project)
+    store.memory.set_active('active.md', True, scoped['sha256'], project)
+    shared_source = tmp_path / 'shared.md'
+    shared_source.write_text('tradeoffs SHARED-SOURCE-EVIDENCE')
+    project_source = tmp_path / 'workspace.md'
+    project_source.write_text('tradeoffs WORKSPACE-SOURCE-EVIDENCE')
+    store.set_setting('source_roots', [str(shared_source)])
+    store.link(project, project_source)
+    ident = store.create_chat('Discussion', project)
+    user_id = store.add_message(ident, 'user', 'Discuss the tradeoffs.')
+    engine = DialogueEngine()
+    engine.config.context_size = 32768
+    worker = DialogueWorker(store, ident, engine, computer_enabled=reading, reply_count=2)
+    worker.run()
+
+    assert len(engine.requests) == 2
+    replies = [row for row in store.messages(ident) if row['role'] == 'assistant']
+    for index, row in enumerate(replies):
+        payload = json.loads(row['payload'])
+        request = engine.requests[index][1]
+        system = request[0]['content']
+        assert 'Keep the workspace discussion candid.' in system
+        for marker in ('SHARED-MEMORY-CONTENT', 'WORKSPACE-MEMORY-CONTENT',
+                       'SHARED-SOURCE-EVIDENCE', 'WORKSPACE-SOURCE-EVIDENCE'):
+            assert (marker in system) == reading
+        receipt = payload['context']
+        assert receipt['system_text'] == system
+        assert f'Your participant label is "Model {"A" if index == 0 else "B"}' in system
+        assert receipt['capabilities'] == {'read_files': reading, 'actions': False, 'web': False, 'tools': False}
+        assert receipt['available_tools'] == []
+        assert receipt['history_reduced'] is False
+        assert receipt['message_ids'] == [user_id] + ([replies[0]['id']] if index else [])
+        assert receipt['conversation_message_count'] == 1 + index
+        assert receipt['workspace']['id'] == project
+        assert payload['run_configuration']['actions_enabled'] is False
+        if reading:
+            assert set(receipt['source_roots']) == {str(shared_source), str(project_source)}
+            assert {source['path'] for source in receipt['sources']} == {str(shared_source), str(project_source)}
+            assert {note['text'] for note in receipt['memory']} >= {'SHARED-MEMORY-CONTENT', 'WORKSPACE-MEMORY-CONTENT'}
+        else:
+            assert receipt['memory'] == receipt['sources'] == receipt['source_roots'] == []

@@ -15,6 +15,10 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog
 
 from .training import TrainingConfig, TrainingRepository
 from .training_worker import ActivationWorker, TrainingWorker
+from .training_experience import (ExperienceWorker, check_readiness, compare_version,
+    can_retry_conversion, converted_artifact_state,
+    discover_configuration, effective_report, examples_fingerprint, prepare_matching_model, retry_conversion,
+    save_version_review, version_review, version_stage)
 
 
 class FineTuningPanel(QWidget):
@@ -37,10 +41,12 @@ class FineTuningPanel(QWidget):
         self.run_id = None
         self._loading = False
         layout = QVBoxLayout(self)
-        heading = QLabel('Develop your assistant')
+        self._train_after_check = False
+        self._readiness_result = None
+        heading = QLabel('Help Strand improve')
         font = heading.font(); font.setPointSizeF(font.pointSizeF() + 4); font.setBold(True)
         heading.setFont(font); layout.addWidget(heading)
-        intro = QLabel('Review examples, train locally, then compare versions before choosing one. Your chat model changes only when you adopt a version.')
+        intro = QLabel('Show Strand a good answer. Build a candidate from your reviewed examples, compare it with Strand, then choose which version to use. Saved examples and training never change your current assistant by themselves.')
         intro.setWordWrap(True); layout.addWidget(intro)
         self.tabs = QTabWidget(); layout.addWidget(self.tabs, 1)
         self._examples_tab()
@@ -71,19 +77,21 @@ class FineTuningPanel(QWidget):
 
     def _examples_tab(self):
         page = QWidget(); outer = QVBoxLayout(page)
-        hint = QLabel('Examples teach a desired answer to a prompt. Keep evaluation prompts separate so they test behavior the model did not train on. Imported and chat examples start as drafts.')
+        hint = QLabel('A good example stands on its own: include what the question means and the answer you want. Keep a few different questions for comparison; Strand will not train on those. New examples stay drafts until you approve them.')
         hint.setWordWrap(True); outer.addWidget(hint)
         body = QSplitter(); outer.addWidget(body, 1)
         self.examples_list = QListWidget(); self.examples_list.currentItemChanged.connect(self.select_example)
         body.addWidget(self.examples_list)
         editor = QWidget(); form = QVBoxLayout(editor)
-        form.addWidget(QLabel('Prompt'))
-        self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText('What should the user ask?')
+        form.addWidget(QLabel('Question, with any background needed'))
+        self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText('For example: Explain a metaphor to a beginner using one everyday example.')
+        self.prompt.setAccessibleName('Training question and background')
         form.addWidget(self.prompt, 1)
         form.addWidget(QLabel('Desired response'))
-        self.response = QPlainTextEdit(); self.response.setPlaceholderText('Write or correct the answer you want the assistant to learn.')
+        self.response = QPlainTextEdit(); self.response.setPlaceholderText('Write or correct the answer Strand should learn. Include enough detail to show what makes it useful.')
+        self.response.setAccessibleName('Desired answer for Strand')
         form.addWidget(self.response, 1)
-        self.split = QComboBox(); self.split.addItem('Training example', 'train'); self.split.addItem('Held-out evaluation', 'eval')
+        self.split = QComboBox(); self.split.addItem('Teach this answer', 'train'); self.split.addItem('Keep for comparison', 'eval')
         form.addWidget(self.split)
         row = QHBoxLayout()
         self._button('New example', self.new_example, row)
@@ -99,14 +107,27 @@ class FineTuningPanel(QWidget):
 
     def _training_tab(self):
         page = QWidget(); form = QVBoxLayout(page)
-        help_text = QLabel('Train reviewed text responses with local Llama or Gemma 4 E2B/E4B original safetensors weights. 4-bit QLoRA needs an NVIDIA CUDA GPU and a separate training Python with PyTorch, Transformers, PEFT, Accelerate and bitsandbytes. A GGUF chat file alone cannot be trained. The model architecture is detected from the selected training folder.')
+        help_text = QLabel('Start with Check preparation. It checks whether your model and training tools are ready, and tells you how to fix anything missing. Strand keeps your current version until you compare answers and choose a candidate.')
         help_text.setWordWrap(True); form.addWidget(help_text)
+        self.readiness = QLabel('Not checked yet. You can save and review examples at any time.')
+        self.readiness.setTextFormat(Qt.TextFormat.PlainText)
+        self.readiness.setWordWrap(True); form.addWidget(self.readiness)
+        preparation = QHBoxLayout()
+        self.check_button = self._button('Check preparation', self.check_preparation, preparation)
+        self.prepare_button = self._button('Prepare matching model', self.prepare_model, preparation)
+        form.addLayout(preparation)
+        self.details_toggle = QCheckBox('Show preparation details and advanced settings')
+        form.addWidget(self.details_toggle)
+        self.advanced = QWidget(); advanced_layout = QVBoxLayout(self.advanced)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.details_toggle.toggled.connect(self.advanced.setVisible)
+        self.advanced.hide()
         paths = QFormLayout(); self.fields = {}
-        saved = self.store.setting('training_config', {})
+        saved = discover_configuration(self.store, self.main_window.engine_config)
         if not isinstance(saved, dict):
             saved = {}
         defaults = dataclasses.asdict(TrainingConfig(python_executable='', base_model=''))
-        if not saved:
+        if not self.store.setting('training_config'):
             defaults.update(training_method='qlora', device='cuda',
                             gradient_accumulation_steps=4, gradient_checkpointing=True)
         training_python = Path.home() / '.local/share/letracode-training-qlora/bin/python'
@@ -138,7 +159,7 @@ class FineTuningPanel(QWidget):
             button = QPushButton('Browse…'); horizontal.addWidget(button)
             button.clicked.connect(lambda _=False, f=field, k=kind: self.browse(f, k))
             paths.addRow(label, row)
-        form.addLayout(paths)
+        advanced_layout.addLayout(paths)
         advanced = QGroupBox('Advanced training settings'); settings = QFormLayout(advanced)
         for name, label, low, high in (('epochs', 'Passes through training data', 1, 100),
                                      ('rank', 'LoRA rank', 1, 256),
@@ -172,33 +193,60 @@ class FineTuningPanel(QWidget):
         self.fields['batch_size'].valueChanged.connect(self.update_effective_batch)
         self.fields['gradient_accumulation_steps'].valueChanged.connect(self.update_effective_batch)
         self.profile.currentIndexChanged.connect(self.apply_profile)
-        form.addWidget(advanced)
-        gemma_hint = QLabel('Gemma 4: E2B has more room on an 8 GB GPU. E4B uses frozen embeddings in system RAM to fit short examples; its usual QLoRA baseline is 10 GB VRAM. On the tested RTX 2060 SUPER, a 250-token update fit but 509 tokens ran out of memory. Start at 256 tokens or less, batch 1 and rank 4. Only text responses are trained. Adoption requires a matching GGUF conversion manifest. Compare held-out answers before adoption.')
-        gemma_hint.setWordWrap(True); form.addWidget(gemma_hint)
-        warning = QLabel('Training reads only approved examples and local weights. Larger models and longer examples still need more memory. QLoRA does not guarantee better answers: compare held-out results before adoption. Training runs do not download models or packages. Conversion also needs the selected llama.cpp checkout’s Python dependencies in the training environment.')
+        advanced_layout.addWidget(advanced)
+        gemma_hint = QLabel('Supported training: original text-only Llama and Gemma 4 E2B/E4B weights. Gemma uses CUDA QLoRA with frozen per-layer embeddings in system RAM. Example length and available memory determine capacity; the preparation check counts every example without truncating it. Start conservatively. Historical hardware measurements are in Help → Training guide.')
+        gemma_hint.setWordWrap(True); advanced_layout.addWidget(gemma_hint)
+        form.addWidget(self.advanced)
+        technical_note = QLabel('Conversion needs the selected llama.cpp checkout’s Python dependencies in the training environment. QLoRA is an optimization method; held-out loss is supporting evidence rather than a guarantee of better answers.')
+        technical_note.setWordWrap(True); advanced_layout.addWidget(technical_note)
+        self.preparation_diagnostics = QLabel()
+        self.preparation_diagnostics.setTextFormat(Qt.TextFormat.PlainText)
+        self.preparation_diagnostics.setWordWrap(True); advanced_layout.addWidget(self.preparation_diagnostics)
+        warning = QLabel('Only your approved examples are used. Larger models and longer examples need more memory. Training may improve some answers and worsen others, so compare them before choosing a version. Nothing is downloaded during preparation or training.')
         warning.setWordWrap(True); form.addWidget(warning)
-        self.review_check = QCheckBox('I reviewed the approved examples and selected the matching model files.')
+        self.review_check = QCheckBox('Use my approved teaching and comparison examples for this candidate')
         form.addWidget(self.review_check)
-        self.start_button = QPushButton('Start local fine-tuning'); self.start_button.clicked.connect(self.start_training)
+        self.start_button = QPushButton('Check preparation and train'); self.start_button.clicked.connect(self.start_training)
+        self.start_button.setToolTip('Checks preparation first. Training starts only after those checks pass and uses your approved examples.')
         form.addWidget(self.start_button); form.addStretch()
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(page)
-        self.training_form = page; self.tabs.addTab(scroll, 'Train')
+        self.training_form = page; self.tabs.addTab(scroll, 'Prepare and train')
 
     def _versions_tab(self):
         page = QWidget(); layout = QVBoxLayout(page)
+        self.stage = QLabel('No candidates yet. Start in Examples, then use Prepare and train to build one.'); self.stage.setWordWrap(True)
+        layout.addWidget(self.stage)
         split = QSplitter()
         self.runs_list = QListWidget(); self.runs_list.currentItemChanged.connect(self.select_run)
         self.results = QPlainTextEdit(); self.results.setReadOnly(True)
+        self.results.setPlaceholderText('Candidates and their comparisons will appear here. Your current Strand stays in use while you prepare examples.')
         split.addWidget(self.runs_list); split.addWidget(self.results); split.setSizes([270, 700])
         layout.addWidget(split, 1)
         row = QHBoxLayout()
-        self.adopt_button = self._button('Adopt selected version', self.adopt, row)
-        self.rollback_button = self._button('Roll back to previous model', self.rollback, row)
-        self._button('Open run folder', self.open_run, row)
+        self.compare_button = self._button('Compare with Strand', self.compare, row)
+        self.convert_button = self._button('Retry conversion', self.retry_conversion, row)
+        self.adopt_button = self._button('Use this version', self.adopt, row)
+        self.rollback_button = self._button('Restore previous version', self.rollback, row)
+        self.open_run_button = self._button('Open run folder', self.open_run, row)
         layout.addLayout(row)
-        note = QLabel('Held-out loss measures fit to these expected answers; lower is better on this set. Review sample answers and test real tasks before deciding the assistant improved. Previous versions and base weights are kept.')
+        review = QFormLayout()
+        self.version_name = QLineEdit(); self.version_name.setPlaceholderText('For example: Clearer explanations')
+        self.judgment = QComboBox()
+        for label, value in (('Not reviewed yet', 'unreviewed'), ('Candidate is better on these examples', 'better'),
+                             ('About the same', 'same'), ('Candidate lost useful behavior', 'worse'), ('Mixed results', 'mixed')):
+            self.judgment.addItem(label, value)
+        self.review_notes = QLineEdit(); self.review_notes.setPlaceholderText('Accuracy, missing details, style, and any regressions')
+        review.addRow('Version name', self.version_name); review.addRow('Your judgment', self.judgment)
+        review.addRow('Review notes', self.review_notes)
+        layout.addLayout(review)
+        self.review_button = QPushButton('Save my review'); self.review_button.clicked.connect(self.save_review)
+        layout.addWidget(self.review_button)
+        self.report_toggle = QCheckBox('Show technical training report')
+        self.report_toggle.toggled.connect(lambda _: self.show_run(self.repository.run(self.run_id)) if self.run_id else None)
+        layout.addWidget(self.report_toggle)
+        note = QLabel('Compare answers for correctness, useful detail and style. Keep worse or mixed results in your review too. Scores in the technical report are supporting evidence. Previous versions are kept so you can restore one.')
         note.setWordWrap(True); layout.addWidget(note)
-        self.tabs.addTab(page, 'Versions & evaluation')
+        self.tabs.addTab(page, 'Compare and choose')
 
     def browse(self, field, kind):
         if kind == 'directory':
@@ -211,7 +259,7 @@ class FineTuningPanel(QWidget):
 
     def error(self, error):
         self.progress.setText(str(error))
-        QMessageBox.warning(self, 'Fine-Tuning', str(error))
+        QMessageBox.warning(self, 'Improve Strand', str(error))
 
     def persist_draft(self):
         draft = {'id': self.example_id, 'key': self._editor_key,
@@ -253,7 +301,7 @@ class FineTuningPanel(QWidget):
         self.examples_list.blockSignals(True); self.examples_list.clear()
         rows = self.repository.examples()
         for row in rows:
-            label = ('Approved' if row['approved'] else 'Draft') + ' · ' + ('Eval' if row['split'] == 'eval' else 'Train')
+            label = ('Approved' if row['approved'] else 'Draft') + ' · ' + ('Comparison' if row['split'] == 'eval' else 'Teaching')
             item = QListWidgetItem(label + '\n' + row['prompt'][:100].replace('\n', ' '))
             item.setData(Qt.ItemDataRole.UserRole, row['id']); self.examples_list.addItem(item)
             if row['id'] == self.example_id:
@@ -268,7 +316,7 @@ class FineTuningPanel(QWidget):
         self.examples_list.blockSignals(False)
         training = sum(row['approved'] and row['split'] == 'train' for row in rows)
         evaluation = sum(row['approved'] and row['split'] == 'eval' for row in rows)
-        self.counts.setText(f'Approved: {training} training · {evaluation} evaluation')
+        self.counts.setText(f'Approved: {training} teaching · {evaluation} comparison')
 
     def select_example(self, current, previous=None):
         if current is None:
@@ -285,6 +333,16 @@ class FineTuningPanel(QWidget):
         self.persist_draft()
         self.load_draft({}, 'draft:' + uuid.uuid4().hex)
         self.persist_draft(); self.refresh_examples()
+
+    def capture_example(self, prompt, response, source='', context=''):
+        self.new_example()
+        if context.strip():
+            prompt = 'Background for this request:\n' + context.strip() + '\n\nRequest:\n' + prompt
+        self.prompt.setPlainText(prompt)
+        self.response.setPlainText(response)
+        self.example_source = source
+        self.persist_draft(); self.tabs.setCurrentIndex(0)
+        self.progress.setText('Review this example as a standalone question and answer. Earlier context is editable above; source files and tool results are not copied automatically. Add any facts the answer needs, then approve it. Saving does not train Strand.')
 
     def save_example(self, checked=False):
         try:
@@ -350,6 +408,9 @@ class FineTuningPanel(QWidget):
     def persist_configuration(self, *_):
         # Keep incomplete setup too; paths are validated only when a run starts.
         self.store.set_setting('training_config', dataclasses.asdict(self.configuration()))
+        self._readiness_result = None
+        if hasattr(self, 'readiness'):
+            self.readiness.setText('Preparation changed. Check it before training; your current Strand is unchanged.')
 
     def training_method_changed(self, *_):
         qlora = self.fields['training_method'].currentData() == 'qlora'
@@ -380,10 +441,76 @@ class FineTuningPanel(QWidget):
         if self.job is not None or self.chat_busy:
             return
         if not self.review_check.isChecked():
-            self.error('Review the approved examples and matching model files, then select the checkbox to start.')
+            self.error('Review your approved examples, then select the checkbox to use them for this candidate.')
             return
+        self.check_preparation(train_after=True)
+
+    def check_preparation(self, checked=False, *, train_after=False):
+        if self.job is not None or self.chat_busy:
+            return
+        config = self.configuration()
+        self._train_after_check = train_after
+        self.readiness.setText('Checking local files, reviewed examples, runtime, token lengths and conversion…')
+        self.start_experience(lambda cancel, status: check_readiness(self.repository, config, cancel, status),
+                              self.preparation_checked)
+
+    def preparation_checked(self, result):
+        self._readiness_result = result
+        self.preparation_diagnostics.setText('\n'.join(check['name'] + ': ' + check['detail'] for check in result['checks']))
+        summary = []
+        for check in result['checks']:
+            detail = check['detail']
+            if not check['ready'] and check['name'] == 'Local training files':
+                detail = 'Finish model setup in preparation details. Help → Training guide explains the required files.'
+            elif not check['ready'] and check['name'] == 'Runtime, tokenizer and conversion tools':
+                detail = 'Training tools or example sizes need attention. Open preparation details for the exact check result.'
+            summary.append(('✓ ' if check['ready'] else '• ') + detail)
+        self.readiness.setText(('Ready for local training' if result['ready'] else 'Preparation needs attention') + '\n' +
+            '\n'.join(summary))
+        if not result['ready']:
+            self._train_after_check = False
+            self.progress.setText('Finish the listed preparation step, then check again. Your current Strand is unchanged.')
+        else:
+            self.progress.setText('Preparation passed. Memory use is still confirmed during training; your current version stays saved.')
+
+    def prepare_model(self):
+        if self.job is not None or self.chat_busy:
+            return
+        config = self.configuration()
+        self.start_experience(lambda cancel, status: prepare_matching_model(self.repository, config, cancel, status),
+                              self.model_prepared)
+
+    def model_prepared(self, result):
+        self.fields['base_gguf'].setText(result['base_gguf'])
+        self.readiness.setText('Matching local model prepared. Check preparation to validate your runtime and examples.')
+        self.progress.setText('Matching Chat model and provenance saved. The active Strand model is unchanged.')
+
+    def start_experience(self, operation, callback, *, unload=False):
+        if self.job is not None or self.chat_busy:
+            return
+        if unload:
+            self.main_window.engine.stop()
+        self.job = ExperienceWorker(operation, self)
+        self.job.status.connect(self.progress.setText)
+        self.job.failed.connect(self.experience_failed)
+        self.job.ready.connect(callback)
+        self.job.finished.connect(self.job_finished)
+        self.busy_changed.emit(True); self.set_chat_busy(True)
+        self.job.start()
+
+    def experience_failed(self, error):
+        self._train_after_check = False
+        self.progress.setText(error)
+        if self._readiness_result is None:
+            self.readiness.setText('Preparation needs attention\n' + error)
+
+    def begin_training(self):
         try:
             config = self.configuration()
+            if (not self._readiness_result or not self._readiness_result.get('ready')
+                    or self._readiness_result.get('configuration') != dataclasses.asdict(config)
+                    or self._readiness_result.get('examples_fingerprint') != examples_fingerprint(self.repository)):
+                raise ValueError('Examples or preparation changed after the check. Check preparation again before training.')
             run = self.repository.create_run(config)
             self.store.set_setting('training_config', dataclasses.asdict(config))
         except (OSError, ValueError) as error:
@@ -398,21 +525,55 @@ class FineTuningPanel(QWidget):
         self.refresh_runs(); self.tabs.setCurrentIndex(2)
         self.progress.setText('Preparing local training…'); self.job.start()
 
+    def compare(self):
+        if self.job is not None or self.chat_busy or not self.run_id:
+            return
+        ident = self.run_id
+        config = dataclasses.replace(self.main_window.engine_config)
+        thinking = self.main_window.mode.currentText() == 'Thinking'
+        self.start_experience(lambda cancel, status: compare_version(self.repository, ident, config, cancel, status, thinking),
+                              lambda result: self.progress.setText('Comparison complete. Read every answer and save your judgment.' if result['status'] == 'complete' else 'Comparison is incomplete. Saved answers and errors are shown; you can try again.'), unload=True)
+
+    def retry_conversion(self):
+        if self.job is not None or self.chat_busy or not self.run_id:
+            return
+        ident = self.run_id
+        config = self.configuration()
+        self.start_experience(lambda cancel, status: retry_conversion(self.repository, ident, config.llama_cpp_dir,
+                              config.python_executable, cancel, status),
+                              lambda result: self.progress.setText('Conversion completed. Compare this candidate with Strand next.'))
+
+    def save_review(self):
+        if not self.run_id or self.job is not None:
+            return
+        try:
+            save_version_review(self.repository, self.run_id, name=self.version_name.text().strip(),
+                                judgment=self.judgment.currentData(), notes=self.review_notes.text())
+            self.refresh_runs()
+            self.progress.setText('Your judgment is saved separately from the measured training results.')
+        except ValueError as error:
+            self.error(error)
+
     def refresh_runs(self):
         self.runs_list.blockSignals(True); self.runs_list.clear()
-        for row in self.repository.runs():
+        runs = self.repository.runs()
+        for row in runs:
             report = row.get('report') or {}
             details = report.get('training_details') or {}
             name = f"Gemma 4 {details.get('variant', '')}" if details.get('model_family') == 'gemma4' else row['id'][:12]
+            name = version_review(self.repository, row['id']).get('name') or name
             if report.get('verification_only'):
                 name += ' · synthetic verification'
-            item = QListWidgetItem(f"{row['created']} · {row['status']}\n{name}")
+            item = QListWidgetItem(f"{name}\n{version_stage(self.repository, row['id'])}")
             item.setData(Qt.ItemDataRole.UserRole, row['id']); self.runs_list.addItem(item)
             if row['id'] == self.run_id:
                 self.runs_list.setCurrentItem(item)
         self.runs_list.blockSignals(False)
         if self.run_id:
             self.show_run(self.repository.run(self.run_id))
+        else:
+            self.stage.setText('Choose a candidate to see its next step.' if runs else
+                'No candidates yet. Start in Examples, then use Prepare and train to build one.')
         self.update_controls()
 
     def select_run(self, current, previous=None):
@@ -421,7 +582,46 @@ class FineTuningPanel(QWidget):
             self.show_run(self.repository.run(self.run_id)); self.update_controls()
 
     def show_run(self, run):
-        report = run.get('report') or {}
+        if run is None:
+            return
+        stored = self.repository.run(run['id'])
+        report = effective_report(self.repository, run['id']) if stored else run.get('report') or {}
+        review = version_review(self.repository, run['id'])
+        self.version_name.setText(review.get('name', ''))
+        self.judgment.setCurrentIndex(max(0, self.judgment.findData(review.get('judgment', 'unreviewed'))))
+        self.review_notes.setText(review.get('notes', ''))
+        self.stage.setText(version_stage(self.repository, run['id']) if stored else 'Historical training record')
+        comparison = review.get('comparison') or {}
+        if stored and not self.report_toggle.isChecked():
+            text = (review.get('name') or 'Candidate ' + run['id'][:8]) + '\n' + version_stage(self.repository, run['id'])
+            text += '\n\nTeaching, conversion and comparison are separate steps. A lower training loss does not prove better answers.'
+            text += '\nYour judgment: ' + review.get('judgment', 'unreviewed')
+            if comparison:
+                text += '\n\nChat comparison: ' + comparison.get('status', 'unknown')
+                text += '\n' + comparison.get('runtime', '')
+                text += '\nThis tests standalone answers. Shared notes, project retrieval, file edits and action tools are not exercised.'
+                text += '\nEach reply uses the Chat output budget (' + str(comparison.get('current_config', {}).get('max_tokens', '?')) + ' tokens). Errors and cut-off answers remain incomplete.'
+                if comparison.get('base_changed'):
+                    text += '\nThe candidate uses a different base model. This comparison includes that model change as well as training.'
+                if comparison.get('error'):
+                    text += '\n' + comparison['error']
+                for index, row in enumerate(comparison.get('examples', []), 1):
+                    text += f'\n\n── Comparison {index} ──\nQuestion: ' + row['prompt'] + '\nDesired answer: ' + row['response']
+                    for key, label in (('current', 'Strand now'), ('candidate', 'Candidate')):
+                        text += '\n\n' + label + ':\n' + row.get(key + '_output', 'No answer saved')
+                        if row.get(key + '_error'):
+                            text += '\nIncomplete: ' + row[key + '_error']
+            elif converted_artifact_state(self.repository, run['id']) == 'present':
+                text += '\n\nNext: Compare with Strand. Every saved comparison question will be answered by both versions independently in the Chat runtime.'
+            elif run['status'] == 'succeeded':
+                text += '\n\nThe trained adapter is preserved. Retry conversion after resolving preparation details; optimization will not repeat.'
+                text += '\n' + report.get('conversion_error', '')
+            if run.get('error'):
+                text += '\n\n' + run['error']
+            if review.get('notes'):
+                text += '\n\nYour notes: ' + review['notes']
+            self.results.setPlainText(text)
+            return
         text = f"Version {run['id']}\nStatus: {run['status']}\nCreated: {run['created']}\n"
         if report.get('verification_only'):
             text += 'Synthetic workflow verification. This version has not been validated for answer quality.\n'
@@ -491,14 +691,15 @@ class FineTuningPanel(QWidget):
             self.progress.setText('This version is already active. The previous model is still available for rollback.')
             return
         run = self.repository.run(self.run_id)
-        report = run.get('report') or {}
+        report = effective_report(self.repository, self.run_id)
         if run['status'] != 'succeeded' or not report.get('adapter_gguf_sha256'):
             self.error('Select a version with completed evaluation and a converted GGUF adapter.'); return
-        answer = QMessageBox.question(self, 'Adopt this version?',
-            'Load this adapter and its selected base GGUF as Model A for Chat? Model B stays as configured. The previous model configuration will be saved for rollback. Review the evaluation results before proceeding.',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
-        if answer == QMessageBox.StandardButton.Yes:
-            self.start_activation(run_id=self.run_id)
+        review = version_review(self.repository, self.run_id)
+        if (review.get('comparison', {}).get('status') != 'complete'
+                or review.get('judgment', 'unreviewed') == 'unreviewed'):
+            self.error('Compare this candidate with Strand, then save your judgment before choosing it.')
+            return
+        self.start_activation(run_id=self.run_id)
 
     def rollback(self):
         if self.job is not None or self.chat_busy:
@@ -514,7 +715,9 @@ class FineTuningPanel(QWidget):
             return
         self.main_window.engine.stop()
         self.job = ActivationWorker(self.repository, self.main_window.engine_config, run_id, rollback, self,
-                                    secondary_enabled=self.main_window.conversation_mode.currentIndex() == 1)
+                                    secondary_enabled=self.main_window.conversation_mode.currentIndex() == 1,
+                                    require_comparison=rollback is None,
+                                    thinking=self.main_window.mode.currentText() == 'Thinking')
         self.job.status.connect(self.progress.setText)
         self.job.failed.connect(self.progress.setText)
         self.job.ready.connect(self.activation_ready)
@@ -542,10 +745,14 @@ class FineTuningPanel(QWidget):
         self.main_window.engine = engine
         self.main_window.engine_config = selected_config
         self.main_window.render_chat()
+        if hasattr(self.main_window, 'settings_panel'):
+            self.main_window.settings_panel.refresh()
         self.progress.setText('Selected model loaded and saved. Chat will use this configuration after restart.')
 
     def job_finished(self):
         completed = self.job
+        train_after = self._train_after_check and self._readiness_result and self._readiness_result.get('ready')
+        self._train_after_check = False
         self.job = None
         if completed is not None:
             completed.deleteLater()
@@ -553,8 +760,11 @@ class FineTuningPanel(QWidget):
         self.refresh_runs()
         if self.main_window.closing_when_stopped:
             self.main_window.close()
+        elif train_after and completed is not None and not completed.cancelled.is_set():
+            self.begin_training()
 
     def stop(self):
+        self._train_after_check = False
         if self.job is not None:
             self.progress.setText('Stopping the local process…')
             self.job.cancel()
@@ -566,9 +776,20 @@ class FineTuningPanel(QWidget):
     def update_controls(self):
         busy = self.chat_busy or self.job is not None
         self.start_button.setEnabled(not busy)
+        self.start_button.setText('Train a candidate' if self._readiness_result and self._readiness_result.get('ready') else 'Check preparation and train')
         self.training_form.setEnabled(not busy)
         self.stop_button.setEnabled(self.job is not None)
         run = self.repository.run(self.run_id) if self.run_id else None
-        can_adopt = run and run['id'] != self.store.setting('training_active_version') and run['status'] == 'succeeded' and (run.get('report') or {}).get('adapter_gguf_sha256') and run['config'].get('base_gguf')
+        review = version_review(self.repository, run['id']) if run else {}
+        report = effective_report(self.repository, run['id']) if run else {}
+        converted = run and run['status'] == 'succeeded' and converted_artifact_state(self.repository, run['id']) == 'present' and run['config'].get('base_gguf')
+        can_adopt = converted and run['id'] != self.store.setting('training_active_version') and review.get('comparison', {}).get('status') == 'complete' and review.get('judgment', 'unreviewed') != 'unreviewed'
         self.adopt_button.setEnabled(not busy and bool(can_adopt))
+        self.compare_button.setEnabled(not busy and bool(converted) and bool(self.main_window.engine_config.model_path))
+        self.convert_button.setEnabled(not busy and bool(run and can_retry_conversion(self.repository, run['id'])))
+        self.review_button.setEnabled(not busy and bool(run))
+        self.open_run_button.setEnabled(bool(run))
+        self.version_name.setEnabled(not busy and bool(run))
+        self.judgment.setEnabled(not busy and bool(run))
+        self.review_notes.setEnabled(not busy and bool(run))
         self.rollback_button.setEnabled(not busy and bool(self.store.setting('training_previous_engine')))

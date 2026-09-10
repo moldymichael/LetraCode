@@ -1,5 +1,5 @@
 Name:           letracode
-Version:        0.5.0
+Version:        0.6.0
 Release:        1%{?dist}
 Summary:        Private local AI conversations with project context
 License:        MIT
@@ -22,6 +22,7 @@ managed llama.cpp server. Conversations remain on the user's computer.
 %install
 mkdir -p %{buildroot}%{_datadir}/letracode
 cp -a letracode %{buildroot}%{_datadir}/letracode/
+cp -a docs %{buildroot}%{_datadir}/letracode/
 install -Dm0644 LICENSE %{buildroot}%{_licensedir}/%{name}/LICENSE
 install -Dm0644 README.md %{buildroot}%{_docdir}/%{name}/README.md
 
@@ -53,6 +54,9 @@ PYTHONPATH=%{buildroot}%{_datadir}/letracode %{_bindir}/python3 -P -m letracode 
 %{_metainfodir}/io.letracode.LetraCode.metainfo.xml
 
 %changelog
+* Thu Sep 10 2026 LetraCode contributors - 0.6.0-1
+- Coherent Strand workspace, transparent context and guided improvement workflow.
+
 * Wed Sep 09 2026 LetraCode contributors - 0.5.0-1
 - Add CUDA 4-bit QLoRA with memory reporting and accumulated training.
 

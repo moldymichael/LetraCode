@@ -13,7 +13,7 @@ from PySide6.QtGui import QDesktopServices, QIcon
 from PySide6.QtWidgets import (
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QMessageBox, QPlainTextEdit, QPushButton,
-    QStyle, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QStyle, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QMenu, QToolButton,
 )
 
 from .context import MAX_FILE, TEXT_SUFFIXES, read_text, is_link
@@ -151,40 +151,44 @@ class ProjectFilesPanel(QWidget):
         self.new_folder_button = QPushButton('New folder…')
         self.add_files_button = QPushButton('Add existing files…')
         self.add_folder_button = QPushButton('Add existing folder…')
-        row = QHBoxLayout()
-        row.setSpacing(4)
-        for button, slot in ((self.new_button, self.new_note), (self.new_folder_button, self.new_folder)):
-            row.addWidget(button)
-            button.clicked.connect(slot)
-        layout.addLayout(row)
+        self.new_button.setParent(self); self.new_button.hide(); self.new_button.clicked.connect(self.new_note)
+        self.new_folder_button.setParent(self); self.new_folder_button.hide(); self.new_folder_button.clicked.connect(self.new_folder)
         row = QHBoxLayout()
         for button, slot in ((self.add_files_button, self.add_files), (self.add_folder_button, self.add_folder)):
             row.addWidget(button)
             button.clicked.connect(slot)
+        self.create_menu = QToolButton(); self.create_menu.setText('Create note or folder')
+        self.create_menu.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(self.create_menu)
+        menu.addAction('New saved note…', self.new_note); menu.addAction('New notes folder…', self.new_folder)
+        self.create_menu.setMenu(menu); row.addWidget(self.create_menu)
+        row.addStretch()
         layout.addLayout(row)
         self.tree = QTreeWidget()
-        self.tree.setHeaderLabels(['Name', 'Kind'])
-        self.tree.setColumnCount(2)
+        self.tree.setAccessibleName('Saved notes and useful source files')
+        self.tree.setHeaderLabels(['Name', 'Kind', 'Use by Strand'])
+        self.tree.setColumnCount(3)
         self.tree.setIndentation(16)
         self.tree.header().setStretchLastSection(False)
         self.tree.header().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self.tree.header().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.tree.header().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
         self.tree.itemExpanded.connect(self._expand)
         self.tree.itemSelectionChanged.connect(self._update_controls)
         self.tree.itemDoubleClicked.connect(self._activate)
         layout.addWidget(self.tree)
         self.edit_button = QPushButton('Edit')
-        self.open_button = QPushButton('Open')
+        self.open_button = QPushButton('Open in usual app')
         self.show_button = QPushButton('Show in folder')
         row = QHBoxLayout()
         for button, slot in ((self.edit_button, self.edit_selected), (self.open_button, self.open_selected), (self.show_button, self.show_selected)):
             row.addWidget(button)
             button.clicked.connect(slot)
         layout.addLayout(row)
-        self.manage_button = QPushButton('Files, saved drafts & history…')
+        self.manage_button = QPushButton('Note settings, drafts and history…')
         self.manage_button.clicked.connect(self.manage_files)
         layout.addWidget(self.manage_button)
-        self.remove_button = QPushButton('Remove attachment')
+        self.remove_button = QPushButton('Remove source')
         self.remove_button.setToolTip('Remove the selected attachment. Its original file or folder stays on disk.')
         self.refresh_button = QPushButton('Refresh')
         row = QHBoxLayout()
@@ -218,9 +222,10 @@ class ProjectFilesPanel(QWidget):
         ready = self._ready()
         for button in (self.new_button, self.new_folder_button, self.refresh_button, self.manage_button):
             button.setEnabled(ready)
-        self.add_files_button.setEnabled(ready and self.project_id is not None)
-        self.add_folder_button.setEnabled(ready and self.project_id is not None)
-        self.tree.setEnabled(ready)
+        self.create_menu.setEnabled(ready)
+        self.add_files_button.setEnabled(ready)
+        self.add_folder_button.setEnabled(ready)
+        self.tree.setEnabled(True)
         selected = self._selected() or {}
         path = Path(selected['path']) if selected.get('path') else None
         exists = path is not None and path.exists()
@@ -229,9 +234,12 @@ class ProjectFilesPanel(QWidget):
             or not path.suffix and not selected.get('managed'))
         editable = exists and selected.get('kind') == 'File' and supported
         self.edit_button.setEnabled(bool(ready and editable))
-        self.open_button.setEnabled(bool(ready and exists))
-        self.show_button.setEnabled(bool(ready and path is not None and path.parent.is_dir()))
+        self.open_button.setEnabled(bool(exists))
+        self.show_button.setEnabled(bool(path is not None and path.parent.is_dir()))
         self.remove_button.setEnabled(bool(ready and selected.get('attachment')))
+        if selected:
+            self.status_label.setText(str(path) + '\n' + ('Shared across workspaces' if selected.get('project_id') is None else 'Focus for this workspace') +
+                (' · Included automatically when local reading is on.' if selected.get('always_active') else ' · Available for retrieval; visibility does not mean Strand has read it.'))
 
     def _item(self, path, parent, *, attachment=False, label=None):
         path = Path(path)
@@ -248,12 +256,12 @@ class ProjectFilesPanel(QWidget):
                 kind = 'Other'
         except OSError:
             kind = 'Unavailable'
-        item = QTreeWidgetItem(parent, [label or path.name or str(path), kind])
+        item = QTreeWidgetItem(parent, [label or path.name or str(path), kind, 'Unavailable' if kind in ('Missing', 'Unavailable', 'Missing link') else 'Available'])
         folder = kind == 'Folder'
         fallback = self.style().standardIcon(QStyle.StandardPixmap.SP_DirIcon if folder else QStyle.StandardPixmap.SP_FileIcon)
         item.setIcon(0, QIcon.fromTheme('folder' if folder else 'text-x-generic', fallback))
         item.setToolTip(0, str(path))
-        item.setData(0, Qt.ItemDataRole.UserRole, {'path': str(path), 'kind': kind, 'attachment': attachment, 'loaded': False})
+        item.setData(0, Qt.ItemDataRole.UserRole, {'path': str(path), 'kind': kind, 'attachment': attachment, 'loaded': False, 'project_id': self.project_id})
         if kind == 'Folder':
             item.setChildIndicatorPolicy(QTreeWidgetItem.ChildIndicatorPolicy.ShowIndicator)
         return item
@@ -272,8 +280,9 @@ class ProjectFilesPanel(QWidget):
             item = self._item(root / relative, parents.get('' if ancestor == '.' else ancestor, parent))
             data = item.data(0, Qt.ItemDataRole.UserRole)
             data.update(managed=True, project_id=project_id, relative_path=relative, loaded=True,
-                        kind=entry['kind'].capitalize())
+                        kind=entry['kind'].capitalize(), always_active=entry.get('always_active', False))
             item.setText(1, data['kind'])
+            item.setText(2, 'Automatic' if entry.get('always_active') else 'Available')
             item.setData(0, Qt.ItemDataRole.UserRole, data)
             parents[relative] = item
         parent.setExpanded(True)
@@ -288,15 +297,19 @@ class ProjectFilesPanel(QWidget):
             except (OSError, ValueError, RuntimeError) as error:
                 self.status_label.setText(f'Current Context could not be imported: {error}\nRefresh to retry.')
             try:
-                self._managed_tree(self.project_id, 'Project folder')
+                self._managed_tree(self.project_id, 'Workspace notes')
             except (OSError, ValueError, RuntimeError) as error:
                 self.status_label.setText(f'Project folder unavailable: {error}')
         try:
-            self._managed_tree(None, 'Shared files')
+            self._managed_tree(None, 'Shared notes · Strand')
         except (OSError, ValueError, RuntimeError) as error:
             self.status_label.setText(f'Shared files unavailable: {error}')
         for path in self.store.links(self.project_id) if self.project_id else []:
             self._item(path, self.tree, attachment=True)
+        for path in self.store.setting('source_roots', []):
+            item = self._item(path, self.tree, attachment=True)
+            data = item.data(0, Qt.ItemDataRole.UserRole); data['project_id'] = None
+            item.setData(0, Qt.ItemDataRole.UserRole, data)
         if selected:
             self._select_path(selected['path'])
         self._update_controls()
@@ -326,7 +339,10 @@ class ProjectFilesPanel(QWidget):
             with os.scandir(path) as entries:
                 children = list(islice(entries, 301))
             for child in sorted(children[:300], key=lambda entry: entry.name.casefold()):
-                self._item(Path(child.path), item)
+                node = self._item(Path(child.path), item)
+                child_data = node.data(0, Qt.ItemDataRole.UserRole)
+                child_data['project_id'] = data.get('project_id')
+                node.setData(0, Qt.ItemDataRole.UserRole, child_data)
             if len(children) > 300:
                 hint = QTreeWidgetItem(item, ['Showing first 300 entries; open folder for all', ''])
                 hint.setFlags(Qt.ItemFlag.NoItemFlags)
@@ -390,25 +406,36 @@ class ProjectFilesPanel(QWidget):
         self.refresh()
 
     def add_files(self):
-        if not self._ready() or self.project_id is None:
+        if not self._ready():
             return
-        paths, _ = QFileDialog.getOpenFileNames(self, 'Add files to project')
+        paths, _ = QFileDialog.getOpenFileNames(self, 'Add useful sources to ' + ('this workspace' if self.project_id else 'Strand’s shared sources'))
         for path in paths:
-            self.store.link(self.project_id, path)
+            self.add_source(path)
         self.refresh()
 
     def add_folder(self):
-        if not self._ready() or self.project_id is None:
+        if not self._ready():
             return
-        path = QFileDialog.getExistingDirectory(self, 'Add folder to project')
+        path = QFileDialog.getExistingDirectory(self, 'Choose a useful source folder')
         if path:
-            self.store.link(self.project_id, path)
+            self.add_source(path)
             self.refresh()
+
+    def add_source(self, path):
+        if self.project_id:
+            self.store.link(self.project_id, path)
+        else:
+            roots = self.store.setting('source_roots', [])
+            path = str(Path(path).expanduser().absolute())
+            if path not in roots: self.store.set_setting('source_roots', roots + [path])
 
     def remove_selected(self):
         selected = self._selected()
         if self._ready() and selected and selected['attachment']:
-            self.store.unlink(self.project_id, selected['path'])
+            if selected.get('project_id'):
+                self.store.unlink(selected['project_id'], selected['path'])
+            else:
+                self.store.set_setting('source_roots', [p for p in self.store.setting('source_roots', []) if p != selected['path']])
             self.refresh()
 
     def _edit_path(self, path):
@@ -436,9 +463,9 @@ class ProjectFilesPanel(QWidget):
             self.status_label.setText(f'Could not open {path} in its usual application.')
 
     def open_selected(self):
-        if self._ready() and self.open_button.isEnabled():
+        if self.open_button.isEnabled():
             self._open_path(Path(self._selected()['path']))
 
     def show_selected(self):
-        if self._ready() and self.show_button.isEnabled():
+        if self.show_button.isEnabled():
             self._open_path(Path(self._selected()['path']).parent)

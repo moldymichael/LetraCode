@@ -74,7 +74,7 @@ def test_invalid_resume_cursor_never_generates(tmp_path, cursor):
     assert 'cursor' in store.messages(chat)[-1]['content']
 
 
-def test_nonadjacent_plan_is_preserved_or_explicitly_too_large(tmp_path):
+def test_paused_nonadjacent_plan_is_preserved_or_explicitly_too_large(tmp_path):
     store = Store(tmp_path / 'data'); chat = store.create_chat('Earlier plan')
     store.add_message(chat, 'user', 'Propose alternatives.')
     plan = 'REQUIRED-OPTION-B: preserve old versions. ' + 'details ' * 1000
@@ -82,6 +82,8 @@ def test_nonadjacent_plan_is_preserved_or_explicitly_too_large(tmp_path):
     store.add_message(chat, 'user', 'Are you ready?')
     store.add_message(chat, 'assistant', 'Yes, ready.')
     store.add_message(chat, 'user', 'Use option B.')
+    ConversationWorker(store, chat, CountingEngine()).pause('action_round_limit', 'Paused', 10)
+    store.add_message(chat, 'user', 'Continue.')
     with pytest.raises(ContextOverflowError, match='referenced context'):
         conversation_messages(store.messages(chat), 'System', 1500)
     messages, _ = conversation_messages(store.messages(chat), 'System', 16000)

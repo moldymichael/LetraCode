@@ -167,22 +167,22 @@ class MemoryDialog(QDialog):
         self.state = None
         self.selected_snapshot = None
         self.items = {}
-        self.setWindowTitle('Files, saved drafts & history — LetraCode')
+        self.setWindowTitle('Saved notes, drafts and history — LetraCode')
         self.resize(760, 560) if editor_only else self.resize(960, 680)
         if editor_only:
             self.setWindowTitle('Edit file — LetraCode')
         layout = QVBoxLayout(self)
         note = QLabel('Organize ordinary Markdown and text files in your own folders. '
-            'Only files marked always active are automatically included; other files can be listed, searched and read when relevant. '
+            'When local reading is on, Automatic notes are included in chats; other notes can be found and read when relevant. '
             'Use Save file to apply edits. Navigation and Close keep unsaved drafts separately.')
         note.setWordWrap(True); layout.addWidget(note)
-        self.scope = QComboBox(); self.scope.addItem('Shared files', None)
+        self.scope = QComboBox(); self.scope.addItem('Shared notes · all workspaces', None)
         if project_id:
-            self.scope.addItem('Project files', project_id)
+            self.scope.addItem('Workspace notes', project_id)
         layout.addWidget(self.scope)
         splitter = QSplitter(); layout.addWidget(splitter, 1)
         self.browser = browser = QWidget(); left = QVBoxLayout(browser); left.setContentsMargins(0, 0, 8, 0)
-        self.tree = QTreeWidget(); self.tree.setHeaderLabels(['File', 'Active'])
+        self.tree = QTreeWidget(); self.tree.setHeaderLabels(['File', 'Use by Strand']); self.tree.setAccessibleName('Saved notes and inclusion settings')
         self.tree.setColumnWidth(0, 240); left.addWidget(self.tree, 1)
         for label, callback in [('New folder…', self.create_folder), ('New note…', self.create_file),
                                 ('Rename / move…', self.move_selected), ('Delete…', self.delete_selected),
@@ -194,9 +194,9 @@ class MemoryDialog(QDialog):
         self.path_label.setWordWrap(True)
         self.path_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         right.addWidget(self.path_label)
-        self.editor = QPlainTextEdit(); right.addWidget(self.editor, 1)
-        self.always_active = QCheckBox('Always include this file in context')
-        self.always_active.setToolTip('Save file applies this choice. Project files are included only in that project.')
+        self.editor = QPlainTextEdit(); self.editor.setAccessibleName('Note contents'); right.addWidget(self.editor, 1)
+        self.always_active = QCheckBox('Include automatically when local reading is on')
+        self.always_active.setToolTip('Save file applies this choice. Workspace notes are included only in that workspace; shared notes follow you.')
         right.addWidget(self.always_active)
         row = QHBoxLayout()
         self.save_button = QPushButton('Save file'); self.save_button.clicked.connect(self.save_current); row.addWidget(self.save_button)
@@ -209,14 +209,14 @@ class MemoryDialog(QDialog):
         splitter.addWidget(pane); splitter.setSizes([300, 640])
         self.message = QLabel(); self.message.setTextFormat(Qt.TextFormat.PlainText)
         self.message.setWordWrap(True); layout.addWidget(self.message)
-        self.learning_grant = QCheckBox('Allow appends without review to the original learning file only')
+        self.learning_grant = QCheckBox('Allow automatic additions to the saved learning note (not model training)')
         self.learning_grant.setChecked(store.setting('strand_learning_grant', False) is True)
-        self.learning_grant.setToolTip('Only the existing learning-file grant. Other memory writes require review; saved changes retain Undo.')
+        self.learning_grant.setToolTip('An explicit exception for this one existing note. Other note writes require approval. Additions are saved information, not model training, and retain Undo.')
         self.learning_grant.toggled.connect(lambda enabled: store.set_setting('strand_learning_grant', enabled))
         layout.addWidget(self.learning_grant)
         self.detail_widgets = (note, self.scope, self.browser, self.always_active,
                                self.history, self.undo_button, self.learning_grant)
-        self.details_toggle = QPushButton('History & file settings…')
+        self.details_toggle = QPushButton('History and note settings…')
         self.details_toggle.setCheckable(True)
         self.details_toggle.setVisible(editor_only)
         self.details_toggle.toggled.connect(self.set_details_visible)
@@ -232,7 +232,7 @@ class MemoryDialog(QDialog):
     def set_details_visible(self, visible):
         for widget in self.detail_widgets:
             widget.setVisible(visible)
-        self.details_toggle.setText('Hide history & file settings' if visible else 'History & file settings…')
+        self.details_toggle.setText('Hide history and note settings' if visible else 'History and note settings…')
 
     @property
     def project_id(self):
@@ -313,7 +313,7 @@ class MemoryDialog(QDialog):
             for entry in sorted(entries, key=lambda row: (row['path'].count('/'), row['path'].casefold())):
                 path = entry['path']; parent = str(PurePosixPath(path).parent)
                 label = PurePosixPath(path).name + (' (missing; draft kept)' if entry.get('missing_draft') else '')
-                item = QTreeWidgetItem([label, 'Always' if entry.get('always_active') else ''])
+                item = QTreeWidgetItem([label, 'Automatic' if entry.get('always_active') else 'Available'])
                 item.setData(0, Qt.ItemDataRole.UserRole, path)
                 item.setData(0, Qt.ItemDataRole.UserRole + 1, entry['kind'])
                 if parent in self.items:

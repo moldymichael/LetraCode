@@ -1,5 +1,17 @@
 # Current implementation state
 
+The **0.6.0 Strand experience** reworks the installed 0.5.0 Gemma lineage into
+Chat, Knowledge, Improve and Settings. Workspaces focus one persistent Strand.
+It adds account-wide explicit file reads with independent action controls,
+private request receipts, usable long-history/task recovery, navigation and
+saved drafting during jobs, guided preparation, recoverable conversion, and
+Chat-runtime comparison with explicit version judgments and rollback. The
+SQLite schema and ordinary-file recovery formats are retained. See the
+[current user guide and verification](STRAND-EXPERIENCE.md). The live installation
+is not automatically replaced by source development.
+
+## Earlier implementation milestones
+
 The **0.5.0 QLoRA update** adds explicit CUDA 4-bit NF4 training with double
 quantization, all-linear adapters, gradient checkpointing and token-weighted
 accumulation. New training setup recommends QLoRA; existing full-precision runs

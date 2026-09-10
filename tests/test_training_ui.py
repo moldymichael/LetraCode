@@ -11,7 +11,7 @@ def test_separate_fine_tuning_workspace_reviews_examples_and_persists(tmp_path):
     app = QApplication.instance() or QApplication([])
     store = Store(tmp_path / 'data')
     window = MainWindow(store)
-    assert [window.workspaces.tabText(i) for i in range(window.workspaces.count())] == ['Chat', 'Fine-Tuning']
+    assert [window.workspaces.tabText(i) for i in range(window.workspaces.count())] == ['Chat', 'Knowledge', 'Improve', 'Settings']
     panel = window.training_panel
     panel.prompt.setPlainText('How should this answer be written?')
     panel.response.setPlainText('A reviewed, desired answer.')

@@ -690,11 +690,11 @@ def test_worker_exposes_saved_reads_when_computer_and_web_are_disabled(tmp_path)
     class Offline(ScriptedEngine):
         def complete(self,messages,tools,*args,**kwargs):
             names={tool['function']['name'] for tool in tools}
-            assert names=={'read_tool_result','read_memory','list_tool_results','list_memory','search_memory'}
+            assert names=={'read_tool_result','list_tool_results','search_history'}
             return {'role':'assistant','content':'Offline history available.'}
     store=Store(tmp_path/'data');chat=store.create_chat('Offline')
     store.add_message(chat,'user','Review saved evidence')
-    ConversationWorker(store,chat,Offline(),computer_enabled=False,web_enabled=False).run()
+    ConversationWorker(store,chat,Offline(),computer_enabled=False,web_enabled=False,actions_enabled=False).run()
     assert store.messages(chat)[-1]['content']=='Offline history available.'
 
 
@@ -727,7 +727,7 @@ def test_saved_result_pages_remain_retrievable_after_source_changes_and_compacti
     source.unlink()
     store.add_message(chat,'user',f'Read saved result {source_id}.')
     engine=SavedReader()
-    ConversationWorker(store,chat,engine,computer_enabled=False,web_enabled=False).run()
+    ConversationWorker(store,chat,engine,computer_enabled=False,web_enabled=False,actions_enabled=False).run()
     assert engine.seen==original
     assert not source.exists()
     assert store.messages(chat)[-1]['content']=='Read the saved command output.'

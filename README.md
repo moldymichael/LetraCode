@@ -1,258 +1,144 @@
 # LetraCode
 
-LetraCode is a private desktop chat app for a local AI model. It runs on Windows
-10/11 x64 and Fedora KDE, uses native Qt windows, and keeps conversations on your
-computer. There is no cloud inference, account, or telemetry.
+LetraCode is the home of **Strand**, one persistent, general-purpose local
+assistant for writing, learning, files and ongoing projects. It uses native Qt
+on Fedora KDE and Windows. Conversations, notes, model inference and training
+stay on your computer. There is no account, telemetry or cloud inference.
 
-For the development baseline, current capabilities and verification boundaries,
-see [Current implementation state](docs/CURRENT-STATE.md).
+This checkout is **0.6.0**, the Strand experience redesign, based on the installed
+0.5.0 Gemma work. It preserves existing data, guarded file editing, approvals,
+training artifacts and model rollback. See the [user guide and verification
+record](docs/STRAND-EXPERIENCE.md), [design](docs/superpowers/specs/2026-09-10-strand-experience.md)
+and [development history](docs/CURRENT-STATE.md). Older public downloads do not
+include these changes; build this checkout for the current application.
 
-## Fine-Tuning and visible thinking (0.5.0 source build)
+## Start with Strand
 
-Open **Fine-Tuning** to write or import examples, review training and held-out
-evaluation sets, run local 4-bit QLoRA or full-precision LoRA training, compare results, and adopt or roll back
-a model version. **Learn from reply…** creates an editable draft from chat.
-Training uses a separate Python environment and original, unquantized text-only
-Llama weights; a GGUF inference file alone cannot be trained. Models in other
-architectures remain usable for chat but are not supported by this trainer.
-QLoRA uses NVIDIA CUDA, NF4 double quantization, gradient checkpointing and
-accumulated batches to reduce training memory. Evaluation remains necessary to
-establish whether a candidate gives better answers.
-See [Fine-Tuning setup and workflow](docs/FINE-TUNING.md).
+1. Open **Settings → Choose or change model**. Choose a local `llama-server`
+   program and a GGUF chat model. Existing settings are retained. **Find local
+   models** checks common folders; Browse can select a model anywhere.
+2. Leave Advanced settings at their defaults if unsure. **Test local reply**
+   checks loading and a real reply without changing saved chats. It does not
+   certify answer quality or tool support.
+3. Open **Chat**, type a question and press Ctrl+Enter. Enter makes a new line.
+   Your draft saves automatically. Read other chats and prepare your next
+   message while Strand works; one model job runs at a time.
 
-Choose **Thinking** in regular chat to request reasoning from compatible local
-models. Emitted thinking streams in its own block; use **Show thinking** or
-**Hide thinking** to expand or collapse it. Saved thinking survives reopening
-and stays separate from the answer, Copy last reply, and future chat context.
-Models that do not emit reasoning continue to show their ordinary answers.
+**Workspaces** focus the same Strand on particular work. They are optional.
+Shared notes remain available across workspaces; workspace notes and instructions
+supply the current focus. Conversations and saved knowledge are not model training.
 
-This source tree is version **0.5.0**, based on the current 0.3.0 Strand app.
-The 0.3.0 downloads linked below predate these additions. Build this checkout
-with `python3 packaging/build-release.py` for 0.5.0 source/Fedora archives;
-the GitHub workflow also builds native Windows installer and portable artifacts.
+## Four places, four purposes
 
-## Two-model conversations
+- **Chat:** everyday work, saved conversations, per-reply Copy/Create example,
+  and **Used for this reply** receipts. Conversation options contain advanced
+  tool compatibility and optional bounded two-model exchanges. **Ask again**
+  repeats the question as a new turn and keeps the previous answer.
+- **Knowledge:** see saved notes and useful source files. **Automatic** notes
+  are included when local reading is enabled; **Available** files can be found
+  and read when relevant. Originals stay in their current folders and open in
+  Dolphin, Obsidian or their usual application. Note settings provide explicit
+  saves, retained drafts, history and Undo.
+- **Improve:** create and approve self-contained examples; check preparation;
+  train a candidate; compare every held-out question in the actual Chat runtime;
+  save your judgment; choose a version or return to the previous one.
+- **Settings:** model readiness and testing, permission explanations,
+  LetraCode source-checkout selection, data location, backup and diagnostics.
 
-In **Model Setup**, select two different local GGUF files, then choose **Two
-models** above the conversation. This uses the [llama.cpp multi-model router](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md#using-multiple-models)
-and requires a current compatible `llama-server`. Single model mode still works
-with older compatible engines. Both models use the shared inference settings;
-allow enough memory for both weights and context buffers.
+## Reading and action permissions
 
-Choose the next speaker and 1–4 total replies (default 2). Each model sees the
-preceding reply and can respond to it. The exchange always pauses at the selected
-limit. **Continue exchange** explicitly starts another bounded exchange without
-repeating your message. Send or clear your draft before continuing. **Stop**
-cancels the exchange; use **Unload model from memory** while idle to release
-both models. Reopening a chat never starts an exchange automatically.
+**Read local files** allows Strand to read supported ordinary files anywhere
+your operating-system account can read, including hidden paths. Selected sources
+prioritize relevance; they are not an access boundary. Turning this off excludes
+automatic note/source text and file-reading tools. Saved conversation text and
+workspace instructions remain available.
 
-Two-model mode has no Actions or Internet tools. Computer still gates optional
-linked source excerpts; explicitly always-active Memory retains the current app's
-context behavior. Required user intent, referenced plans, and the latest reply
-stay intact. Older optional dialogue copies can be omitted, with a visible notice;
-if required context cannot fit, start a new chat with the complete shorter request.
-Runtime token accounting uses the selected model, and requests have an additional
-24,000-byte transcript limit. Full messages remain saved with their original
-speaker labels in chat, Markdown, backups and evaluation exports.
+**Edits & commands** allows proposals for changes, with exact approval previews,
+conflict checks and retained previous bytes. Commands require a separate
+acknowledgment and run with your account, including network authority. A legacy
+grant for automatic additions to one saved learning note remains explicit in
+Note settings; it is saved information, not model training.
 
-Two-model router presets cannot represent paths with `#`, `;`, line breaks or
-trailing whitespace; choose another local path if needed. Model downloads and
-newer engine binaries remain separate setup steps.
+**Web research** asks before every outgoing query or URL. Turning it off disables
+web tools; it does not sandbox separately approved shell commands. **Model tools**,
+in Conversation options, is a compatibility setting for models without tool use.
 
-Fine-Tuning and thinking remain available alongside two-model conversations.
-An adopted LoRA adapter applies to Model A; Model B keeps its own base weights.
-Thinking is saved and displayed separately for each speaker that emits it.
+The reply receipt shows recorded request contents, source excerpts, permissions
+and limits. “Available,” “retrieved,” “included” and “understood” are different
+things. Old replies without receipts remain readable and are labeled honestly.
 
-## Evaluation export and Memory folders
+## Improving Strand
 
-**File → Export Evaluation…** saves the selected conversation as a portable ZIP
-with a readable transcript, ordered action/evidence records, recorded run
-settings, optional notes, and an explanatory README. Private source/Memory tool
-bodies are replaced by hashes and omission markers. Review conversation prose
-and notes before sharing; free-text secrets cannot all be detected automatically.
-An evaluation bundle is not a restorable backup.
+Use **Create example** on a reply, or write one in Improve. Make the question
+understandable on its own; correct the desired answer and remove irrelevant
+background. Captured earlier dialogue is editable, and files/tool output are not
+silently copied. Keep different questions for comparison. Only approved teaching
+examples go into optimization; comparison examples are held out.
 
-**Project files** puts your notes, folders and linked originals in one visible
-tree. Create notes and folders, attach existing files, or open them in your usual
-application. Text edits use explicit Save; external changes are checked before
-saving, and unsaved drafts and saved-change history remain recoverable.
-Project instructions live in a separate optional dialog.
+LetraCode checks preparation before unloading Chat, reuses saved local training
+configuration, and can prepare the supported matching Gemma model. Numeric
+settings remain available under preparation details. If conversion fails after
+training, retry it from the retained adapter. Comparison uses the Chat runtime
+and settings, saves complete or partial answers, and does not automatically adopt.
+A lower training loss is not proof of useful improvement. Record regressions,
+uncertain outcomes and your own judgment before choosing a version.
 
-Existing Memory files stay in place. The former Current Context field is copied
-once to `Current Context.md`, preserving the original database value for recovery.
-A name collision gets a separate legacy filename. These notes become ordinary
-files available to the assistant's file tools. Existing always-active choices
-remain unchanged; advanced file settings and history remain accessible.
+Supported optimization remains local LoRA/QLoRA for text-only Llama and the
+supported Gemma 4 E2B/E4B path. Training requires original compatible weights and
+local training/conversion dependencies; an arbitrary GGUF alone cannot be
+trained. No model or package is downloaded automatically. Generic Llama pairing
+has less provenance assurance than app-prepared Gemma pairing. See the
+[training guide](docs/FINE-TUNING.md) and [Gemma record](docs/GEMMA4.md).
 
-Existing Strand files and their hidden recovery/history data migrate to `Memory`;
-your Strand identity remains your own configuration. Read the [migration and
-pre-install checks](docs/EVALUATION-MEMORY.md) before upgrading an existing data
-folder. Version 0.3.0 includes native Windows filesystem and process support while
-retaining the current Project files interface, schema-3 data and recovery history.
+## Install or build
 
-## Install on Windows 10/11 (64-bit)
-
-Windows 10 version 1809 or newer, or Windows 11, is required.
-The repository and downloads are private; sign in to a GitHub account with
-repository access to download the release.
-
-1. Open the [LetraCode 0.3.0 downloads](https://github.com/moldymichael/LetraCode/releases/tag/v0.3.0).
-2. Download **LetraCode-0.3.0-windows-x64-setup.exe** and double-click it.
-3. Follow the installer, then open **LetraCode** from the Start menu.
-
-Python, Qt/PySide6 and PDF support are included. You do not need to install
-Python, use a terminal, or enter an administrator password. The app installs
-for your Windows account. Windows may show an **Unknown publisher** or
-SmartScreen prompt because this release is unsigned; check that the download
-came from the release page above before continuing.
-
-For a portable copy, download **LetraCode-0.3.0-windows-x64-portable.zip**,
-right-click it and choose **Extract All**, then open **LetraCode.exe** inside
-the extracted folder. Keep its `_internal` folder alongside the executable.
-The portable copy saves data in the same per-user location as the installer;
-it does not put chats on a USB drive automatically.
-
-Close LetraCode before updating. Run the new setup file to update; your chats,
-settings, Project files and recovery history stay in place. To remove the app,
-open Windows **Settings → Apps → Installed apps → LetraCode → Uninstall**.
-On Windows 10, use **Apps & features**. Your data remains available for reinstall.
-
-## Install on Fedora KDE
-
-1. Download `LetraCode-0.3.0.run`.
-2. Open Dolphin, go to Downloads, right-click an empty area, and choose
-   **Open Terminal Here** (Konsole).
-3. Run:
-
-   ```bash
-   chmod +x LetraCode-0.3.0.run
-   ./LetraCode-0.3.0.run
-   ```
-
-The installer shows the Fedora packages it needs, then uses `sudo dnf install`.
-It installs only for your user. Start **LetraCode** from KDE's application
-launcher, or run `~/.local/bin/letracode` in Konsole.
-
-If you downloaded the source archive instead, extract it, open Konsole in the
-extracted `LetraCode-0.3.0` folder, and run `./install.sh`.
-
-Version 0.1.1 fixes the Fedora 44 installation failure caused by the unavailable
-`python3-docx` package. It requires only `python3`, `python3-pyside6`, and
-`python3-pypdf` from Fedora. DOCX paragraph and table text is read by the app
-using Python's standard library, so no pip installation is needed. If 0.1.0
-stopped with that dependency error, run this installer normally; no cleanup
-or dependency-skipping option is needed. Existing chats and projects are kept.
-
-## First chat
-
-LetraCode needs two local files that are distributed separately from the app:
-
-- a `llama-server` executable from [llama.cpp](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
-- an instruction/chat model in GGUF format
-
-On Windows, open the official [llama.cpp releases](https://github.com/ggml-org/llama.cpp/releases)
-and download a **Windows x64 CPU** build to start. Extract its entire ZIP to a
-permanent folder, keeping `llama-server.exe` together with the included DLLs.
-Open LetraCode, choose **Model setup**, select that `llama-server.exe` and your
-`.gguf` file, and save. A GPU build is optional; choose one that supports your
-hardware and drivers once CPU mode works.
-
-On Fedora, install a provided engine with `sudo dnf install llama-cpp` when that
-package is available for your Fedora release, or choose a compatible local
-llama.cpp build. Select its `llama-server` executable and your `.gguf` file in
-**Model setup**. Model weights can be several gigabytes and are not included. Pick a model whose publisher documents
-the RAM, license, and llama.cpp compatibility you need.
-
-Create a project, link only the files or folders you want the conversation to
-use, and start chatting. LetraCode previews commands and sensitive file or web
-access. Read each request and choose **Approve once** only when the proposed
-action is correct.
-
-The system `llama-cpp` package can lag models that use a new architecture or
-chat template. GPU offload also requires a llama.cpp build compatible with your
-GPU and driver; begin with **GPU layers** set to 0 if unsure.
-
-## Data, backup, and removal
-
-On Windows, chats, settings and app-managed Project files live in
-`%LOCALAPPDATA%\letracode`. Paste that path into File Explorer's address bar
-to open it. The default application installation is separate, in
-`%LOCALAPPDATA%\Programs\LetraCode`.
-
-On Fedora, chats and settings live in `${XDG_DATA_HOME:-~/.local/share}/letracode`.
-Installed application files live separately in
-`${XDG_DATA_HOME:-~/.local/share}/letracode-app`, so updates and uninstall do not
-delete your conversations.
-
-Choose **File → Back up chats, Memory and source backups** while the app is open. Save the
-snapshot ZIP to your backup drive. It contains a SQLite snapshot, human-readable JSON, Memory files and retained
-recovery history, app-owned pre-edit source backups, and a restore guide.
-Linked originals, model weights, logs and migration snapshots are excluded.
-See the consistency boundary in [the reliability report](docs/RELIABILITY-VERIFICATION.md). To remove the application while
-retaining its data folder, run:
+From this source checkout on Fedora KDE:
 
 ```bash
-"${XDG_DATA_HOME:-$HOME/.local/share}/letracode-app/uninstall.sh"
+./install.sh
 ```
 
-To reinstall or update, run the new `.run` installer in the same way as the
-first installation.
+The installer explains its distribution dependencies and requests `sudo` for
+those packages. It installs LetraCode for your user and keeps application files
+separate from your data. A compatible local `llama-server` and model weights are
+separate; use the instructions in Model setup and the engine/model publisher’s
+requirements. GPU support depends on the engine build and driver.
 
-## Developer and RPM packaging
-
-`./install.sh --no-deps` skips `dnf` only for a development/test system where
-Python 3.11+, PySide6, and pypdf are already installed. Set
-`LETRACODE_PYTHON` explicitly to test with a chosen interpreter. Fedora uses its
-system Qt packages.
-
-Windows source development requires native Python 3.11 or newer. From the
-source directory, run `python -m pip install .` and `python -m letracode`.
-The downloadable setup executable is the normal installation path.
-
-Build the Fedora `.run` and reproducible source `.tar.gz`/`.zip` archives with:
+Build source and Fedora self-extracting archives:
 
 ```bash
 python3 packaging/build-release.py
 ```
 
-To build Windows downloads, use native Windows x64 Python 3.13 and
-[Inno Setup 6](https://jrsoftware.org/isinfo.php):
+Run the resulting `.run` from Konsole, or build native Windows artifacts using
+the included workflow/build scripts. Windows packaging details are in the
+[Windows release guide](docs/WINDOWS-RELEASE.md). Development systems with the
+required packages already installed may use `./install.sh --no-deps`.
 
-```powershell
-python -m pip install -r packaging/windows-requirements.txt .
-python packaging/build-windows.py
+## Ownership and recovery
+
+On Linux data lives in `${XDG_DATA_HOME:-~/.local/share}/letracode`; installed app
+files live separately in `letracode-app`. On Windows data uses the account’s
+LocalAppData LetraCode directory. **Settings → Back up LetraCode** creates a
+restorable snapshot with a guide. Keep separate backups of linked originals and
+large training/model artifacts. Export Evaluation makes a privacy-filtered
+review bundle, not a restorable backup; inspect its conversation prose before
+sharing. Automatic request receipts are private and excluded from that export.
+
+Stopping keeps saved output. A paused task offers **Start a fresh task in this
+chat**, retaining history and unknown-action records without replaying effects.
+Long chats display recent messages with **Load earlier messages** and search;
+model context remains bounded, with reduction reported in receipts.
+
+Uninstalling retains the data folder. The [historical README](docs/README-0.5.0.md)
+and dated verification records preserve earlier development findings.
+
+## Development checks
+
+```bash
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q
+python3 -m compileall -q letracode
+python3 packaging/build-release.py
 ```
 
-The build creates a setup executable, portable ZIP and SHA-256 checksums in
-`dist`. Its Python/Qt dependencies are bundled; llama.cpp and model weights are
-separate. The [Windows and Fedora workflow](https://github.com/moldymichael/LetraCode/actions/workflows/windows-and-fedora.yml)
-runs source tests on Windows Python 3.11, 3.13 and 3.14, builds the downloads,
-and checks actual native-window startup, reinstall/update, uninstall and data
-retention on a clean Windows account. It saves desktop screenshots and the
-lifecycle report with its artifacts. **Run workflow** can validate a release
-branch before publishing downloads.
-
-On Fedora, install `rpm-build` and run `packaging/build-rpm.sh` to build the
-included spec. See Fedora's [RPM packaging
-guidelines](https://docs.fedoraproject.org/en-US/packaging-guidelines/),
-[Qt for Python documentation](https://doc.qt.io/qtforpython-6/), and the
-[llama.cpp server documentation](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
-for upstream details.
-
-## License
-
-LetraCode is available under the MIT License. See `LICENSE`.
-
-## Gemma 4 fine-tuning
-
-The Fine-Tuning area supports text adaptation of original **Gemma 4 E2B-it**
-and **E4B-it** safetensors using CUDA NF4 QLoRA, with frozen per-layer embeddings
-in system RAM. Select a Gemma profile for conservative starting settings.
-The existing Llama workflow remains available. Gemma training requires a newer
-separate training environment; see `packaging/gemma-training-requirements.txt`.
-
-Create the matching Chat GGUF from the same original checkpoint using
-`tools/prepare-gemma-chat.py`; its hash-linked manifest is checked during
-training and adoption. A downloaded QAT GGUF is not a training checkpoint and
-cannot substitute for this pair. See [Gemma setup and measured verification](docs/GEMMA4.md)
-for exact sources, commands, hardware limits, and the real-run results.
+License: [MIT](LICENSE).

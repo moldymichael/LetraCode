@@ -275,9 +275,11 @@ def test_ordinary_completion_claim_never_becomes_verified_task_status(tmp_path):
     window = MainWindow(store)
     try:
         window.select_chat(chat)
-        for visible in (window.transcript.toPlainText(), store.export_markdown(chat)):
-            assert 'Response saved · Task outcome unverified' in visible
-            assert 'The task is complete and fully verified.' in visible
+        assert 'Used for this reply' in window.transcript.toPlainText()
+        assert 'Response saved · Task outcome unverified' in store.export_markdown(chat)
+        assert 'The task is complete and fully verified.' in window.transcript.toPlainText()
+        from letracode.store import message_status
+        assert message_status(store.messages(chat)[0]) == 'Response saved · Task outcome unverified'
     finally:
         window.close()
 

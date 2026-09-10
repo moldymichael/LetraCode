@@ -86,6 +86,22 @@ def test_old_chat_has_honest_missing_run_metadata_and_no_notes(tmp_path):
     assert 'git' in metadata['application']
 
 
+def test_request_receipt_stays_private_in_evaluation_and_markdown_exports(tmp_path):
+    store = Store(tmp_path / 'data'); chat = store.create_chat('Receipt privacy')
+    store.add_message(chat, 'assistant', 'A reviewed public answer.', payload={
+        'context': {'system_text': 'PRIVATE SYSTEM RECEIPT',
+                    'memory': [{'path': '/home/private/notes.md', 'text': 'PRIVATE MEMORY RECEIPT'}],
+                    'sources': [{'path': '/home/private/source.md', 'text': 'PRIVATE SOURCE RECEIPT'}],
+                    'included_tool_results': [{'content': 'PRIVATE SAVED TOOL RECEIPT'}]}})
+    files = export(store, chat, tmp_path / 'receipt-evaluation.zip')
+    exported = ''.join(files.values()) + store.export_markdown(chat)
+    assert 'A reviewed public answer.' in exported
+    for private in ('PRIVATE SYSTEM RECEIPT', 'PRIVATE MEMORY RECEIPT', 'PRIVATE SOURCE RECEIPT',
+                    'PRIVATE SAVED TOOL RECEIPT', '/home/private'):
+        assert private not in exported
+    assert 'PRIVATE SYSTEM RECEIPT' in store.messages(chat)[0]['payload']
+
+
 def test_saved_run_configuration_is_allowlisted_and_keeps_mode(tmp_path):
     store = Store(tmp_path / 'data')
     chat = store.create_chat('Configured')

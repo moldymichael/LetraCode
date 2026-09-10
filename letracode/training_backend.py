@@ -463,12 +463,73 @@ def run_training(run_dir):
     return report
 
 
+def check_training(run_dir):
+    """Check the selected runtime and every example without loading model weights."""
+    run_dir = Path(run_dir)
+    config = json.loads((run_dir / 'config.json').read_text(encoding='utf-8'))
+    base = Path(config['base_model'])
+    architecture = validate_model_directory(base)
+    gemma = architecture.get('model_type') == 'gemma4'
+    train, evaluation = load_datasets(run_dir)
+    os.environ.update(HF_HUB_OFFLINE='1', TRANSFORMERS_OFFLINE='1', HF_HUB_DISABLE_TELEMETRY='1')
+    try:
+        import torch
+        import peft  # noqa: F401 - verify this separate environment before Chat unloads
+        import safetensors  # noqa: F401
+        from transformers import AutoTokenizer
+    except ImportError as exc:
+        raise RuntimeError('The selected training Python is missing PyTorch, Transformers, PEFT or safetensors. Use the separate training environment described in Help; examples remain saved.') from exc
+    if config.get('device') == 'cuda':
+        if not torch.cuda.is_available():
+            raise ValueError('The selected training Python cannot use CUDA. Check its PyTorch build and NVIDIA driver, or choose CPU LoRA for a supported Llama model.')
+    if config.get('training_method') == 'qlora':
+        if config.get('device') != 'cuda' or torch.cuda.get_device_capability(0)[0] < 6:
+            raise ValueError('QLoRA requires an available NVIDIA Pascal or newer CUDA GPU.')
+        try:
+            import bitsandbytes  # noqa: F401
+            import accelerate  # noqa: F401
+        except (ImportError, OSError, RuntimeError) as exc:
+            raise RuntimeError('The selected training Python needs working bitsandbytes and Accelerate packages for QLoRA.') from exc
+    if gemma:
+        if config.get('training_method') != 'qlora' or config.get('device') != 'cuda':
+            raise ValueError('Gemma 4 training uses CUDA QLoRA. Apply the Gemma starting settings in preparation details.')
+        from packaging.version import Version
+        if Version(importlib.metadata.version('transformers')) < Version('5.17.0'):
+            raise ValueError('Gemma 4 needs Transformers 5.17 or newer in the separate training environment.')
+    tokenizer = AutoTokenizer.from_pretrained(str(base), local_files_only=True, trust_remote_code=False)
+    text_config = architecture.get('text_config', {}) if gemma else architecture
+    limit = min(config['max_length'], text_config.get('max_position_embeddings', config['max_length']))
+    lengths = []
+    for split, rows in (('teaching', train), ('comparison', evaluation)):
+        for index, row in enumerate(rows):
+            try:
+                lengths.append(len(encode_example(tokenizer, row, limit, gemma=gemma)['input_ids']))
+            except ValueError as exc:
+                raise ValueError(f'{split.capitalize()} example {index + 1}: {exc}') from exc
+    converter = Path(config.get('llama_cpp_dir', '')) / 'convert_lora_to_gguf.py'
+    if not converter.is_file():
+        raise ValueError('Choose the local llama.cpp source folder containing convert_lora_to_gguf.py so the trained version can be used in Chat.')
+    checked = subprocess.run([sys.executable, str(converter), '--help'], capture_output=True,
+                             text=True, timeout=60, check=False)
+    if checked.returncode:
+        raise ValueError('The adapter converter needs dependencies in this training Python. ' + (checked.stderr or checked.stdout)[-2000:])
+    result = {'ready': True, 'max_example_tokens': max(lengths), 'training_examples': len(train),
+              'evaluation_examples': len(evaluation),
+              'summary': f'{len(train)} teaching and {len(evaluation)} comparison examples fit; longest is {max(lengths)} tokens. Runtime and converter are available. Memory capacity is confirmed only during training.'}
+    (run_dir / 'readiness.json').write_text(json.dumps(result), encoding='utf-8')
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--run-dir', required=True)
+    parser.add_argument('--check-only', action='store_true', help='Check runtime, examples and conversion without loading or optimizing weights')
     args = parser.parse_args()
     try:
-        run_training(args.run_dir)
+        if args.check_only:
+            check_training(args.run_dir)
+        else:
+            run_training(args.run_dir)
     except Exception as exc:
         message = str(exc)
         if 'out of memory' in message.lower():

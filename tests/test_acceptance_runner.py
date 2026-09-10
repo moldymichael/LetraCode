@@ -192,7 +192,7 @@ def test_unbounded_trial_is_rejected(value):
 
 
 @pytest.mark.parametrize('opt_in', [False, True])
-@pytest.mark.parametrize('blocked', ['repeated_read', 'denied_read'])
+@pytest.mark.parametrize('blocked', ['repeated_read', 'denied_write'])
 def test_production_stop_never_sends_fixture_continuation(tmp_path, monkeypatch, opt_in, blocked):
     import os
     os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
@@ -208,7 +208,8 @@ def test_production_stop_never_sends_fixture_continuation(tmp_path, monkeypatch,
         nonlocal counter
         counter += 1
         return {'role':'assistant','content':'', 'tool_calls':[{'id':f'call-{counter}',
-            'type':'function', 'function':{'name':'read_file','arguments':json.dumps({'path':path})}}]}
+            'type':'function', 'function':{'name':'read_file' if blocked == 'repeated_read' else 'write_file',
+                'arguments':json.dumps({'path':path} if blocked == 'repeated_read' else {'path':path, 'content':'Must never be written'})}}]}
     monkeypatch.setattr(LocalEngine, 'complete', scripted)
     root = Path(fixture['root'])
     runner.run_native(fixture, EngineConfig(executable='/scripted/runtime', model_path='/scripted/model.gguf'),

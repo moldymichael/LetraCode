@@ -563,13 +563,24 @@ class MemoryFiles(StrandFiles):
                                    'sha256': snapshot['sha256'], 'score': score})
         return sorted(result, key=lambda row: (-row['score'], row['path'], row['offset']))[:limit]
 
-    def core(self, project_id=None):
+    def active_context(self, project_id=None):
+        """Snapshot every selected note, including errors for missing notes.
+
+        Request construction and its receipt share these exact bytes. Directory
+        discovery must not silently drop a selected file deleted outside the app.
+        """
         meta, _ = self._metadata(); result = []
         for ident, row in meta['files'].items():
             if row.get('always_active') and not row.get('deleted') and row.get('project_id') in (None, project_id):
-                text = self.snapshot('file:' + ident, row.get('project_id'))['text']
-                result.append(f"[Always-active Memory: {row['path']}]\n{text}")
-        return '\n\n'.join(result)
+                source = self.snapshot('file:' + ident, row.get('project_id'))
+                result.append({'path': source['path'], 'relative_path': row['path'],
+                    'project_id': row.get('project_id'), 'scope': 'shared' if row.get('project_id') is None else 'workspace',
+                    'sha256': source['sha256'], 'text': source['text']})
+        return result
+
+    def core(self, project_id=None):
+        return '\n\n'.join(f"[Always-active Memory: {row['relative_path']}]\n{row['text']}"
+                           for row in self.active_context(project_id))
 
     def context(self, project_id, query, budget):
         if type(budget) is not int or budget < 0:

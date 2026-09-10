@@ -16,10 +16,10 @@ def executor(store, chat, approve=lambda _: False, **kwargs):
 
 
 def test_memory_tool_catalog_offers_user_paths_and_retrieval():
-    from letracode.tools import TOOL_SCHEMAS, SAVED_READ_TOOLS
+    from letracode.tools import TOOL_SCHEMAS, FILE_READ_TOOLS
     definitions = {tool['function']['name']: tool['function'] for tool in TOOL_SCHEMAS}
     assert {'list_memory', 'search_memory'} <= definitions.keys()
-    assert {'list_memory', 'search_memory'} <= set(SAVED_READ_TOOLS)
+    assert {'list_memory', 'search_memory'} <= set(FILE_READ_TOOLS)
     assert 'path' in definitions['read_memory']['parameters']['properties']
     assert 'path' in definitions['remember']['parameters']['properties']
 
@@ -31,7 +31,7 @@ def test_nested_memory_tools_read_search_and_list_only_current_scope(tmp_path):
     store.memory.create_file('Research/notes.md', 'The nebula contains seven stars.', project_id=a)
     store.memory.create_file('private.txt', 'Unrelated project secret', project_id=b)
     chat = store.create_chat(project_id=a)
-    tool = executor(store, chat, computer_enabled=False, web_enabled=False)
+    tool = executor(store, chat, computer_enabled=True, web_enabled=False, actions_enabled=False)
     listing = json.loads(tool.execute('list_memory', {'scope': 'project'}))
     assert any(row['path'] == 'Research/notes.md' for row in listing['entries'])
     assert 'private.txt' not in json.dumps(listing)
@@ -126,5 +126,5 @@ def test_prompt_includes_only_active_files_and_query_relevant_memory(tmp_path):
     assert 'silver saddle' not in global_context and 'Private project rule.' not in global_context
     project_context = build_context(store.project(project), [], 'hello', strand=store.memory)
     assert 'Private project rule.' in project_context
-    assert 'You are Strand' not in global_context
+    assert 'You are Strand' in global_context
     assert 'list_memory' in global_context and 'search_memory' in global_context

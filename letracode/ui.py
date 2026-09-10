@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QTabWidget, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget)
+    QVBoxLayout, QWidget, QToolButton, QSizePolicy)
 
 from . import __version__
 from .dialogs import ApprovalDialog, ModelDialog
@@ -27,6 +27,7 @@ from .memory_ui import MemoryDialog
 from .project_files import ProjectFilesPanel
 from .platform import engine_setup_help, is_windows
 from .training_ui import FineTuningPanel
+from .experience import KnowledgePanel, SettingsPanel
 
 
 def assistant_html(text, font):
@@ -51,6 +52,16 @@ class SafeBrowser(QTextBrowser):
 class Composer(QPlainTextEdit):
     submitted = Signal()
 
+    def __init__(self):
+        super().__init__()
+        self.setAccessibleName('Message to Strand')
+        self.setAccessibleDescription('Draft saves automatically. Control Enter sends; Enter adds a new line.')
+        self.textChanged.connect(self.fit_draft)
+
+    def fit_draft(self):
+        lines = max(2, min(6, self.document().blockCount()))
+        self.setFixedHeight(round(self.fontMetrics().lineSpacing() * lines + 18))
+
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter) and event.modifiers() & Qt.KeyboardModifier.ControlModifier:
             self.submitted.emit()
@@ -70,6 +81,9 @@ class MainWindow(QMainWindow):
         self.approval_dialog = None
         self.loading = False
         self.thinking_expanded = {}
+        self.history_limits = {}
+        self.rendered_chat = None
+        self.rendered_html = None
         self.selection_ready = False
         self.closing_when_stopped = False
         config_data = self.store.setting('engine',{})
@@ -96,11 +110,17 @@ class MainWindow(QMainWindow):
         self.build_ui()
         self.build_menus()
         self.workspaces = QTabWidget()
+        self.workspaces.setAccessibleName('Application areas')
         self.workspaces.addTab(self.takeCentralWidget(), 'Chat')
+        self.knowledge_panel = KnowledgePanel(store, self.files_panel, self)
+        self.workspaces.addTab(self.knowledge_panel, 'Knowledge')
         self.training_panel = FineTuningPanel(store, self)
-        self.workspaces.addTab(self.training_panel, 'Fine-Tuning')
+        self.workspaces.addTab(self.training_panel, 'Improve')
+        self.settings_panel = SettingsPanel(store, self)
+        self.workspaces.addTab(self.settings_panel, 'Settings')
         self.setCentralWidget(self.workspaces)
         self.training_panel.busy_changed.connect(self.set_busy)
+        self.workspaces.currentChanged.connect(self.refresh_area)
         self.refresh_tree()
         previous = self.store.setting('last_chat')
         if previous and self.store.chat(previous):
@@ -111,6 +131,10 @@ class MainWindow(QMainWindow):
         if geometry:
             from PySide6.QtCore import QByteArray
             self.restoreGeometry(QByteArray.fromHex(geometry.encode('ascii')))
+        sizes = self.store.setting('chat_splitter_sizes')
+        if isinstance(sizes, list) and len(sizes) == 3 and all(type(x) is int and x >= 0 for x in sizes):
+            self.splitter.setSizes(sizes)
+        self.set_context_visible(self.store.setting('show_chat_context', False))
         self.statusBar().showMessage('Ready · everything is saved on this computer')
 
     def build_ui(self):
@@ -121,15 +145,17 @@ class MainWindow(QMainWindow):
         title = QLabel('LetraCode')
         font = title.font(); font.setBold(True); font.setPointSizeF(font.pointSizeF()+3); title.setFont(font)
         side.addWidget(title)
-        subtitle = QLabel('Local conversations. Your context.')
+        subtitle = QLabel('Strand · your local assistant')
         subtitle.setWordWrap(True); side.addWidget(subtitle)
         side.addSpacing(10)
         self.search = QLineEdit()
+        self.search.setAccessibleName('Search saved chats')
         self.search.setPlaceholderText('Search chats…')
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(lambda _: self.refresh_tree())
         side.addWidget(self.search)
         self.tree = QTreeWidget()
+        self.tree.setAccessibleName('Chats and workspaces')
         self.tree.setHeaderHidden(True)
         self.tree.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.tree.setIndentation(16)
@@ -139,7 +165,7 @@ class MainWindow(QMainWindow):
         side.addWidget(self.tree,1)
         self.new_chat_button = QPushButton(QIcon.fromTheme('list-add'),'New chat')
         self.new_chat_button.clicked.connect(self.new_chat)
-        self.new_project_button = QPushButton(QIcon.fromTheme('folder-new'),'New project…')
+        self.new_project_button = QPushButton(QIcon.fromTheme('folder-new'),'New workspace…')
         self.new_project_button.clicked.connect(self.new_project)
         side.addWidget(self.new_chat_button); side.addWidget(self.new_project_button)
         self.splitter.addWidget(sidebar)
@@ -150,7 +176,7 @@ class MainWindow(QMainWindow):
         font = self.chat_title.font(); font.setBold(True); font.setPointSizeF(font.pointSizeF()+2); self.chat_title.setFont(font)
         self.chat_title.setTextFormat(Qt.TextFormat.PlainText)
         header.addWidget(self.chat_title,1)
-        self.model_button = QPushButton(QIcon.fromTheme('configure'),'Model Setup…')
+        self.model_button = QPushButton(QIcon.fromTheme('configure'),'Model…')
         self.model_button.clicked.connect(self.model_setup)
         header.addWidget(self.model_button)
         center.addLayout(header)
@@ -158,6 +184,21 @@ class MainWindow(QMainWindow):
         self.model_label.setTextFormat(Qt.TextFormat.PlainText)
         self.model_label.setWordWrap(True)
         center.addWidget(self.model_label)
+        self.activity = QLabel()
+        self.activity.setWordWrap(True)
+        self.activity.setOpenExternalLinks(False)
+        self.activity.linkActivated.connect(lambda _: self.return_to_active_chat())
+        self.activity.setVisible(False)
+        center.addWidget(self.activity)
+        self.options_button = QToolButton()
+        self.options_button.setText('Conversation options')
+        self.options_button.setCheckable(True)
+        self.options_button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextBesideIcon)
+        self.options_button.setArrowType(Qt.ArrowType.RightArrow)
+        center.addWidget(self.options_button)
+        self.options_panel = QWidget()
+        options_layout = QVBoxLayout(self.options_panel)
+        options_layout.setContentsMargins(0, 0, 0, 0)
         exchange = QHBoxLayout()
         self.conversation_mode = QComboBox()
         self.conversation_mode.addItems(['Single model', 'Two models'])
@@ -176,27 +217,44 @@ class MainWindow(QMainWindow):
         self.reply_count.setToolTip('Total replies in this exchange, alternating between models. The exchange always stops at this limit.')
         exchange.addWidget(self.reply_count)
         exchange.addStretch()
-        center.addLayout(exchange)
+        options_layout.addLayout(exchange)
         self.dialogue_hint = QLabel('Each exchange stops at the reply limit. Two-model mode has no tools or internet access; Computer can still include project files.')
         self.dialogue_hint.setWordWrap(True)
-        center.addWidget(self.dialogue_hint)
+        options_layout.addWidget(self.dialogue_hint)
+        center.addWidget(self.options_panel)
+        self.options_panel.hide()
+        self.options_button.toggled.connect(self.options_panel.setVisible)
+        self.options_button.toggled.connect(lambda checked: self.options_button.setArrowType(Qt.ArrowType.DownArrow if checked else Qt.ArrowType.RightArrow))
+        self.load_older_button = QPushButton('Load earlier messages')
+        self.load_older_button.clicked.connect(self.load_older_messages)
+        self.load_older_button.hide(); center.addWidget(self.load_older_button)
         self.transcript = SafeBrowser()
+        self.transcript.setAccessibleName('Saved conversation with Strand')
         self.transcript.setOpenLinks(False)
         self.transcript.setOpenExternalLinks(False)
         self.transcript.anchorClicked.connect(self.open_link)
+        self.transcript.selectionChanged.connect(self.queue_render)
         center.addWidget(self.transcript,1)
         row = QHBoxLayout()
         self.copy_button = QPushButton(QIcon.fromTheme('edit-copy'),'Copy last reply')
         self.copy_button.clicked.connect(self.copy_reply)
-        self.retry_button = QPushButton(QIcon.fromTheme('view-refresh'),'Retry reply')
+        self.retry_button = QPushButton(QIcon.fromTheme('view-refresh'),'Ask again')
         self.retry_button.clicked.connect(self.retry_reply)
         self.continue_button = QPushButton('Continue exchange')
         self.continue_button.setToolTip('Continue the shared conversation for the selected number of replies. Send or clear your draft first.')
         self.continue_button.clicked.connect(self.continue_exchange)
-        self.learn_button = QPushButton('Learn from reply…')
+        self.learn_button = QPushButton('Create example…')
         self.learn_button.clicked.connect(self.learn_from_reply)
-        row.addWidget(self.copy_button); row.addWidget(self.retry_button)
-        row.addWidget(self.continue_button); row.addWidget(self.learn_button); row.addStretch()
+        # Keep secondary actions reachable by menu and per-message links.
+        self.reply_menu = QToolButton(); self.reply_menu.setText('Reply actions')
+        self.reply_menu.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        menu = QMenu(self.reply_menu)
+        menu.addAction('Copy last reply', self.copy_reply)
+        self.repeat_action = menu.addAction('Ask last question again', self.retry_reply)
+        self.example_action = menu.addAction('Create example from last reply…', self.learn_from_reply)
+        self.reply_menu.setMenu(menu)
+        self.copy_button.hide(); self.retry_button.hide(); self.learn_button.hide()
+        row.addWidget(self.reply_menu); row.addWidget(self.continue_button); row.addStretch()
         self.mode = QComboBox(); self.mode.addItems(['Instant','Thinking'])
         self.mode.setToolTip('Thinking asks compatible models to reason before replying. Emitted thinking appears live in a separate, collapsible block. Support depends on your model and engine.')
         self.mode.setCurrentText(self.store.setting('mode','Instant'))
@@ -204,23 +262,27 @@ class MainWindow(QMainWindow):
         center.addLayout(row)
         self.composer = Composer()
         self.composer.setPlaceholderText('Ask a question…   Ctrl+Enter to send; Enter for a new line.')
-        self.composer.setMinimumHeight(90); self.composer.setMaximumHeight(180)
+        self.composer.fit_draft()
         self.composer.textChanged.connect(self.schedule_save)
         self.composer.textChanged.connect(self.update_conversation_controls)
         self.composer.submitted.connect(self.send)
         center.addWidget(self.composer)
         controls = QHBoxLayout()
-        self.computer = QCheckBox('Computer')
+        self.computer = QCheckBox('Read local files')
         self.computer.setChecked(self.store.setting('computer',True))
-        self.computer.setToolTip('Use linked project files and computer tools. Commands, edits and access outside project links require approval.')
-        self.internet = QCheckBox('Internet')
+        self.computer.setToolTip('Include automatic notes and source excerpts, and let Strand read supported files anywhere your account can read. Off excludes file-reading tools and automatic file text; saved conversation text remains.')
+        self.internet = QCheckBox('Web research')
         self.internet.setChecked(self.store.setting('internet',True))
         self.internet.setToolTip('Permit web research. Each outgoing query or URL requires approval.')
-        self.actions = QCheckBox('Actions')
+        self.actions = QCheckBox('Model tools')
         self.actions.setChecked(self.store.setting('actions',True))
-        self.actions.setToolTip('Allow model tool calls. Turn off for plain chat with a model that does not support tools; linked evidence can still be included when Computer is on.')
-        for check in (self.computer,self.internet,self.actions):
+        self.actions.setToolTip('Advanced compatibility switch. Disable if this model cannot call tools. Automatic source excerpts still follow Read local files.')
+        self.effects = QCheckBox('Edits && commands')
+        self.effects.setChecked(self.store.setting('effects', True))
+        self.effects.setToolTip('Allow proposals for changes and commands, each requiring approval. Approved commands run with your account and can also use the network.')
+        for check in (self.computer,self.internet,self.effects):
             controls.addWidget(check)
+        options_layout.addWidget(self.actions)
         controls.addStretch()
         self.stop_button = QPushButton(QIcon.fromTheme('process-stop'),'Stop')
         self.stop_button.setEnabled(False); self.stop_button.clicked.connect(self.stop)
@@ -232,19 +294,27 @@ class MainWindow(QMainWindow):
 
         self.context_panel = QWidget(); context = QVBoxLayout(self.context_panel)
         context.setContentsMargins(8,12,12,12)
-        context_title = QLabel('Project files')
+        context_title = QLabel('Strand’s focus')
         font = context_title.font(); font.setBold(True); context_title.setFont(font)
         context.addWidget(context_title)
-        self.context_hint = QLabel('Ordinary files and folders, shared across this project’s chats.')
+        self.context_hint = QLabel()
         self.context_hint.setWordWrap(True); context.addWidget(self.context_hint)
         self.files_panel = ProjectFilesPanel(self.store, self)
-        context.addWidget(self.files_panel, 1)
+        knowledge = QPushButton('Open Knowledge')
+        knowledge.clicked.connect(lambda: self.workspaces.setCurrentWidget(self.knowledge_panel))
+        context.addWidget(knowledge)
+        self.capability_hint = QLabel()
+        self.capability_hint.setWordWrap(True)
+        context.addWidget(self.capability_hint)
+        context.addStretch()
         self.splitter.addWidget(self.context_panel)
-        self.splitter.setSizes([240,700,320])
+        self.splitter.setSizes([205,800,250])
         self.splitter.setStretchFactor(1,1)
         self.conversation_mode.currentIndexChanged.connect(self.conversation_options_changed)
         self.first_speaker.currentIndexChanged.connect(self.conversation_options_changed)
         self.reply_count.valueChanged.connect(self.conversation_options_changed)
+        for check in (self.computer, self.internet, self.effects, self.actions):
+            check.toggled.connect(self.update_capability_hint)
 
     def action(self, menu, title, callback, shortcut=None):
         action = QAction(title,self)
@@ -256,7 +326,7 @@ class MainWindow(QMainWindow):
 
     def build_menus(self):
         file = self.menuBar().addMenu('&File')
-        self.mutation_actions = [self.action(file,'New &chat',self.new_chat,'Ctrl+N'), self.action(file,'New &project…',self.new_project,'Ctrl+Shift+N')]
+        self.mutation_actions = [self.action(file,'New &chat',self.new_chat,'Ctrl+N'), self.action(file,'New &workspace…',self.new_project,'Ctrl+Shift+N')]
         self.action(file,'&Export chat as Markdown…',self.export_chat,'Ctrl+Shift+E')
         self.action(file,'Export Evaluation…',self.export_evaluation)
         self.action(file,'Back up chats, Memory and source backups…',self.backup)
@@ -267,26 +337,28 @@ class MainWindow(QMainWindow):
         self.mutation_actions.append(self.action(chat,'Delete selected…',self.delete_selected))
         self.action(chat,'Search chats',lambda:self.search.setFocus(),'Ctrl+K')
         self.action(chat,'Find in conversation…',self.find_in_chat,'Ctrl+F')
+        self.action(chat,'Start a fresh task in this chat', self.end_current_task)
         view = self.menuBar().addMenu('&View')
-        self.show_context_action = self.action(view,'Project files',lambda checked:self.context_panel.setVisible(checked))
-        self.show_context_action.setCheckable(True); self.show_context_action.setChecked(True)
+        self.show_context_action = self.action(view,'Focus details',self.set_context_visible)
+        self.show_context_action.setCheckable(True); self.show_context_action.setChecked(False)
         self.action(view,'Zoom in',lambda:self.transcript.zoomIn(),'Ctrl++')
         self.action(view,'Zoom out',lambda:self.transcript.zoomOut(),'Ctrl+-')
         settings = self.menuBar().addMenu('&Settings')
         self.mutation_actions.append(self.action(settings,'Model Setup…',self.model_setup))
         self.mutation_actions.append(self.action(settings,'Files, saved drafts & history…',self.edit_memory))
-        self.instructions_action = self.action(settings,'Project instructions…',self.edit_instructions)
+        self.instructions_action = self.action(settings,'Workspace instructions…',self.edit_instructions)
         self.mutation_actions.append(self.instructions_action)
         self.action(settings,'Unload model from memory',self.unload_model)
         help_menu = self.menuBar().addMenu('&Help')
         self.action(help_menu,'Getting started',self.getting_started)
+        self.action(help_menu,'Training guide',lambda: self.show_guide('FINE-TUNING.md', 'Training guide'))
         self.action(help_menu,'Engine log',self.show_log)
         self.action(help_menu,'About LetraCode',lambda:QMessageBox.about(self,'About LetraCode',f'LetraCode {__version__}\n\nLocal conversations, with your context.\nNative Qt desktop application for Windows and Linux.\nInference: local llama.cpp / GGUF\nStorage: local SQLite\nNo account, telemetry or cloud inference.'))
 
     def refresh_tree(self):
         selected = ('chat',self.chat_id) if self.chat_id else ('project',self.project_id) if self.project_id else ('global',None)
         self.tree.blockSignals(True); self.tree.clear()
-        global_item = QTreeWidgetItem(self.tree,['Global chats']); global_item.setData(0,Qt.ItemDataRole.UserRole,('global',None))
+        global_item = QTreeWidgetItem(self.tree,['Everyday']); global_item.setData(0,Qt.ItemDataRole.UserRole,('global',None))
         global_item.setIcon(0,QIcon.fromTheme('mail-message'))
         project_items = {}
         for project in self.store.projects():
@@ -310,7 +382,7 @@ class MainWindow(QMainWindow):
         self.tree.blockSignals(False)
 
     def tree_selected(self,current,previous):
-        if not current or self.worker:
+        if not current:
             return
         kind, ident = current.data(0,Qt.ItemDataRole.UserRole)
         if kind == 'chat':
@@ -331,11 +403,15 @@ class MainWindow(QMainWindow):
         self.chat_id, self.project_id = chat_id, project_id
         project = self.store.project(project_id) if project_id else None
         chat = self.store.chat(chat_id) if chat_id else None
-        self.chat_title.setText(chat['title'] if chat else project['title'] if project else 'A little room to think.')
+        self.chat_title.setText(chat['title'] if chat else project['title'] if project else 'Talk with Strand')
         self.composer.setPlainText(chat['draft'] if chat else self.store.setting('unbound_draft_' + (project_id or 'global'),''))
         self.load_conversation_options()
         self.files_panel.set_project(project_id)
-        self.instructions_action.setEnabled(project is not None and not self.worker)
+        self.context_hint.setText('Workspace: ' + (project['title'] if project else 'Everyday') +
+            '\nThe same Strand, with shared notes and this workspace’s focus. Sources help it find relevant material; they are not reading-access boundaries.')
+        self.knowledge_panel.refresh()
+        self.update_capability_hint()
+        self.instructions_action.setEnabled(project is not None and not self.busy)
         self.loading = False
         self.selection_ready = True
         self.store.set_setting('last_chat',chat_id)
@@ -380,7 +456,7 @@ class MainWindow(QMainWindow):
         self.render_chat()
 
     def sync_engine(self):
-        if self.worker or self.training_panel.job is not None:
+        if self.busy or self.worker or self.training_panel.job is not None:
             return
         config = self.engine_config if self.conversation_mode.currentIndex() == 1 else dataclasses.replace(self.engine_config, secondary_model_path='')
         if config != self.engine.config:
@@ -395,25 +471,28 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not self.busy)
         self.actions.setEnabled(not self.busy and not multi)
         self.internet.setEnabled(not self.busy and not multi)
-        has_prompt = bool(self.chat_id and any(m['role'] == 'user' for m in self.store.messages(self.chat_id)))
+        self.effects.setEnabled(not self.busy and not multi)
+        has_prompt = bool(self.chat_id and self.store.rows('SELECT id FROM messages WHERE chat_id=? AND role=? LIMIT 1', (self.chat_id, 'user')))
         self.continue_button.setEnabled(not self.busy and multi and has_prompt and not self.composer.toPlainText().strip())
         self.retry_button.setEnabled(not self.busy and not multi and has_prompt)
+        self.repeat_action.setEnabled(not self.busy and not multi and has_prompt)
+        self.example_action.setEnabled(not self.busy and has_prompt)
         self.retry_button.setToolTip('Use Continue exchange to add model replies without repeating your prompt.' if multi else 'Repeat your last prompt as a new turn; previous replies are kept.')
 
     def edit_memory(self):
-        if not self.worker:
+        if not self.busy:
             self.save_editors()
             self.files_panel.manage_files()
 
     def edit_instructions(self):
-        if self.worker or self.project_id is None:
+        if self.busy or self.project_id is None:
             return
         project = self.store.project(self.project_id)
         dialog = QDialog(self)
-        dialog.setWindowTitle('Project instructions')
+        dialog.setWindowTitle('Workspace instructions')
         dialog.resize(640, 440)
         layout = QVBoxLayout(dialog)
-        note = QLabel('How the assistant should work in this project. Files remain project evidence.')
+        note = QLabel('Focus Strand on this workspace. Shared notes still follow you. These instructions are included in chats here; reference files are consulted separately.')
         note.setWordWrap(True); layout.addWidget(note)
         editor = QPlainTextEdit(project['instructions']); layout.addWidget(editor)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Save | QDialogButtonBox.StandardButton.Cancel)
@@ -423,24 +502,22 @@ class MainWindow(QMainWindow):
             self.store.update_project(self.project_id, instructions=editor.toPlainText())
 
     def new_chat(self, checked=False):
-        if self.worker:
-            return
         self.save_editors()
         chat = self.store.create_chat('New chat',self.project_id)
         self.store.set_setting('dialogue_' + chat, self.conversation_options())
         self.select_chat(chat); self.composer.setFocus()
 
     def new_project(self, checked=False):
-        if self.worker:
+        if self.busy:
             return
-        title,ok = QInputDialog.getText(self,'New project','Project name:')
+        title,ok = QInputDialog.getText(self,'New workspace','Name this focus for Strand (for example, Writing or LetraCode):')
         if ok and title.strip():
             p = self.store.create_project(title)
             c = self.store.create_chat('New chat',p)
             self.select_chat(c)
 
     def tree_menu(self,point):
-        if self.worker:
+        if self.busy:
             return
         item = self.tree.itemAt(point)
         if not item:
@@ -455,7 +532,7 @@ class MainWindow(QMainWindow):
         menu.exec(self.tree.viewport().mapToGlobal(point))
 
     def rename_selected(self):
-        if self.worker:
+        if self.busy:
             return
         item = self.tree.currentItem()
         if not item:
@@ -471,7 +548,7 @@ class MainWindow(QMainWindow):
             self.refresh_tree()
 
     def delete_selected(self):
-        if self.worker:
+        if self.busy:
             return
         item = self.tree.currentItem()
         if not item:
@@ -501,7 +578,7 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage('Project deleted · no Memory files were present; Memory was not archived')
 
     def model_setup(self):
-        if self.worker or self.training_panel.job is not None:
+        if self.busy or self.worker or self.training_panel.job is not None:
             return
         dialog = ModelDialog(self.engine_config,self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
@@ -512,6 +589,7 @@ class MainWindow(QMainWindow):
             self.store.set_setting('engine',dataclasses.asdict(self.engine_config))
             self.store.set_setting('training_active_version', None)
             self.render_chat()
+            self.settings_panel.refresh()
             self.statusBar().showMessage('Models configured. Send a message to load the selected conversation mode.')
 
     def prepare_engine(self):
@@ -526,7 +604,7 @@ class MainWindow(QMainWindow):
         return True
 
     def send(self):
-        if self.worker or self.training_panel.job is not None:
+        if self.busy or self.worker or self.training_panel.job is not None:
             return
         text = self.composer.toPlainText().strip()
         if not text:
@@ -554,7 +632,7 @@ class MainWindow(QMainWindow):
         self.start_worker()
 
     def continue_exchange(self):
-        if self.worker or self.training_panel.job is not None or not self.chat_id or self.conversation_mode.currentIndex() != 1:
+        if self.busy or self.worker or self.training_panel.job is not None or not self.chat_id or self.conversation_mode.currentIndex() != 1:
             return
         if self.composer.toPlainText().strip():
             self.statusBar().showMessage('Send or clear your draft before continuing the exchange.')
@@ -566,10 +644,10 @@ class MainWindow(QMainWindow):
         self.start_worker()
 
     def start_worker(self):
-        if self.worker or self.training_panel.job is not None:
+        if self.busy or self.worker or self.training_panel.job is not None:
             return
         self.store.set_setting('mode',self.mode.currentText())
-        for key,widget in [('computer',self.computer),('internet',self.internet),('actions',self.actions)]:
+        for key,widget in [('computer',self.computer),('internet',self.internet),('actions',self.actions),('effects',self.effects)]:
             self.store.set_setting(key,widget.isChecked())
         self.store.set_setting(self.conversation_options_key(), self.conversation_options())
         if self.conversation_mode.currentIndex() == 1:
@@ -578,7 +656,7 @@ class MainWindow(QMainWindow):
             self.worker = DialogueWorker(self.store,self.chat_id,self.engine,thinking=self.mode.currentText()=='Thinking',computer_enabled=self.computer.isChecked(),first_speaker=self.first_speaker.currentIndex(),reply_count=self.reply_count.value())
         else:
             self.exchange_start_id = None
-            self.worker = ConversationWorker(self.store,self.chat_id,self.engine,self.mode.currentText()=='Thinking',self.internet.isChecked(),self.computer.isChecked(),self.actions.isChecked())
+            self.worker = ConversationWorker(self.store,self.chat_id,self.engine,self.mode.currentText()=='Thinking',self.internet.isChecked(),self.computer.isChecked(),self.actions.isChecked(),actions_enabled=self.effects.isChecked())
         self.worker.changed.connect(self.queue_render)
         self.worker.status.connect(self.statusBar().showMessage)
         self.worker.status.connect(self.queue_render)
@@ -589,15 +667,24 @@ class MainWindow(QMainWindow):
 
     def set_busy(self,busy):
         self.busy = busy
-        for widget in (self.tree,self.search,self.new_chat_button,self.new_project_button,self.model_button,self.composer,self.send_button,self.retry_button,self.mode,self.computer,self.internet,self.actions):
+        for widget in (self.new_project_button,self.model_button,self.send_button,self.retry_button,self.mode,self.computer,self.internet,self.actions,self.effects):
             widget.setEnabled(not busy)
+        for widget in (self.tree, self.search, self.composer, self.new_chat_button):
+            widget.setEnabled(True)
         self.files_panel.set_busy(busy)
         for action in self.mutation_actions:
             action.setEnabled(not busy)
+        self.mutation_actions[0].setEnabled(True)
         self.instructions_action.setEnabled(not busy and self.project_id is not None)
         self.stop_button.setEnabled(self.worker is not None)
         self.learn_button.setEnabled(not busy)
         self.training_panel.set_chat_busy(busy)
+        if hasattr(self, 'settings_panel'): self.settings_panel.refresh()
+        if hasattr(self, 'knowledge_panel'): self.knowledge_panel.refresh()
+        self.activity.setVisible(busy)
+        origin = self.store.chat(getattr(self.worker, 'chat_id', None)) if self.worker else None
+        self.activity.setText(('Strand is working in <a href="active">' + html.escape(origin['title']) + '</a>.' if origin else
+                              'A local model job is running.') + ' You can keep reading and prepare a saved draft.')
         self.update_conversation_controls()
 
     def queue_render(self):
@@ -621,12 +708,36 @@ class MainWindow(QMainWindow):
             self.model_label.setText(f'{model}  ·  Local inference' if self.engine_config.model_path else 'Choose a local model in Model Setup to begin.')
         scrollbar = self.transcript.verticalScrollBar()
         previous = scrollbar.value(); bottom = previous >= scrollbar.maximum()-50
-        messages = self.store.messages(self.chat_id) if self.chat_id else []
+        limit = self.history_limits.get(self.chat_id, 200)
+        # Query only the displayed tail, not the complete history on every streamed delta.
+        messages = self.store.rows('SELECT * FROM (SELECT * FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?) ORDER BY id',
+                                   (self.chat_id, limit)) if self.chat_id else []
+        first = messages[0]['id'] if messages else 0
+        older = bool(first and self.store.rows('SELECT id FROM messages WHERE chat_id=? AND id<? LIMIT 1', (self.chat_id, first)))
+        self.load_older_button.setVisible(older)
         chunks = []
         if not messages:
-            chunks.append('<h2>What are we working on?</h2><p>Start a conversation, or create a project for work you want to return to.</p><p><b>Projects remember the context you give them.</b><br>Add existing files and folders, or create a note in Project files. Every chat in that project can use them. Set project instructions in Settings.</p><p><b>You control computer access.</b><br>Review commands, file edits and outgoing web requests before they run.</p>')
+            chunks.append('<h2>Hello, I’m Strand.</h2><p>Ask for help with writing, learning, a file, or a project. '
+                'Your conversations and unfinished messages are saved on this computer.</p>'
+                '<p><b>Start with a question.</b> A workspace is optional: it focuses the same assistant on work you return to.</p>'
+                '<p><a href="letracode:knowledge">Add useful files or review saved notes</a> · '
+                '<a href="letracode:improve">Teach with examples</a></p>'
+                '<p>Strand asks before changing files, running commands, or making web requests. '
+                'You can inspect what was used for each reply.</p>')
             if not self.engine_config.model_path:
                 chunks.append('<p><a href="letracode:setup">Choose your local model →</a></p>')
+        elif not self.busy:
+            from .pause_context import active_checkpoint
+            try:
+                paused = active_checkpoint(self.store.messages(self.chat_id))
+            except (ValueError, RuntimeError):
+                paused = None
+                chunks.append('<p><b>A saved context record needs attention.</b> The conversation remains readable. '
+                              'Back up your data before repairing it; see Settings for recovery tools.</p>')
+            if paused:
+                chunks.append('<p><b>This task is paused.</b> Review the saved actions below before continuing. '
+                    'A missing outcome does not mean an action failed to run. '
+                    '<a href="letracode:end-task">Start a fresh task in this chat</a> keeps the record and repeats no actions.</p>')
         for message in messages:
             role = message['role']
             if role == 'tool':
@@ -643,7 +754,7 @@ class MainWindow(QMainWindow):
                     except (ValueError, TypeError):
                         pass
                 continue
-            name = {'user':'You','assistant':'LetraCode','notice':'Notice'}.get(role,role)
+            name = {'user':'You','assistant':'Strand','notice':'Notice'}.get(role,role)
             if role == 'assistant':
                 try:
                     metadata = json.loads(message.get('payload') or '{}')
@@ -653,6 +764,7 @@ class MainWindow(QMainWindow):
                 if isinstance(speaker, dict) and isinstance(speaker.get('label'), str):
                     name = speaker['label']
             status = message_status(message)
+            if status == 'Response saved · Task outcome unverified': status = ''
             state = f' · {status}' if status else ''
             chunks.append(f'<hr><p><b>{html.escape(name)}{html.escape(state)}</b></p>')
             reasoning = ''
@@ -678,8 +790,18 @@ class MainWindow(QMainWindow):
                 chunks.append(assistant_html(text, self.transcript.font()))
             elif message['status']=='streaming' and not reasoning:
                 chunks.append('<p>Working locally…</p>')
-        self.transcript.setHtml('\n'.join(chunks))
-        scrollbar.setValue(scrollbar.maximum() if bottom else previous)
+            if role == 'assistant' and message['status'] != 'streaming':
+                chunks.append(f'<p><small><a href="letracode:receipt/{message["id"]}">Used for this reply</a> · '
+                              f'<a href="letracode:copy/{message["id"]}">Copy</a> · '
+                              f'<a href="letracode:example/{message["id"]}">Create example</a></small></p>')
+        rendered = '\n'.join(chunks)
+        if rendered != self.rendered_html or self.rendered_chat != self.chat_id:
+            # Reading an older selection during streaming must not repeatedly destroy it.
+            reading_selection = self.transcript.textCursor().hasSelection() and self.rendered_chat == self.chat_id
+            if not reading_selection:
+                self.transcript.setHtml(rendered)
+                self.rendered_html, self.rendered_chat = rendered, self.chat_id
+                scrollbar.setValue(scrollbar.maximum() if bottom else previous)
         if self.chat_id:
             chat = self.store.chat(self.chat_id)
             if chat: self.chat_title.setText(chat['title'])
@@ -704,16 +826,20 @@ class MainWindow(QMainWindow):
 
     def worker_finished(self):
         worker = self.worker
+        origin = getattr(worker, 'chat_id', self.chat_id)
         self.worker = None
         if self.exchange_start_id is not None:
             participants = dialogue_participants(self.engine_config)
-            rows = self.store.messages(self.chat_id)
+            rows = self.store.messages(origin)
             completed = [m for m in rows if m['id'] > self.exchange_start_id and m['role'] == 'assistant' and m['status'] == 'complete']
             if completed:
                 speaker = json.loads(completed[-1]['payload']).get('speaker', {})
                 for index, participant in enumerate(participants):
                     if speaker.get('id') == participant['id']:
-                        self.first_speaker.setCurrentIndex(1 - index)
+                        options = self.store.setting('dialogue_' + origin, {})
+                        options['first_speaker'] = 1 - index
+                        self.store.set_setting('dialogue_' + origin, options)
+                        if self.chat_id == origin: self.first_speaker.setCurrentIndex(1 - index)
                         break
             self.exchange_start_id = None
         if self.approval_dialog: self.approval_dialog.reject()
@@ -724,7 +850,7 @@ class MainWindow(QMainWindow):
         else: self.composer.setFocus()
 
     def retry_reply(self):
-        if self.worker or self.training_panel.job is not None or not self.chat_id or self.conversation_mode.currentIndex() == 1:
+        if self.busy or self.worker or self.training_panel.job is not None or not self.chat_id or self.conversation_mode.currentIndex() == 1:
             return
         if self.save_editors() is False:
             return
@@ -742,8 +868,108 @@ class MainWindow(QMainWindow):
                 if message['role']=='assistant' and message['content']:
                     QApplication.clipboard().setText(message['content']); self.statusBar().showMessage('Reply copied'); break
 
+    def refresh_area(self, *_):
+        self.knowledge_panel.refresh()
+        self.settings_panel.refresh()
+        if self.workspaces.currentWidget() is self.knowledge_panel:
+            self.files_panel.refresh()
+
+    def set_context_visible(self, visible):
+        visible = bool(visible)
+        self.context_panel.setVisible(visible)
+        self.show_context_action.setChecked(visible)
+        self.store.set_setting('show_chat_context', visible)
+
+    def update_capability_hint(self, *_):
+        if not hasattr(self, 'capability_hint'): return
+        self.capability_hint.setText(
+            ('Local files and automatic notes available. ' if self.computer.isChecked() else 'Automatic file text and file reading off. ') +
+            ('Changes and commands require approval. ' if self.effects.isChecked() else 'Changes and commands off. ') +
+            ('Web requests require approval. ' if self.internet.isChecked() else 'Web research off. ') +
+            'Saved conversation text and workspace instructions remain available.' +
+            (' Model tools are disabled; only automatic context can be included.' if not self.actions.isChecked() else ''))
+
+    def return_to_active_chat(self):
+        origin = getattr(self.worker, 'chat_id', None)
+        if origin:
+            self.select_chat(origin)
+            self.workspaces.setCurrentIndex(0)
+
+    def load_older_messages(self):
+        self.history_limits[self.chat_id] = self.history_limits.get(self.chat_id, 200) + 200
+        self.render_chat()
+
+    def end_current_task(self):
+        if self.busy or not self.chat_id: return
+        if not hasattr(self.store, 'end_task'): return
+        self.save_editors()
+        try:
+            self.store.end_task(self.chat_id)
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            self.statusBar().showMessage(str(error)); return
+        self.render_chat()
+        self.statusBar().showMessage('Fresh task ready. Earlier work and unresolved action records remain saved; no action was repeated.')
+
+    def reply_details(self, message):
+        try:
+            payload = json.loads(message.get('payload') or '{}')
+            payload = payload if isinstance(payload, dict) else {}
+        except (ValueError, TypeError): payload = {}
+        context = payload.get('context')
+        intro = ('This is a saved record of material prepared for the model. It does not prove that Strand understood it.\n\n'
+                 if context else 'This older reply has no automatic-context receipt. Its saved actions remain available below.\n\n')
+        details = intro + 'Reply status: ' + message_status(message) + '\n\n'
+        if context:
+            workspace = context.get('workspace') or {}
+            details += 'Focus: ' + str(workspace.get('title') or 'Everyday') + '\n'
+            capabilities = context.get('capabilities') or {}
+            details += 'Available for this request: ' + ', '.join(label + (' on' if capabilities.get(key) else ' off')
+                for key, label in [('read_files', 'Local files'), ('actions', 'Edits and commands'), ('web', 'Web research'), ('tools', 'Model tools')]) + '\n\n'
+            details += 'Notes included automatically\n'
+            notes = context.get('memory') or []
+            details += '\n'.join(str(note.get('path') or note.get('relative_path')) + ' · ' + str(note.get('scope', '')) for note in notes) or 'None'
+            details += '\n\nSource excerpts included\n'
+            sources = context.get('sources') or []
+            details += '\n'.join(str(source.get('path', '')) + ' · line ' + str(source.get('line', '?')) +
+                ' · ' + str(source.get('included_chars', len(source.get('text', '')))) + ' characters' +
+                (' · partial' if source.get('partial') else '') for source in sources) or 'None'
+            details += '\n\nConversation\n' + ('Earlier conversation was reduced to fit. All messages remain saved.' if context.get('history_reduced') else 'The selected conversation context fit without reducing history.')
+            omissions = context.get('omissions') or []
+            if omissions: details += '\n\nLimits and omissions\n' + '\n'.join(str(item) for item in omissions)
+            retrieval = context.get('retrieval') or {}
+            if retrieval.get('inventory_truncated'): details += '\nSource inventory reached its limit; some files were not searched.'
+            failed = retrieval.get('failed_sources') or []
+            if failed: details += '\nSome source files could not be read:\n' + '\n'.join(str(item) for item in failed)
+        actions = []
+        for row in self.store.messages(self.chat_id):
+            if row['id'] >= message['id']: break
+            if row['role'] == 'user': actions = []
+            elif row['role'] == 'tool': actions.append(row['content'])
+        if actions: details += '\n\nSaved actions in this turn\n\n' + '\n\n'.join(actions)
+        dialog = QDialog(self); dialog.setWindowTitle('Used for this reply'); dialog.resize(760, 580)
+        layout = QVBoxLayout(dialog)
+        editor = QPlainTextEdit(details); editor.setReadOnly(True); editor.setAccessibleName('Reply context receipt'); layout.addWidget(editor, 1)
+        technical = QCheckBox('Show saved context receipt (technical details)')
+        technical.toggled.connect(lambda checked: editor.setPlainText(json.dumps(context, ensure_ascii=False, indent=2) if checked else details))
+        technical.setEnabled(bool(context)); layout.addWidget(technical)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Close); buttons.rejected.connect(dialog.reject); layout.addWidget(buttons)
+        dialog.exec()
+
     def open_link(self,url):
         text = url.toString()
+        if text == 'letracode:knowledge': self.workspaces.setCurrentWidget(self.knowledge_panel); return
+        if text == 'letracode:improve': self.workspaces.setCurrentWidget(self.training_panel); return
+        if text == 'letracode:end-task': self.end_current_task(); return
+        for action in ('receipt', 'copy', 'example'):
+            if text.startswith('letracode:' + action + '/'):
+                ident = text.rsplit('/', 1)[-1]
+                rows = self.store.rows('SELECT * FROM messages WHERE chat_id=? AND id=? AND role=?', (self.chat_id, ident, 'assistant'))
+                if rows:
+                    message = rows[0]
+                    if action == 'receipt': self.reply_details(message)
+                    elif action == 'copy': QApplication.clipboard().setText(message['content'])
+                    else: self.learn_from_reply(message_id=message['id'])
+                return
         if text.startswith('letracode:thinking/'):
             ident = text.removeprefix('letracode:thinking/')
             message = next((m for m in self.store.messages(self.chat_id)
@@ -767,7 +993,7 @@ class MainWindow(QMainWindow):
                     allowed |= message.get('name') == 'remember' and ident == (receipt.get('receipt_id') or receipt.get('id'))
                 except (ValueError, TypeError, AttributeError):
                     pass
-            if not allowed or self.worker:
+            if not allowed or self.busy:
                 return
             try:
                 receipt = self.store.strand.receipt(ident)
@@ -813,6 +1039,15 @@ class MainWindow(QMainWindow):
     def find_in_chat(self):
         text,ok = QInputDialog.getText(self,'Find in conversation','Find:')
         if ok and text and not self.transcript.find(text):
+            # Explicit Find replaces the reading selection before expanding
+            # history; otherwise render_chat correctly defers that expansion.
+            cursor = self.transcript.textCursor(); cursor.clearSelection(); self.transcript.setTextCursor(cursor)
+            if self.chat_id:
+                matches = self.store.rows('SELECT id FROM messages WHERE chat_id=? AND instr(lower(content),lower(?))>0 ORDER BY id LIMIT 1', (self.chat_id, text))
+                if matches:
+                    count = self.store.rows('SELECT COUNT(*) AS n FROM messages WHERE chat_id=? AND id>=?', (self.chat_id, matches[0]['id']))[0]['n']
+                    self.history_limits[self.chat_id] = max(200, count)
+                    self.render_chat()
             cursor = self.transcript.textCursor(); cursor.movePosition(cursor.MoveOperation.Start); self.transcript.setTextCursor(cursor)
             self.transcript.find(text)
 
@@ -856,7 +1091,7 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self,'Backup failed',str(error))
 
     def unload_model(self):
-        if self.worker:
+        if self.busy:
             QMessageBox.information(self,'Model is busy','Stop the current reply before unloading the model.'); return
         self.engine.stop(); self.render_chat(); self.statusBar().showMessage('Models unloaded from memory')
 
@@ -865,9 +1100,20 @@ class MainWindow(QMainWindow):
         self.text_dialog('Engine log',path.read_text(encoding='utf-8',errors='replace')[-100000:] if path.exists() else 'The local engine has not written a log yet.')
 
     def getting_started(self):
-        self.text_dialog('Getting started','1. Open Model Setup. Choose llama-server and a local instruction/chat GGUF model.\n\n' + engine_setup_help() + '\n\nCPU mode works without GPU configuration. For an NVIDIA GPU, use a compatible llama.cpp CUDA or Vulkan build and choose it in Model Setup, then increase GPU layers. New models may need a newer llama.cpp version.\n\n2. Create a chat and type a question. Ctrl+Enter sends.\n\n3. Create a project for shared work. Link files or folders. Use Project files to add existing files and folders, create notes and folders, and open or edit files. Save file applies note edits; navigation and Close keep unsaved note drafts separately. Files, saved drafts & history provides recovery and Undo. Shared files are available across projects. Always-active notes are included automatically; other notes are available to list, search and read when relevant. Set Project instructions in Settings.\n\n4. Review action dialogs. Every command and file edit needs your approval. Internet requests show the exact outgoing query or URL. Deny anything you do not want.\n\n5. If your model does not support tool calls, turn off Actions. Computer still controls whether linked evidence is included. Turn Internet off to prevent web tools.\n\n6. Use File → Export Evaluation for a privacy-filtered ZIP of one saved conversation, recorded actions, errors, evidence and run metadata. It omits private source and Memory tool bodies; review the transcript and optional notes before sharing. For recovery, use Back up chats, Memory and source backups instead. Backups include a recovery guide; logs and migration snapshots are omitted. Linked originals and model weights are separate.\n\nLimits: text/source, PDF and DOCX extraction are bounded; images, scanned PDF OCR, audio and video are not interpreted. Some websites block automated retrieval. Small local models may need smaller, clearer tasks. LetraCode does not guarantee the correctness of a model’s reasoning.\n\nUninstalling the app retains your local conversations and projects.')
+        self.show_guide('STRAND-EXPERIENCE.md', 'Getting started with Strand')
+
+    def show_guide(self, filename, title):
+        path = Path(__file__).resolve().parent.parent / 'docs' / filename
+        if path.is_file():
+            self.text_dialog(title, path.read_text(encoding='utf-8'))
+        else:
+            self.text_dialog(title, 'Start in Settings to choose and test a local model. Chat with Strand; use Knowledge for useful files and saved notes, and Improve for reviewed examples and version comparisons.\n\n' + engine_setup_help())
 
     def closeEvent(self,event):
+        if self.settings_panel.job is not None:
+            self.closing_when_stopped = True
+            self.settings_panel.stop_check()
+            event.ignore(); return
         if self.training_panel.job is not None:
             if not self.closing_when_stopped:
                 answer = QMessageBox.question(self, 'Stop and quit?', 'A training or model change is running. Stop it and quit?', QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No)
@@ -883,15 +1129,17 @@ class MainWindow(QMainWindow):
         self.save_editors()
         self.training_panel.persist_draft()
         self.store.set_setting('geometry',bytes(self.saveGeometry().toHex()).decode('ascii'))
+        self.store.set_setting('chat_splitter_sizes', self.splitter.sizes())
         self.engine.stop()
         event.accept()
 
-    def learn_from_reply(self):
-        if self.worker or self.training_panel.job is not None or not self.chat_id:
+    def learn_from_reply(self, checked=False, message_id=None):
+        if self.busy or self.worker or self.training_panel.job is not None or not self.chat_id:
             return
         messages = self.store.messages(self.chat_id)
         for index in range(len(messages) - 1, -1, -1):
             row = messages[index]
+            if message_id is not None and row['id'] != message_id: continue
             if row['role'] != 'assistant' or row['status'] != 'complete' or not row['content'].strip():
                 continue
             try:
@@ -903,9 +1151,19 @@ class MainWindow(QMainWindow):
             prompt = next((m['content'] for m in reversed(messages[:index]) if m['role'] == 'user'), '')
             if prompt:
                 panel = self.training_panel
-                panel.new_example(); panel.prompt.setPlainText(prompt); panel.response.setPlainText(row['content'])
-                panel.example_source = f"chat:{self.chat_id}/message:{row['id']}"
-                panel.persist_draft(); panel.tabs.setCurrentIndex(0)
-                panel.progress.setText('Review and correct this draft. Saving a reply does not establish that it is true.')
+                preceding = [m for m in messages[:index] if m['role'] in ('user', 'assistant') and m['status'] == 'complete']
+                # Capture dialogue as editable background; do not silently import source/tool bodies.
+                if preceding and preceding[-1]['role'] == 'user': preceding = preceding[:-1]
+                background = '\n\n'.join(('You: ' if m['role'] == 'user' else 'Strand: ') + m['content'] for m in preceding[-6:])[-12000:]
+                project = self.store.project(self.project_id) if self.project_id else None
+                if project and project.get('instructions'):
+                    background = 'Workspace instructions:\n' + project['instructions'][:4000] + '\n\n' + background
+                source = f"chat:{self.chat_id}/message:{row['id']}"
+                if hasattr(panel, 'capture_example'):
+                    panel.capture_example(prompt, row['content'], source=source, context=background)
+                else:
+                    panel.new_example(); panel.prompt.setPlainText(prompt); panel.response.setPlainText(row['content'])
+                    panel.example_source = source; panel.persist_draft(); panel.tabs.setCurrentIndex(0)
+                    panel.progress.setText('Review this draft. Earlier dialogue and source files may be needed to make the request self-contained.')
                 self.workspaces.setCurrentWidget(panel)
             return

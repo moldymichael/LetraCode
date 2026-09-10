@@ -273,3 +273,17 @@ def prepare_gemma_chat(training_python, base_model, llama_cpp, output):
     candidate.unlink()
     staged_manifest.unlink()
     return manifest
+
+
+if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Prepare an offline, hash-linked Gemma Chat model')
+    parser.add_argument('--training-python', required=True)
+    parser.add_argument('--base-model', required=True)
+    parser.add_argument('--llama-cpp', required=True)
+    parser.add_argument('--output', required=True)
+    args = parser.parse_args()
+    try:
+        prepare_gemma_chat(args.training_python, args.base_model, args.llama_cpp, args.output)
+    except (OSError, ValueError, RuntimeError) as error:
+        parser.exit(1, str(error) + '\n')

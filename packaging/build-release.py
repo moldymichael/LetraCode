@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def release_files() -> list[Path]:
     files = [
         ROOT / name
-        for name in ("pyproject.toml", "install.sh", "uninstall.sh", "README.md", "LICENSE")
+        for name in ("pyproject.toml", "install.sh", "uninstall.sh", "README.md", "AGENTS.md", "LICENSE")
     ]
     files.extend((ROOT / "letracode").glob("*.py"))
     files.append(ROOT / "letracode/assets/io.letracode.LetraCode.svg")
@@ -37,6 +37,7 @@ def release_files() -> list[Path]:
         )
     )
     files.extend((ROOT / "docs").rglob("*.md"))
+    files.extend((ROOT / "docs").rglob("*.json"))
     files.extend((ROOT / "tools").glob("*.py"))
     files.extend((ROOT / ".github/workflows").glob("*.yml"))
     files.extend((ROOT / "packaging/licenses").rglob("*.txt"))

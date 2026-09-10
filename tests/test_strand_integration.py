@@ -26,7 +26,7 @@ def test_identity_and_corrected_memory_reach_global_and_separate_projects(tmp_pa
         return build_context(store.project(project) if project else None, [], 'Mara bicycle', strand=store.strand, provenance='Local llama.cpp; configured model: fixture.gguf')
     global_context, context_a, context_b = context(None), context(a), context(b)
     assert all('LetraCode' in text and 'fixture.gguf' in text for text in (global_context, context_a, context_b))
-    assert all('You are Strand' not in text for text in (global_context, context_a, context_b))
+    assert all('You are Strand' in text for text in (global_context, context_a, context_b))
     assert 'blue bicycle' in context_a and 'red bicycle' not in context_a
     assert 'red bicycle' in context_b and 'blue bicycle' not in context_b
     assert 'blue bicycle' not in global_context and 'red bicycle' not in global_context
@@ -94,12 +94,12 @@ def test_learning_grant_does_not_authorize_other_memories_or_sources(tmp_path):
     assert 'denied' in json.loads(tool.execute('remember', {'scope':'learning','text':'Unreviewed inference'}))
 
 
-def test_memory_and_saved_history_reads_work_with_external_tools_disabled(tmp_path):
+def test_file_read_switch_blocks_memory_but_saved_history_is_available(tmp_path):
     store = Store(tmp_path / 'data'); chat = store.create_chat('Global')
     store.strand.remember('global','Preferred name: Alex', origin='user', expected_sha256=store.strand.snapshot('global')['sha256'])
     row = store.add_message(chat,'tool','{"output":"Saved command output"}',payload={'message':{'role':'tool','name':'run_command','tool_call_id':'one','content':'{"output":"Saved command output"}'}})
-    tool = executor(store, chat, computer_enabled=False, web_enabled=False)
-    assert 'Alex' in tool.execute('read_memory', {'scope':'global'})
+    tool = executor(store, chat, computer_enabled=False, web_enabled=False, actions_enabled=False)
+    assert 'denied' in json.loads(tool.execute('read_memory', {'scope':'global'}))
     assert 'Saved command output' in tool.execute('read_tool_result', {'result_id':row})
     assert 'denied' in json.loads(tool.execute('remember', {'scope':'global','text':'A write'}))
     other = store.create_chat('Other')

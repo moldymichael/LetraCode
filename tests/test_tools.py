@@ -21,11 +21,11 @@ def executor(tmp_path, approve=lambda request: False, roots=None):
     return ToolExecutor(roots or [], tmp_path / 'appdata', approve, threading.Event())
 
 
-def test_unlinked_read_and_denied_commands_have_no_effect(tmp_path):
+def test_unlinked_read_is_allowed_but_denied_commands_have_no_effect(tmp_path):
     f = tmp_path / 'private.md'
     f.write_text('private')
     tool = executor(tmp_path)
-    assert 'denied' in tool.execute('read_file', {'path': str(f)}).lower()
+    assert json.loads(tool.execute('read_file', {'path': str(f)}))['text'] == '1: private'
     assert 'denied' in tool.execute('run_command', {'command': 'touch should-not-exist', 'cwd': str(tmp_path)}).lower()
     assert not (tmp_path / 'should-not-exist').exists()
 
@@ -40,8 +40,8 @@ def test_linked_read_and_symlink_escape(tmp_path, make_symlink):
     (root / '.env').write_text('API_KEY=secret')
     tool = executor(tmp_path, roots=[str(root)])
     assert 'good evidence' in tool.execute('read_file', {'path': str(root / 'a.md')})
-    assert 'denied' in tool.execute('read_file', {'path': str(root / 'escape.md')}).lower()
-    assert 'denied' in tool.execute('read_file', {'path': str(root / '.env')}).lower()
+    assert json.loads(tool.execute('read_file', {'path': str(root / 'escape.md')}))['text'] == '1: never automatically include'
+    assert json.loads(tool.execute('read_file', {'path': str(root / '.env')}))['text'] == '1: API_KEY=secret'
     context = build_context({'title':'Work','memory':'','current_context':'','instructions':''}, [str(root)], 'evidence', 12000)
     assert 'good evidence' in context
     assert 'never automatically include' not in context

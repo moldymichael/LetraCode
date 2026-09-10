@@ -263,7 +263,8 @@ def test_invalid_speaker_metadata_keeps_history_readable(window, payload):
     with window.store.connection() as db:
         db.execute('UPDATE messages SET payload=? WHERE id=?', (payload, message))
     window.select_chat(chat)
-    assert 'LetraCode · Response saved · Task outcome unverified' in window.transcript.toPlainText()
+    assert 'Strand' in window.transcript.toPlainText()
+    assert 'Used for this reply' in window.transcript.toPlainText()
     assert 'Saved prose' in window.transcript.toPlainText()
 
 
@@ -273,5 +274,6 @@ def test_model_speaker_preserves_status_and_model_action_link_boundary(window):
         payload={'speaker': {'label': 'Model A · <local>.gguf'}})
     window.select_chat(chat)
     window.conversation_mode.setCurrentIndex(1)
-    assert 'Model A · <local>.gguf · Response saved · Task outcome unverified' in window.transcript.toPlainText()
+    assert 'Model A · <local>.gguf' in window.transcript.toPlainText()
+    assert 'Used for this reply' in window.transcript.toPlainText()
     assert 'letracode:undo-memory/fake' not in window.transcript.toHtml()

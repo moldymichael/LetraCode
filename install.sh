@@ -124,6 +124,9 @@ trap cleanup EXIT
 
 cp -a -- "$source_dir/letracode" "$stage/letracode"
 cp -- "$source_dir/uninstall.sh" "$source_dir/README.md" "$source_dir/LICENSE" "$stage/"
+if [[ -d "$source_dir/docs" ]]; then
+    cp -a -- "$source_dir/docs" "$stage/docs"
+fi
 printf '%s\n' "$MARKER_CONTENT" > "$stage/.letracode-install"
 chmod 0644 "$stage/.letracode-install"
 chmod 0755 "$stage/uninstall.sh"

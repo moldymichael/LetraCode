@@ -29,7 +29,7 @@ def dialogue_participants(config):
     return tuple(participants)
 
 
-def dialogue_messages(rows, system, speaker, budget, *, fits_context=None):
+def dialogue_messages(rows, system, speaker, budget, *, fits_context=None, receipt=None):
     """Pack attributed conversation data, keeping required recent content whole.
 
     One JSON transcript in one user envelope works with ordinary chat templates.
@@ -37,6 +37,7 @@ def dialogue_messages(rows, system, speaker, budget, *, fits_context=None):
     Measure the final wire message JSON in UTF-8 bytes, including its escaping.
     """
     transcript = []
+    transcript_ids = []
     row_indices = {}
     _, required_rows, _ = resolve_intent(rows)
     latest_user = None
@@ -46,6 +47,7 @@ def dialogue_messages(rows, system, speaker, budget, *, fits_context=None):
             continue
         payload = json.loads(row.get('payload', '{}'))
         row_indices[row['id']] = len(transcript)
+        transcript_ids.append(row['id'])
         if row['role'] == 'user':
             latest_user = len(transcript)
         elif row['role'] == 'assistant':
@@ -101,7 +103,12 @@ def dialogue_messages(rows, system, speaker, budget, *, fits_context=None):
             break
         selected.add(index)
         messages = candidate
-    return messages, len(selected) < len(transcript)
+    trimmed = len(selected) < len(transcript)
+    if receipt is not None:
+        receipt.update(system_text=messages[0]['content'], history_reduced=trimmed,
+                       message_ids=[transcript_ids[index] for index in sorted(selected)],
+                       conversation_message_count=len(selected))
+    return messages, trimmed
 
 
 class DialogueWorker(ConversationWorker):
@@ -112,7 +119,8 @@ class DialogueWorker(ConversationWorker):
         if type(first_speaker) is not int or first_speaker not in (0, 1):
             raise ValueError('Choose Model A or Model B as the next speaker.')
         super().__init__(store, chat_id, engine, thinking=thinking,
-                         computer_enabled=computer_enabled, web_enabled=False, use_tools=False)
+                         computer_enabled=computer_enabled, web_enabled=False, use_tools=False,
+                         actions_enabled=False)
         self.first_speaker = first_speaker
         self.reply_count = reply_count
 
@@ -143,8 +151,11 @@ class DialogueWorker(ConversationWorker):
             chat = self.store.chat(self.chat_id)
             if chat is None:
                 return
-            project = self.store.project_for_context(chat['project_id']) if chat['project_id'] else None
+            project = self.store.project_for_context(chat['project_id'], read_files=self.computer_enabled) if chat['project_id'] else None
             roots = self.store.links(chat['project_id']) if project else []
+            shared_roots = self.store.setting('source_roots', [])
+            if isinstance(shared_roots, list):
+                roots = list(dict.fromkeys([root for root in shared_roots if isinstance(root, str)] + roots))
             rows = self.store.messages(self.chat_id)
             query = next((m['content'] for m in reversed(rows) if m['role'] == 'user'), '')
             # Reserve output + template overhead; no minimum that can exceed a
@@ -152,15 +163,17 @@ class DialogueWorker(ConversationWorker):
             budget = 24000
             if config.context_size - config.max_tokens - 1024 <= 0:
                 raise ValueError('Increase context size or reduce the maximum reply tokens in Model Setup.')
-            self.status.emit('Reading project files for both models…')
+            self.status.emit('Preparing context for both models…')
             # Required project guidance gets the full allowance first. Allocate
             # only optional retrieval afterward, without penalizing ordinary
             # instructions with the retrieval function's evidence reserve.
             retrieval_budget = min(6000, config.context_size - config.max_tokens - 1024)
+            context_receipt = {}
             def context():
                 return build_context(project, roots if self.computer_enabled else [], query,
-                                     retrieval_budget, self.cancel_event, strand=self.store.memory,
-                                     allow_core_overflow=True)
+                                     retrieval_budget, self.cancel_event,
+                                     strand=self.store.memory if self.computer_enabled else None,
+                                     allow_core_overflow=True, receipt=context_receipt)
             system = context()
             self.engine.start(self.cancel_event, self.status.emit)
             any_trimmed = False
@@ -178,7 +191,8 @@ class DialogueWorker(ConversationWorker):
                 while True:
                     try:
                         messages, trimmed = dialogue_messages(self.store.messages(self.chat_id), system,
-                                                              speaker, budget, fits_context=fits_context)
+                                                              speaker, budget, fits_context=fits_context,
+                                                              receipt=context_receipt)
                         break
                     except ValueError:
                         if retrieval_budget == 0:
@@ -194,7 +208,10 @@ class DialogueWorker(ConversationWorker):
                 if speaker['model'] != 'local':
                     run_configuration.pop('adapter_name', None)
                     run_configuration.pop('training_version', None)
-                stream_payload = {'speaker': speaker, 'run_configuration': run_configuration}
+                context_receipt.update(capabilities={'read_files': bool(self.computer_enabled),
+                    'actions': False, 'web': False, 'tools': False}, available_tools=[])
+                stream_payload = {'speaker': speaker, 'run_configuration': run_configuration,
+                                  'context': dict(context_receipt)}
                 message_id = self.store.add_message(self.chat_id, 'assistant', '', status='streaming',
                                                     payload=stream_payload)
                 self.changed.emit()

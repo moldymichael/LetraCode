@@ -33,7 +33,7 @@ def test_file_panel_replaces_autosave_tabs_and_keeps_project_scope(tmp_path):
         assert attachment.read_text() == 'Original'
         window.set_busy(True)
         assert not panel.new_button.isEnabled()
-        assert not panel.tree.isEnabled()
+        assert panel.tree.isEnabled()  # Browsing stays available while mutations are blocked.
         window.set_busy(False)
         assert panel.new_button.isEnabled()
     finally:

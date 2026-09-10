@@ -351,11 +351,14 @@ class ActivationWorker(QThread):
     ready = Signal(object)
     failed = Signal(str)
 
-    def __init__(self, repository, engine_config, run_id=None, rollback=None, parent=None, *, secondary_enabled=True):
+    def __init__(self, repository, engine_config, run_id=None, rollback=None, parent=None, *, secondary_enabled=True,
+                 require_comparison=False, thinking=False):
         super().__init__(parent)
         self.repository = repository
         self.original_config = engine_config
         self.secondary_enabled = secondary_enabled
+        self.require_comparison = require_comparison
+        self.thinking = thinking
         self.selected_config = None
         self.run_id = run_id
         self.rollback = rollback
@@ -374,10 +377,16 @@ class ActivationWorker(QThread):
                 fields = {f.name for f in dataclasses.fields(EngineConfig)}
                 config = EngineConfig(**{k: v for k, v in self.rollback.items() if k in fields})
             else:
+                from .training_experience import comparison_is_current, effective_report, version_review
+                if self.require_comparison:
+                    self.status.emit('Checking the comparison still matches Strand and this candidate…')
+                    if (not comparison_is_current(self.repository, self.run_id, self.original_config, self.thinking)
+                            or version_review(self.repository, self.run_id).get('judgment', 'unreviewed') == 'unreviewed'):
+                        raise ValueError('Compare with the current Strand settings and save your judgment before using this version. Previous comparisons or model files changed.')
                 run = self.repository.run(self.run_id)
                 if run['status'] != 'succeeded':
                     raise ValueError('This version has no completed training and evaluation.')
-                report = run['report']
+                report = effective_report(self.repository, self.run_id)
                 adapter = self.repository.run_directory(self.run_id) / 'adapter.gguf'
                 base = run['config'].get('base_gguf', '')
                 if not base or not report.get('base_gguf_sha256') or not report.get('adapter_gguf_sha256'):

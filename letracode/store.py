@@ -364,7 +364,10 @@ class Store:
             self.set_setting(key, {'current_context': name})
             return folder
 
-    def project_for_context(self, ident):
+    def project_for_context(self, ident, *, read_files=True):
+        if not read_files:
+            rows = self.rows('SELECT id,title,instructions FROM projects WHERE id=?', (ident,))
+            return {**rows[0], 'memory': '', 'current_context': ''} if rows else None
         self.ensure_project_files(ident)
         project = self.project(ident)
         return {**project, 'current_context': ''} if project else None
@@ -537,6 +540,55 @@ class Store:
 
     def messages(self, chat_id):
         return self.rows('SELECT * FROM messages WHERE chat_id=? ORDER BY id', (chat_id,))
+
+    def search_history(self, query, limit=10, chat_id=None):
+        """Return bounded excerpts of saved conversations, never remembered facts."""
+        if (not isinstance(query, str) or not query.strip() or len(query) > 500
+                or type(limit) is not int or not 1 <= limit <= 50
+                or (chat_id is not None and (not isinstance(chat_id, str) or not chat_id))):
+            raise ValueError('History search needs a query of 1–500 characters and a limit of 1–50')
+        query = query.strip()
+        results = self.rows('''SELECT m.id AS message_id, m.chat_id, c.title AS chat_title,
+                c.project_id, p.title AS project_title, m.role, m.status, m.created,
+                substr(m.content, max(1, min(instr(lower(m.content), lower(?)) - 160,
+                    length(m.content) - 599)), 600) AS excerpt,
+                length(m.content) > 600 AS truncated
+            FROM messages AS m JOIN chats AS c ON c.id=m.chat_id
+            LEFT JOIN projects AS p ON p.id=c.project_id
+            WHERE instr(lower(m.content), lower(?)) > 0 AND (? IS NULL OR m.chat_id=?)
+            ORDER BY m.id DESC LIMIT ?''', (query, query, chat_id, chat_id, limit))
+        for row in results:
+            row['truncated'] = bool(row['truncated'])
+        return results
+
+    def end_task(self, chat_id):
+        """Record explicit user closure; saved actions and unknown effects stay intact."""
+        with self.connection() as db:
+            db.execute('BEGIN IMMEDIATE')
+            if db.execute('SELECT id FROM chats WHERE id=?', (chat_id,)).fetchone() is None:
+                raise ValueError('Saved chat does not exist')
+            user = db.execute("SELECT id FROM messages WHERE chat_id=? AND role='user' "
+                              "AND status='complete' ORDER BY id DESC LIMIT 1", (chat_id,)).fetchone()
+            if user is None:
+                raise ValueError('This chat has no saved user request to end')
+            latest = db.execute('SELECT id,payload FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT 1',
+                                (chat_id,)).fetchone()
+            try:
+                prior = json.loads(latest['payload'])
+            except (TypeError, ValueError):
+                prior = {}
+            if (isinstance(prior, dict) and prior.get('task_outcome') == 'ended_by_user'
+                    and prior.get('pause_context_closed') is True):
+                return latest['id']
+            record = {'pause_context_closed': True, 'task_outcome': 'ended_by_user',
+                      'terminal_input_cursor': user['id'], 'ended_through_message_id': latest['id']}
+            created = now()
+            cursor = db.execute('INSERT INTO messages(chat_id,role,content,status,payload,created) VALUES (?,?,?,?,?,?)',
+                (chat_id, 'notice', 'Task ended by you. Saved actions remain recorded; '
+                 'unknown effects remain unknown. Send a new message to start another task.',
+                 'complete', json.dumps(record), created))
+            db.execute('UPDATE chats SET updated=? WHERE id=?', (created, chat_id))
+            return cursor.lastrowid
 
     def tool_result_page(self, chat_id, result_id, offset=0, max_chars=4000):
         if type(offset) is not int or offset < 0 or type(max_chars) is not int or not 1 <= max_chars <= 16000:

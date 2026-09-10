@@ -11,13 +11,13 @@ from dataclasses import asdict
 
 from PySide6.QtCore import QThread, Signal
 
-from .context import build_context
+from .context import application_info, build_context
 from .budgeting import fallback_usage
 from .engine import Cancelled, ContextOverflowError
 from .pause_context import payload as row_payload, resolve_intent
 from .continuation import RunHalted, RunLimits, RunProgress, interrupted_outcome
 from .evidence import evidence_state, request_exposure, source_evidence, summary as evidence_summary
-from .tools import ApprovalRequest, SAVED_READ_TOOLS, TOOL_SCHEMAS, ToolExecutor
+from .tools import ApprovalRequest, TOOL_SCHEMAS, ToolExecutor, tool_enabled
 from .store import now
 
 
@@ -157,7 +157,7 @@ def saved_result_references(rows):
     return {'saved_result_ids': saved[-20:], 'saved_result_count': len(saved)}
 
 
-def conversation_messages(rows, system, budget, *, measure=None):
+def conversation_messages(rows, system, budget, *, measure=None, receipt=None):
     """Fit intact user turns against the whole formatted request, tools included.
 
     The optional measure returns complete request usage including reserved reply
@@ -268,9 +268,15 @@ def conversation_messages(rows, system, budget, *, measure=None):
                     'unneeded actions, or send a shorter request. Saved results remain available.')
         selected.insert(0, turn)
     selected_messages = [message for turn in selected for message in turn]
-    result = protocol_messages(required_prefix(selected_messages) + selected_messages)
+    packed = required_prefix(selected_messages) + selected_messages
+    result = protocol_messages(packed)
     if measure(result) > budget:
         raise ContextOverflowError('Core instructions and reserved reply exceed this context setting; nothing was truncated.')
+    if receipt is not None:
+        receipt.update(system_text=result[0]['content'], history_reduced=compacted or len(selected) < len(turns),
+                       message_ids=[message['_row_id'] for message in packed if message.get('_row_id')],
+                       saved_result_ids=[message['saved_result_id'] for message in packed if message.get('saved_result_id')],
+                       conversation_message_count=len(result) - 1)
     return result, compacted or len(selected) < len(turns)
 
 
@@ -279,14 +285,16 @@ class ConversationWorker(QThread):
     status = Signal(str)
     approval_needed = Signal(object)
 
-    def __init__(self, store, chat_id, engine, thinking=False, web_enabled=True, computer_enabled=True, use_tools=True, *, limits=None):
+    def __init__(self, store, chat_id, engine, thinking=False, web_enabled=True, computer_enabled=True, use_tools=True, *, limits=None, actions_enabled=True):
         super().__init__()
         self.store, self.chat_id, self.engine = store, chat_id, engine
         self.thinking = thinking
         self.web_enabled, self.computer_enabled = web_enabled, computer_enabled
         self.use_tools = use_tools
+        self.actions_enabled = actions_enabled
         self.cancel_event = threading.Event()
         self.pending = None
+        self._pinned_intent = None
         self.limits = limits if limits is not None else RunLimits()
         self.progress = None
         self.run_id = uuid.uuid4().hex
@@ -303,7 +311,7 @@ class ConversationWorker(QThread):
             'engine_name': Path(getattr(config, 'executable', '')).name,
             'thinking': bool(thinking), 'mode': 'Thinking' if thinking else 'Instant',
             'web_enabled': bool(web_enabled), 'computer_enabled': bool(computer_enabled),
-            'use_tools': bool(use_tools),
+            'use_tools': bool(use_tools), 'actions_enabled': bool(actions_enabled),
         }
         adapter = getattr(config, 'lora_path', '')
         if isinstance(adapter, str) and adapter.strip():
@@ -374,8 +382,17 @@ class ConversationWorker(QThread):
     def pause(self, reason, detail, rounds=0, *, automatic=False):
         rows = self.store.messages(self.chat_id)
         latest_id = next((row['id'] for row in reversed(rows) if row['role'] == 'user'), None)
+        if latest_id is not None and any(row['id'] > latest_id and row['role'] == 'notice'
+                and row_payload(row).get('task_outcome') == 'ended_by_user'
+                and row_payload(row).get('pause_context_closed') is True for row in rows):
+            # Explicit closure wins over a late response, timeout or exception.
+            # Never pin the ended objective again while reporting a run failure.
+            self.changed.emit()
+            self.status.emit('Task ended · saved outcomes retained')
+            return
         try:
-            intent, _, _ = resolve_intent(rows, self.chat_id)
+            intent, _, _ = resolve_intent(rows, self.chat_id, starting_task=True,
+                                          pinned_intent=self._pinned_intent)
         except ContextOverflowError as error:
             # Preserve the damaged checkpoint and exact diagnostic; do not
             # silently re-anchor a continuation to an invented replacement.
@@ -469,6 +486,7 @@ class ConversationWorker(QThread):
                 return
             if intent is None:
                 return
+            self._pinned_intent = resolve_intent(rows, self.chat_id, starting_task=True)[0]
             origin = intent['origin_user_message_id']
             input_cursor = latest_user['id']
             self.progress = RunProgress(self.limits)
@@ -483,6 +501,9 @@ class ConversationWorker(QThread):
                     raise Cancelled()
                 self.progress.check_time()
                 current = self.store.messages(self.chat_id)
+                if any(row['id'] > input_cursor and row['role'] == 'notice'
+                       and row_payload(row).get('task_outcome') == 'ended_by_user' for row in current):
+                    raise RunHalted('user_stop', 'The user ended this task. Its saved action outcomes remain unchanged.')
                 if next((row['id'] for row in reversed(current) if row['role'] == 'user'), None) != input_cursor:
                     raise RunHalted('new_input', 'New user input was saved. This run stopped before another dispatch; review that input before continuing.')
                 return current
@@ -490,10 +511,13 @@ class ConversationWorker(QThread):
             self._check_dispatch = check_run
 
             # A crashed action must not be inferred as safe to replay. Explicit
-            # input can ask for reconciliation, but cannot invent its outcome.
+            # task closure can release an old objective, never invent its outcome.
             pending = set()
+            ended_after = next((row['id'] for row in reversed(rows) if row['role'] == 'notice'
+                and row_payload(row).get('task_outcome') == 'ended_by_user'
+                and row_payload(row).get('pause_context_closed') is True), 0)
             for row in rows:
-                if row['id'] < origin:
+                if row['id'] <= ended_after:
                     continue
                 message = row_payload(row).get('message', {})
                 if row['role'] == 'assistant':
@@ -501,18 +525,20 @@ class ConversationWorker(QThread):
                 elif row['role'] == 'tool':
                     pending.discard(message.get('tool_call_id'))
             if pending:
-                raise RunHalted('unknown_outcome', 'A saved action has no recorded outcome. It may have run. Reconcile it before another action; automatic replay is blocked.')
+                raise RunHalted('unknown_outcome', 'A saved action has no recorded outcome. It may have run. Inspect its saved details, then use End task to close this objective before starting new work. Unknown effects remain unknown; automatic replay is blocked.')
 
-            project = self.store.project_for_context(chat['project_id']) if chat['project_id'] else None
+            project = self.store.project_for_context(chat['project_id'], read_files=self.computer_enabled) if chat['project_id'] else None
             roots = self.store.links(chat['project_id']) if project else []
+            shared_roots = self.store.setting('source_roots', [])
+            if isinstance(shared_roots, list):
+                roots = list(dict.fromkeys([root for root in shared_roots if isinstance(root, str)] + roots))
             query = '\n'.join(row['content'] for row in required if row['role'] == 'user')
             tools = []
             if self.use_tools:
                 for definition in TOOL_SCHEMAS:
                     name = definition['function']['name']
-                    enabled = (name in SAVED_READ_TOOLS
-                        or (name in ('web_search', 'fetch_url') and self.web_enabled)
-                        or (name not in (*SAVED_READ_TOOLS, 'web_search', 'fetch_url') and self.computer_enabled))
+                    enabled = tool_enabled(name, computer_enabled=self.computer_enabled,
+                                           actions_enabled=self.actions_enabled, web_enabled=self.web_enabled)
                     if enabled:
                         tools.append(definition)
             context_size = self.engine.config.context_size
@@ -525,8 +551,14 @@ class ConversationWorker(QThread):
             provenance = (f'Local model file: {Path(model_path).name if model_path else "not configured"}. '
                           f'Context: {context_size} tokens; maximum response: {reply_size} tokens. '
                           'Memory is editable user context; it does not change model weights.')
+            runtime = application_info(self.store) if self.computer_enabled else None
+            if runtime:
+                provenance += '\n' + json.dumps({key: runtime[key] for key in
+                    ('version', 'runtime_root', 'development_root')}, ensure_ascii=False)
+                provenance += '\nUse app_info for observed installation/docs/history; paths alone are not consulted evidence.'
             executor = ToolExecutor(roots, self.store.directory, self.ask, self.cancel_event,
-                self.web_enabled, self.computer_enabled, store=self.store, chat_id=self.chat_id)
+                self.web_enabled, self.computer_enabled, store=self.store, chat_id=self.chat_id,
+                actions_enabled=self.actions_enabled)
             self.engine.start(self.cancel_event, self.status.emit)
             last_usage = None
 
@@ -560,19 +592,27 @@ class ConversationWorker(QThread):
                     + 'Recent action/verification outcomes: ' + json.dumps(brief, ensure_ascii=False)
                     + '\n' + evidence_summary(state, max_files=3))
 
+            context_receipt = {}
             def packed_messages():
                 nonlocal retrieval_budget
                 current = check_run()
                 extra = run_context(current)
                 def context():
                     return build_context(project, roots if self.computer_enabled else [], query,
-                        retrieval_budget, self.cancel_event, strand=self.store.strand, provenance=provenance,
-                        allow_core_overflow=True) + extra
+                        retrieval_budget, self.cancel_event, strand=self.store.strand if self.computer_enabled else None,
+                        provenance=provenance, allow_core_overflow=True, receipt=context_receipt) + extra
                 system = context()
                 overflow = None
                 while True:
                     try:
-                        messages, trimmed = conversation_messages(current, system, context_size, measure=measure)
+                        messages, trimmed = conversation_messages(current, system, context_size, measure=measure,
+                                                                  receipt=context_receipt)
+                        context_receipt.update(runtime=runtime,
+                            capabilities={'read_files': bool(self.computer_enabled), 'actions': bool(self.actions_enabled),
+                                          'web': bool(self.web_enabled), 'tools': bool(self.use_tools)},
+                            available_tools=[tool['function']['name'] for tool in tools],
+                            retrieval_reduced=bool(overflow),
+                            included_tool_results=[dict(message) for message in messages if message['role'] == 'tool'])
                         if trimmed or overflow:
                             self.status.emit('Using bounded context; full conversation and tool results remain saved.')
                         if last_usage and 'estimate' in last_usage.method:
@@ -606,7 +646,7 @@ class ConversationWorker(QThread):
                     draft, reasoning = '', ''
                     request_record = self.run_record()
                     stream_payload = {'continuation': request_record, 'source_exposure_pending': exposure,
-                                      'run_configuration': self.run_configuration}
+                                      'run_configuration': self.run_configuration, 'context': dict(context_receipt)}
                     message_id = self.store.add_message(self.chat_id, 'assistant', '', status='streaming',
                                                         payload=stream_payload)
                     self.changed.emit()
@@ -642,7 +682,8 @@ class ConversationWorker(QThread):
                     response_id = message_id
                     data = {'message': reply, 'pause_context_closed': False,
                             'continuation': request_record, 'source_exposure': exposure,
-                            'request_completed': True, 'run_configuration': self.run_configuration}
+                            'request_completed': True, 'run_configuration': self.run_configuration,
+                            'context': dict(context_receipt)}
                     if reasoning:
                         data['reasoning'] = reasoning
                     self.store.update_message(message_id, draft, payload=data)

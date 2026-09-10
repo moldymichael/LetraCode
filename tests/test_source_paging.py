@@ -148,13 +148,13 @@ def test_docx_paging_is_readonly_with_explicit_extraction_coverage_and_version(t
     assert changed['source_truncated'] is False
 
 
-def test_character_reads_keep_computer_disabled_and_outside_approval_boundary(tmp_path):
+def test_character_reads_obey_read_switch_and_are_not_limited_to_sources(tmp_path):
     path = tmp_path / 'source.txt'
     path.write_text('private')
     assert 'denied' in json.loads(reader(tmp_path, computer_enabled=False).execute(
         'read_file', {'path': str(path), 'offset': 0}))
     tool = ToolExecutor([], tmp_path / 'appdata', lambda _: False, threading.Event())
-    assert 'denied' in json.loads(tool.execute('read_file', {'path': str(path), 'offset': 0}))
+    assert json.loads(tool.execute('read_file', {'path': str(path), 'offset': 0}))['text'] == 'private'
 
 
 def test_search_overlap_keeps_boundary_marker_and_initial_file_diversity(tmp_path):
@@ -174,10 +174,13 @@ def test_search_bounds_total_supported_character_work(tmp_path):
     for i in range(6):
         (tmp_path / f'{i}.txt').write_bytes(b'x' * MAX_FILE)
     (tmp_path / '7.txt').write_text('OUTSIDE_SEARCH_BUDGET')
-    hits = ProjectFiles([str(tmp_path)]).search('OUTSIDE_SEARCH_BUDGET')
-    assert len(hits) == 6
+    files = ProjectFiles([str(tmp_path)])
+    hits = files.search('OUTSIDE_SEARCH_BUDGET')
+    assert hits == []
+    assert files.report['scanned_files'] == 6
+    assert files.report['search_limit_reached'] is True
     assert not any('OUTSIDE_SEARCH_BUDGET' in hit['text'] for hit in hits)
-    assert sum(hit['searched_chars'] for hit in hits) == 12 * 1024 * 1024
+    assert files.report['searched_chars'] == 12 * 1024 * 1024
 
 
 def pdf(path, text):

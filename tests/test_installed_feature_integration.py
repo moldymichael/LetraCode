@@ -30,7 +30,7 @@ def window(tmp_path):
 
 
 def test_both_workspaces_keep_speaker_labels_and_independent_live_thinking(window):
-    assert [window.workspaces.tabText(i) for i in range(window.workspaces.count())] == ['Chat', 'Fine-Tuning']
+    assert [window.workspaces.tabText(i) for i in range(window.workspaces.count())] == ['Chat', 'Knowledge', 'Improve', 'Settings']
     chat = window.store.create_chat('Two models thinking')
     saved = window.store.add_message(chat, 'assistant', 'First answer', payload={
         'speaker': {'id': 'a', 'label': 'Model A · <base & adapter>'},
@@ -76,7 +76,9 @@ def test_learn_from_exchange_uses_latest_complete_answer_without_reasoning(windo
     window.learn_button.click()
     panel = window.training_panel
     assert window.workspaces.currentWidget() is panel
-    assert panel.prompt.toPlainText() == 'Compare the options'
+    assert panel.prompt.toPlainText().endswith('Compare the options')
+    assert 'Model A answer' in panel.prompt.toPlainText()
+    assert 'private reasoning' not in panel.prompt.toPlainText()
     assert panel.response.toPlainText() == 'Model B answer'
     assert panel.example_source == f'chat:{chat}/message:{ident}'
     assert panel.repository.examples() == [] and panel.repository.runs() == []
@@ -128,7 +130,7 @@ def test_model_setup_keeps_both_second_model_and_primary_adapter(tmp_path):
         dialog.validate()
         assert dialog.result() == QDialog.DialogCode.Accepted
         assert dialog.config() == dataclasses.replace(config, temperature=0.4)
-        assert 'only to Model A' in dialog.lora.toolTip()
+        assert 'only to Strand’s primary model' in dialog.lora.toolTip()
     finally:
         dialog.close()
 
