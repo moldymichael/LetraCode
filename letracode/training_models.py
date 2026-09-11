@@ -28,7 +28,16 @@ def _check_cancel(cancel):
 
 
 def _identity(info):
-    # ctime catches same-size rewrites even if a caller restores mtime.
+    # POSIX ctime catches same-size rewrites even if a caller restores mtime.
+    # On current Windows Python, path stat reports creation time as ctime while
+    # handle stat reports metadata-change time; birthtime is common to both.
+    changed = (getattr(info, 'st_birthtime_ns', info.st_ctime_ns)
+               if sys.platform == 'win32' else info.st_ctime_ns)
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, changed)
+
+
+def _handle_identity(info):
+    """Retain handle ChangeTime/ctime for the before-to-after read check."""
     return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
 
 
@@ -52,13 +61,17 @@ def _file_record(path, cancel=None):
             return dict(cached[1])
         digest = hashlib.sha256()
         with path.open('rb') as stream:
-            before = _identity(os.fstat(stream.fileno()))
+            before_info = os.fstat(stream.fileno())
+            before = _identity(before_info)
             for chunk in iter(lambda: stream.read(4 * 1024 * 1024), b''):
                 _check_cancel(cancel)
                 digest.update(chunk)
-            after = _identity(os.fstat(stream.fileno()))
+            after_info = os.fstat(stream.fileno())
+            after = _identity(after_info)
         _check_cancel(cancel)
-        if identity != before or before != after or after != _identity(path.stat()):
+        if (identity != before or before != after or
+                _handle_identity(before_info) != _handle_identity(after_info) or
+                after != _identity(path.stat())):
             raise ValueError(f'File changed while verifying it: {path}')
     except OSError as exc:
         raise ValueError(f'Cannot verify local file {path}: {exc}') from exc
