@@ -81,7 +81,7 @@ jobs:
           $process = Start-Process $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
       - name: Build self-contained Windows downloads
-        run: python packaging/build-windows.py
+        run: python packaging/build-windows.py --iscc "$env:ProgramFiles\Inno Setup 7\ISCC.exe"
       - name: Install, open, update, uninstall, retain data and open portable app
         shell: pwsh
         run: |

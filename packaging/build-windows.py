@@ -28,7 +28,11 @@ def version() -> str:
 
 
 def compiler_path(explicit: str | None = None) -> str:
-    candidates = [explicit, shutil.which("ISCC.exe")]
+    if explicit:
+        if not Path(explicit).is_file():
+            raise RuntimeError(f"Explicit Inno Setup compiler does not exist: {explicit}")
+        return str(Path(explicit).resolve())
+    candidates = [shutil.which("ISCC.exe")]
     candidates.extend(str(Path(os.environ.get(key, fallback)) / f"Inno Setup {major}/ISCC.exe")
                       for major in (7, 6)
                       for key, fallback in (("ProgramFiles", "C:/Program Files"),

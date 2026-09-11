@@ -7,6 +7,7 @@ import sys
 import tarfile
 import tomllib
 import zipfile
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,8 @@ def test_windows_builder_finds_current_compiler_and_honors_explicit_path(tmp_pat
     monkeypatch.setattr(module.shutil, "which", lambda name: None)
     assert module.compiler_path() == str(current.resolve())
     assert module.compiler_path(str(old)) == str(old.resolve())
+    with pytest.raises(RuntimeError, match="Explicit Inno Setup compiler"):
+        module.compiler_path(str(native / "missing/ISCC.exe"))
 
 
 def test_windows_bundle_includes_current_guides_and_training_inputs(tmp_path):
