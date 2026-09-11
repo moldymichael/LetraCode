@@ -1,0 +1,37 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+    groups:
+      github-actions:
+        patterns: ['*']
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 2
+  - package-ecosystem: pip
+    directory: /packaging
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 3
+    groups:
+      windows-build:
+        patterns:
+          - PySide6
+          - pypdf
+          - PyInstaller
+          - pyinstaller-hooks-contrib
+          - Pillow
+      training:
+        patterns:
+          - torch
+          - transformers
+          - peft
+          - safetensors
+          - sentencepiece
+          - accelerate
+          - bitsandbytes

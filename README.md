@@ -1,149 +1,118 @@
 # LetraCode
 
-LetraCode is the home of **Strand**, one persistent, general-purpose local
-assistant for writing, learning, files and ongoing projects. It uses native Qt
-on Fedora KDE and Windows. Conversations, notes, model inference and training
-stay on your computer. There is no account, telemetry or cloud inference.
+LetraCode is a local desktop AI application for writing, learning, files and ongoing projects. It uses a model on your computer rather than a hosted chat service. The current interface calls the assistant **Strand**.
 
-This checkout is **0.6.0**, the Strand experience redesign, based on the installed
-0.5.0 Gemma work. It preserves existing data, guarded file editing, approvals,
-training artifacts and model rollback. See the [user guide and verification
-record](docs/STRAND-EXPERIENCE.md), [design](docs/superpowers/specs/2026-09-10-strand-experience.md)
-and [development history](docs/CURRENT-STATE.md). Older public downloads do not
-include these changes; build this checkout for the current application.
+The application uses Python and native Qt widgets on Fedora KDE and Windows. Chat history and saved notes stay in your local data folder. No LetraCode account or cloud inference service is required. Optional web research and approved commands can access the network; see [permissions and privacy](#permissions-and-privacy).
 
-## Start with Strand
+## Choose where to start
 
-1. Open **Settings → Choose or change model**. Choose a local `llama-server`
-   program and a GGUF chat model. Existing settings are retained. **Find local
-   models** checks common folders; Browse can select a model anywhere.
-2. Leave Advanced settings at their defaults if unsure. **Test local reply**
-   checks loading and a real reply without changing saved chats. It does not
-   certify answer quality or tool support.
-3. Open **Chat**, type a question and press Ctrl+Enter. Enter makes a new line.
-   Your draft saves automatically. Read other chats and prepare your next
-   message while Strand works; one model job runs at a time.
+| Your goal | Start here |
+| --- | --- |
+| Install on Windows | [Windows installation and first reply](docs/WINDOWS.md) |
+| Use the current interface | [User guide](docs/STRAND-EXPERIENCE.md) |
+| Check current limitations | [Known issues and current boundaries](docs/KNOWN-ISSUES.md) |
+| Run or modify the source | [Contributor setup: Windows and Fedora](CONTRIBUTING.md) |
+| Find technical records or older documentation | [Documentation index](docs/README.md) |
 
-**Workspaces** focus the same Strand on particular work. They are optional.
-Shared notes remain available across workspaces; workspace notes and instructions
-supply the current focus. Conversations and saved knowledge are not model training.
+## Development version versus published download
 
-## Four places, four purposes
+**Status checked September 11, 2026:** this source tree identifies as **0.6.0**. The latest published [GitHub release](https://github.com/moldymichael/LetraCode/releases) is **0.3.0**. They are not the same build. Cloning the repository does not update an installed copy, and a newer version number in source does not mean a newer release has been published.
 
-- **Chat:** everyday work, saved conversations, per-reply Copy/Create example,
-  and **Used for this reply** receipts. Conversation options contain advanced
-  tool compatibility and optional bounded two-model exchanges. **Ask again**
-  repeats the question as a new turn and keeps the previous answer.
-- **Knowledge:** see saved notes and useful source files. **Automatic** notes
-  are included when local reading is enabled; **Available** files can be found
-  and read when relevant. Originals stay in their current folders and open in
-  Dolphin, Obsidian or their usual application. Note settings provide explicit
-  saves, retained drafts, history and Undo.
-- **Improve:** create and approve self-contained examples; check preparation;
-  train a candidate; compare every held-out question in the actual Chat runtime;
-  save your judgment; choose a version or return to the previous one.
-- **Settings:** model readiness and testing, permission explanations,
-  LetraCode source-checkout selection, data location, backup and diagnostics.
+The 0.6.0 development line contains Chat, Knowledge, Improve and Settings, plus the comparison and source-reading updates. Development artifacts are test candidates, not releases. The [Windows guide](docs/WINDOWS.md#development-test-builds) explains how to select a candidate by exact commit, workflow run and evidence rather than relying on a version label or one green packaging job.
 
-## Reading and action permissions
+Windows launch compatibility and CI repairs are tracked separately:
 
-**Read local files** allows Strand to read supported ordinary files anywhere
-your operating-system account can read, including hidden paths. Selected sources
-prioritize relevance; they are not an access boundary. Turning this off excludes
-automatic note/source text and file-reading tools. Saved conversation text and
-workspace instructions remain available.
+- [Issue #6](https://github.com/moldymichael/LetraCode/issues/6): launching installations that use `llama.exe serve` instead of a dedicated `llama-server.exe`.
+- [PR #8](https://github.com/moldymichael/LetraCode/pull/8): Windows/Fedora test portability, native quantizer selection and model-file verification repairs. It does **not** fix issue #6.
 
-**Edits & commands** allows proposals for changes, with exact approval previews,
-conflict checks and retained previous bytes. Commands require a separate
-acknowledgment and run with your account, including network authority. A legacy
-grant for automatic additions to one saved learning note remains explicit in
-Note settings; it is saved information, not model training.
+Use the [known-issues page](docs/KNOWN-ISSUES.md) and those live threads for status. Earlier test counts and installation records are evidence for the builds they name, not guarantees about every later checkout.
 
-**Web research** asks before every outgoing query or URL. Turning it off disables
-web tools; it does not sandbox separately approved shell commands. **Model tools**,
-in Conversation options, is a compatibility setting for models without tool use.
+## What you need
 
-The reply receipt shows recorded request contents, source excerpts, permissions
-and limits. “Available,” “retrieved,” “included” and “understood” are different
-things. Old replies without receipts remain readable and are labeled honestly.
+There are three separate pieces:
 
-## Improving Strand
+1. **LetraCode:** the desktop application. The Windows installer includes Python, Qt/PySide6 and PDF support.
+2. **llama.cpp:** the engine program that loads the model. This checkout expects a dedicated `llama-server` executable, or `llama-server.exe` on Windows. Unified-binary support is tracked in #6.
+3. **A compatible GGUF model:** the model weights. Existing compatible `.gguf` files can be reused; the engine executable must match the operating system. A Linux `llama-server` is not a Windows executable.
 
-Use **Create example** on a reply, or write one in Improve. Make the question
-understandable on its own; correct the desired answer and remove irrelevant
-background. Captured earlier dialogue is editable, and files/tool output are not
-silently copied. Keep different questions for comparison. Only approved teaching
-examples go into optimization; comparison examples are held out.
+Neither llama.cpp nor model weights are bundled with LetraCode. Model size, context length, engine build and available RAM/VRAM determine what your machine can run. Finding a model file does not establish compatibility.
 
-LetraCode checks preparation before unloading Chat, reuses saved local training
-configuration, and can prepare the supported matching Gemma model. Numeric
-settings remain available under preparation details. If conversion fails after
-training, retry it from the retained adapter. **Compare with Strand** opens a
-comparison window. Add fresh questions, run both versions, and read their full
-answers side by side. Original held-out questions remain included. Progress,
-partial answers, errors, previous attempts and your judgments are retained.
-**Export comparison…** saves this evidence separately from the short optimizer
-evaluation in the run folder. Comparison uses the Chat runtime and settings
-and does not automatically adopt.
-A lower training loss is not proof of useful improvement. Record regressions,
-uncertain outcomes and your own judgment before choosing a version.
+<a id="install-or-build"></a>
 
-Supported optimization remains local LoRA/QLoRA for text-only Llama and the
-supported Gemma 4 E2B/E4B path. Training requires original compatible weights and
-local training/conversion dependencies; an arbitrary GGUF alone cannot be
-trained. No model or package is downloaded automatically. Generic Llama pairing
-has less provenance assurance than app-prepared Gemma pairing. See the
-[training guide](docs/FINE-TUNING.md) and [Gemma record](docs/GEMMA4.md).
+## Install and start
 
-## Install or build
+### Windows
 
-From this source checkout on Fedora KDE:
+Follow the [Windows guide](docs/WINDOWS.md) to choose a published download or an explicitly identified development test build. Ordinary installation does not require Git, Python, a compiler or a source checkout. Contributors who need editable source should use [CONTRIBUTING.md](CONTRIBUTING.md#windows-development).
+
+### Fedora KDE
+
+From the root of a source checkout, run in Konsole:
 
 ```bash
 ./install.sh
 ```
 
-The installer explains its distribution dependencies and requests `sudo` for
-those packages. It installs LetraCode for your user and keeps application files
-separate from your data. A compatible local `llama-server` and model weights are
-separate; use the instructions in Model setup and the engine/model publisher’s
-requirements. GPU support depends on the engine build and driver.
+The script explains its distribution dependencies and requests `sudo` for those packages. Application files are installed for your user, separately from data. `./install.sh --no-deps` is intended for systems whose required dependencies have already been checked. To run source without changing the installed application, use the [Fedora development instructions](CONTRIBUTING.md#fedora-development).
 
-Build source and Fedora self-extracting archives:
+<a id="start-with-strand"></a>
 
-```bash
-python3 packaging/build-release.py
-```
+### First reply in 0.6.0
 
-Run the resulting `.run` from Konsole, or build native Windows artifacts using
-the included workflow/build scripts. Windows packaging details are in the
-[Windows release guide](docs/WINDOWS-RELEASE.md). Development systems with the
-required packages already installed may use `./install.sh --no-deps`.
+Open **Settings → Choose or change model** and select the engine and GGUF. Start with the default settings; CPU mode avoids GPU setup but still requires enough RAM for the model. **Test local reply** checks that the selected engine can load the model and answer. It does not certify answer quality or tool support.
 
-## Ownership and recovery
+Open **Chat**, enter a question and press **Ctrl+Enter**. Enter adds a line. Drafts save automatically. You can read other chats and prepare drafts while a job runs; only one model job runs at a time.
 
-On Linux data lives in `${XDG_DATA_HOME:-~/.local/share}/letracode`; installed app
-files live separately in `letracode-app`. On Windows data uses the account’s
-LocalAppData LetraCode directory. **Settings → Back up LetraCode** creates a
-restorable snapshot with a guide. Keep separate backups of linked originals and
-large training/model artifacts. Export Evaluation makes a privacy-filtered
-review bundle, not a restorable backup; inspect its conversation prose before
-sharing. Automatic request receipts are private and excluded from that export.
+<a id="four-places-four-purposes"></a>
 
-Stopping keeps saved output. A paused task offers **Start a fresh task in this
-chat**, retaining history and unknown-action records without replaying effects.
-Long chats display recent messages with **Load earlier messages** and search;
-model context remains bounded, with reduction reported in receipts.
+## The four areas
 
-Uninstalling retains the data folder. The [historical README](docs/README-0.5.0.md)
-and dated verification records preserve earlier development findings.
+| Area | Purpose |
+| --- | --- |
+| **Chat** | Saved conversations, optional bounded two-model exchanges, Copy/Create example, and **Used for this reply** receipts. |
+| **Knowledge** | Shared and workspace notes, useful source files, explicit saves, retained drafts, history and Undo. Originals stay where they are. |
+| **Improve** | Review examples, prepare training, compare candidate answers and explicitly adopt or roll back a model version. |
+| **Settings** | Choose/test the model, control permissions, locate data, create backups and inspect diagnostics. |
 
-## Development checks
+Workspaces are optional ways to focus ongoing work. Shared notes can follow you across workspaces. Saved notes are not model training. The [user guide](docs/STRAND-EXPERIENCE.md) explains everyday use; [comparison workflow](docs/COMPARISON-WORKFLOW.md) describes the current candidate-review interface.
 
-```bash
-QT_QPA_PLATFORM=offscreen python3 -m pytest -q
-python3 -m compileall -q letracode
-python3 packaging/build-release.py
-```
+<a id="reading-and-action-permissions"></a>
 
-License: [MIT](LICENSE).
+## Permissions and privacy
+
+**Read local files** permits supported ordinary file reads anywhere your operating-system account can read, including hidden paths. Selected sources prioritize useful material; they are **not a sandbox**. Turning this permission off removes automatic file text and file-reading tools, but saved conversation/result text and workspace instructions remain available.
+
+**Edits & commands** permits proposals with approval previews and conflict checks. Commands require a separate acknowledgment and run with your account's authority, including network access. A legacy grant for automatic additions to one saved note is visible in Note settings; it is not a general editing grant.
+
+**Web research** asks for approval before each outgoing query or URL. Turning it off disables web tools, not the network access of separately approved commands. **Model tools** is a compatibility option for models without tool use, not a security boundary.
+
+Receipts record what was supplied to a request, including private excerpts. They cannot prove comprehension. Review logs, screenshots and exports before sharing them. See the [permission details](docs/STRAND-EXPERIENCE.md#permission-controls).
+
+<a id="improving-strand"></a>
+
+## Training is optional
+
+Normal chat does not require a training environment. Improve supports local LoRA/QLoRA for compatible text-only Llama models and the supported Gemma 4 E2B/E4B path. It requires compatible original weights and separate training/conversion dependencies; an arbitrary GGUF alone cannot be trained.
+
+Only approved teaching examples are optimized on. Comparison examples are held out, and adopting a candidate is explicit. Lower training loss is not proof of better answers. See the [training guide](docs/FINE-TUNING.md) and [Gemma support record](docs/GEMMA4.md); do not infer native Windows training validation from an installer smoke test.
+
+<a id="ownership-and-recovery"></a>
+
+## Data, backups and recovery
+
+| Platform | Default user data |
+| --- | --- |
+| Windows | `%LOCALAPPDATA%\LetraCode` |
+| Linux | `${XDG_DATA_HOME:-~/.local/share}/letracode` |
+
+Application files are separate. **Settings → Back up LetraCode** creates a restorable snapshot with a guide. Back up linked originals and large model/training artifacts separately. Evaluation export is a review bundle, not a restorable backup.
+
+Uninstalling retains the data folder. On Windows, the portable app uses that same folder by default; portable does not mean isolated. Use an explicit `--data-dir` for tests. See [Windows data isolation](docs/WINDOWS.md#test-without-touching-existing-data).
+
+Stopping retains saved output. A paused chat offers **Start a fresh task in this chat**, preserving history and unknown-action records without replaying their effects. Long conversations remain searchable even though the model's context is bounded.
+
+<a id="development-checks"></a>
+
+## For developers
+
+[CONTRIBUTING.md](CONTRIBUTING.md) contains the two-person branch/review workflow, runnable setup and test commands, a source map, packaging instructions and expected verification evidence. [RELEASING.md](docs/RELEASING.md) defines the separate release handoff and verification gate. [AGENTS.md](AGENTS.md) records source/data handling rules. The project is licensed under [MIT](LICENSE); bundled dependencies and model weights have their own licenses.

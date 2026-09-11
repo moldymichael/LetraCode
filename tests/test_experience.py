@@ -80,8 +80,9 @@ def test_model_setup_keeps_expert_options_collapsed_and_roundtrips(tmp_path):
     from letracode.dialogs import ModelDialog
     from letracode.engine import EngineConfig
     app = QApplication.instance() or QApplication([])
-    cfg = EngineConfig(executable='/local/llama-server', model_path='/local/model.gguf',
-                       secondary_model_path='/local/other.gguf', gpu_layers=17, lora_path='/local/adapter.gguf')
+    cfg = EngineConfig(executable=str(tmp_path / 'llama-server'), model_path=str(tmp_path / 'model.gguf'),
+                       secondary_model_path=str(tmp_path / 'other.gguf'), gpu_layers=17,
+                       lora_path=str(tmp_path / 'adapter.gguf'))
     dialog = ModelDialog(cfg)
     try:
         assert not dialog.advanced.isVisible()

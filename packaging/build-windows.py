@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Build the self-contained x64 Windows installer and portable application ZIP.
 
-Run on Windows after installing windows-requirements.txt and Inno Setup 6.
+Run on Windows after installing windows-requirements.txt and Inno Setup 7.
 The application dependencies and Python runtime are bundled; no model is.
 """
 from __future__ import annotations
@@ -28,13 +28,29 @@ def version() -> str:
 
 
 def compiler_path(explicit: str | None = None) -> str:
-    candidates = [explicit, shutil.which("ISCC.exe")]
-    candidates.extend(str(Path(os.environ.get(key, "C:/Program Files (x86)")) / "Inno Setup 6/ISCC.exe")
-                      for key in ("ProgramFiles(x86)", "ProgramFiles"))
+    if explicit:
+        if not Path(explicit).is_file():
+            raise RuntimeError(f"Explicit Inno Setup compiler does not exist: {explicit}")
+        return str(Path(explicit).resolve())
+    candidates = [shutil.which("ISCC.exe")]
+    candidates.extend(str(Path(os.environ.get(key, fallback)) / f"Inno Setup {major}/ISCC.exe")
+                      for major in (7, 6)
+                      for key, fallback in (("ProgramFiles", "C:/Program Files"),
+                                            ("ProgramFiles(x86)", "C:/Program Files (x86)")))
     for candidate in candidates:
         if candidate and Path(candidate).is_file():
             return str(Path(candidate).resolve())
-    raise RuntimeError("Install Inno Setup 6 from https://jrsoftware.org/isdl.php, or pass --iscc PATH.")
+    raise RuntimeError("Install Inno Setup 7 from https://jrsoftware.org/isdl.php, or pass --iscc PATH.")
+
+
+def copy_support_files(bundle: Path) -> None:
+    """Keep the shipped guides and both separate training environments usable."""
+    for name in ("LICENSE", "README.md", "CONTRIBUTING.md", "AGENTS.md"):
+        shutil.copy2(ROOT / name, bundle / name)
+    shutil.copytree(ROOT / "docs", bundle / "docs", dirs_exist_ok=True)
+    (bundle / "packaging").mkdir(exist_ok=True)
+    for name in ("training-requirements.txt", "gemma-training-requirements.txt"):
+        shutil.copy2(ROOT / "packaging" / name, bundle / "packaging" / name)
 
 
 def create_icon(destination: Path) -> None:
@@ -118,11 +134,7 @@ def build(output: Path, iscc: str | None = None) -> list[Path]:
                "--hidden-import", "PySide6.QtSvg", str(ROOT / "packaging/windows-launcher.py")]
     subprocess.run(command, cwd=ROOT, check=True)
     bundle = work / "dist/LetraCode"
-    for name in ("LICENSE", "README.md"):
-        shutil.copy2(ROOT / name, bundle / name)
-    shutil.copytree(ROOT / "docs", bundle / "docs", dirs_exist_ok=True)
-    (bundle / "packaging").mkdir(exist_ok=True)
-    shutil.copy2(ROOT / "packaging/training-requirements.txt", bundle / "packaging/training-requirements.txt")
+    copy_support_files(bundle)
     release_version = version()
     (bundle / "version.json").write_text(json.dumps({"version": release_version, "python": platform.python_version(),
         "architecture": "x64"}, indent=2) + "\n", encoding="utf-8")

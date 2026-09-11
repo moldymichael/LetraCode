@@ -1,5 +1,7 @@
 # Windows release 0.3.0
 
+> **Historical verification record.** These findings apply to the September 8, 2026 release and the commits named below, not to all later 0.6.0 development builds. For installation today, use the [Windows guide](WINDOWS.md). For document status and navigation, use the [index](README.md).
+
 This release brings the current Project files interface and schema-3 backend
 to Windows 10 version 1809 or newer and Windows 11 x64. The Windows setup executable includes Python, Qt/PySide6
 and PDF support. The publication build bundles Python 3.13. Installation is per user, with a Start Menu shortcut and
@@ -76,4 +78,4 @@ on the separately selected llama.cpp build and GGUF model.
 
 The installer is unsigned. Download it from the repository's versioned GitHub
 release and compare its SHA-256 checksum if Windows asks about its publisher.
-The repository and release downloads remain private and require repository access.
+At the time of the original release verification, access was private. As checked September 11, 2026, the repository and published releases are public; Actions artifact downloads still require GitHub sign-in and read access.
