@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -86,9 +87,6 @@ else:
         shutil.copy2(sys.executable, binary)
         # A copied python.exe needs the original runtime location for stdlib/DLLs.
         monkeypatch.setenv('PYTHONHOME', sys.base_prefix)
-        # Native Python 3.13+ runners observed a file-identity transition on the
-        # copied interpreter's first execution. Prime it before it is recorded.
-        subprocess.run([str(binary), '-c', 'pass'], check=True, capture_output=True)
     else:
         binary = folder / 'llama-quantize'
         binary.write_text(f'#!{sys.executable}\n' + '''import sys
@@ -175,6 +173,19 @@ def test_windows_rehashes_when_file_identity_cannot_detect_a_rewrite(tmp_path, m
     changed = helper._file_record(path)
 
     assert changed['sha256'] != original['sha256']
+
+
+def test_windows_path_and_handle_stats_share_one_file_identity(monkeypatch):
+    helper = pairing()
+    common = {
+        'st_dev': 7, 'st_ino': 11, 'st_size': 13, 'st_mtime_ns': 17,
+        'st_birthtime_ns': 19,
+    }
+    path_stat = SimpleNamespace(**common, st_ctime_ns=19)
+    handle_stat = SimpleNamespace(**common, st_ctime_ns=23)
+    monkeypatch.setattr(helper.sys, 'platform', 'win32')
+
+    assert helper._identity(path_stat) == helper._identity(handle_stat)
 
 
 def test_prepared_pair_rejects_another_source_directory(model, converter, tmp_path):

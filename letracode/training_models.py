@@ -28,8 +28,12 @@ def _check_cancel(cancel):
 
 
 def _identity(info):
-    # ctime catches same-size rewrites even if a caller restores mtime.
-    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+    # POSIX ctime catches same-size rewrites even if a caller restores mtime.
+    # On current Windows Python, path stat reports creation time as ctime while
+    # handle stat reports metadata-change time; birthtime is common to both.
+    changed = (getattr(info, 'st_birthtime_ns', info.st_ctime_ns)
+               if sys.platform == 'win32' else info.st_ctime_ns)
+    return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, changed)
 
 
 def _file_record(path, cancel=None):
