@@ -57,6 +57,8 @@ def _write_quantizer_peer(checkout, body):
 def converter(tmp_path, monkeypatch):
     checkout = tmp_path / 'llama.cpp'
     checkout.mkdir()
+    folder = checkout / 'build' / 'bin'
+    folder.mkdir(parents=True)
     _write_quantizer_peer(checkout, '''import sys
 from pathlib import Path
 assert len(sys.argv) == 3 and sys.argv[2] == 'Q4_K_M'
@@ -79,13 +81,14 @@ if peer.is_file():
 else:
     Path(a.outfile).write_bytes(b'GGUFintermediate')
 ''')
-    folder = checkout / 'build' / 'bin'
-    folder.mkdir(parents=True)
     if sys.platform == 'win32':
         binary = folder / 'llama-quantize.exe'
         shutil.copy2(sys.executable, binary)
         # A copied python.exe needs the original runtime location for stdlib/DLLs.
         monkeypatch.setenv('PYTHONHOME', sys.base_prefix)
+        # Native Python 3.13+ runners observed a file-identity transition on the
+        # copied interpreter's first execution. Prime it before it is recorded.
+        subprocess.run([str(binary), '-c', 'pass'], check=True, capture_output=True)
     else:
         binary = folder / 'llama-quantize'
         binary.write_text(f'#!{sys.executable}\n' + '''import sys
@@ -152,6 +155,26 @@ def test_same_size_file_mutation_is_rejected_even_with_restored_mtime(model, con
     os.utime(path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
     with pytest.raises(ValueError, match='changed|match|unsupported|Unsupported'):
         helper.verify_gemma_pair(model, output)
+
+
+def test_windows_rehashes_when_file_identity_cannot_detect_a_rewrite(tmp_path, monkeypatch):
+    helper = pairing()
+    path = tmp_path / 'model.safetensors'
+    path.write_bytes(b'first contents')
+    identity = path.stat()
+    monkeypatch.setattr(helper.sys, 'platform', 'win32')
+    # Windows creation time does not provide POSIX ctime's rewrite signal.
+    monkeypatch.setattr(helper, '_identity', lambda info: (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, identity.st_ctime_ns,
+    ))
+    original = helper._file_record(path)
+
+    path.write_bytes(b'other contents')
+    os.utime(path, ns=(identity.st_atime_ns, identity.st_mtime_ns))
+
+    changed = helper._file_record(path)
+
+    assert changed['sha256'] != original['sha256']
 
 
 def test_prepared_pair_rejects_another_source_directory(model, converter, tmp_path):
@@ -238,13 +261,14 @@ def test_preparation_never_writes_into_original_model_directory(model, converter
 
 
 def test_relative_training_python_still_runs_inside_fresh_scratch(model, converter, tmp_path, monkeypatch):
-    python = tmp_path / 'training' / 'bin' / 'python'
+    name = 'python.exe' if sys.platform == 'win32' else 'python'
+    python = tmp_path / 'training' / 'bin' / name
     python.parent.mkdir(parents=True)
     python.symlink_to(sys.executable)
     monkeypatch.chdir(tmp_path)
     output = tmp_path / 'chat.gguf'
     helper = pairing()
-    helper.prepare_gemma_chat('training/bin/python', model, converter, output)
+    helper.prepare_gemma_chat(str(Path('training/bin') / name), model, converter, output)
     assert helper.verify_gemma_pair(model, output)['gguf']['bytes'] > 4
 
 

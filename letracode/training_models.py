@@ -42,7 +42,10 @@ def _file_record(path, cancel=None):
         identity = _identity(current)
         key = str(path.absolute())
         cached = _HASH_CACHE.get(key)
-        if cached and cached[0] == identity:
+        # Windows exposes creation time through st_ctime, so a same-size rewrite
+        # can restore mtime and retain every identity field. Rehash there rather
+        # than trusting a cache entry that cannot prove the bytes are unchanged.
+        if sys.platform != 'win32' and cached and cached[0] == identity:
             _check_cancel(cancel)
             if _identity(path.stat()) != identity:
                 raise ValueError(f'File changed while verifying it: {path}')
