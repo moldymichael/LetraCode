@@ -5,3 +5,6 @@ __pycache__/
 stabilization-test-data/
 dist/
 build/
+.venv/
+.venv-*/
+*.egg-info/

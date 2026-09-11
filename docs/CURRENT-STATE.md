@@ -1,5 +1,11 @@
 # Current implementation state
 
+> **Repository snapshot: September 11, 2026.** Remote `main` at `c239fa4407f6b967be025fdf50c6aa124a296e2c` identifies as 0.6.0; the published release is 0.3.0. [PR #8](https://github.com/moldymichael/LetraCode/pull/8) tracks CI/quantizer work and [issue #6](https://github.com/moldymichael/LetraCode/issues/6) tracks unified engine invocation. A successful Windows packaging job does not establish a passing full suite. See the [Windows guide](WINDOWS.md) for the exact candidate and limitations, and the [documentation index](README.md) for navigation.
+>
+> Installation statements and machine paths below describe the maintainer's recorded local work. They do not mean that every contributor's installation, remote branch or published download contains those changes. Preserve the dated records; inspect the actual runtime when diagnosing another computer.
+
+## Recorded 0.6.0 implementation and local installation
+
 The **0.6.0 Strand experience** reworks the installed 0.5.0 Gemma lineage into
 Chat, Knowledge, Improve and Settings. Workspaces focus one persistent Strand.
 It adds account-wide explicit file reads with independent action controls,
