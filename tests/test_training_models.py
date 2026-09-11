@@ -188,6 +188,29 @@ def test_windows_path_and_handle_stats_share_one_file_identity(monkeypatch):
     assert helper._identity(path_stat) == helper._identity(handle_stat)
 
 
+def test_windows_rejects_handle_change_during_hash_with_stable_path_identity(tmp_path, monkeypatch):
+    helper = pairing()
+    path = tmp_path / 'model.safetensors'
+    path.write_bytes(b'original contents')
+    path_info = path.stat()
+    real_fstat = helper.os.fstat
+    change_times = iter((23, 29))
+
+    def changing_fstat(fd):
+        info = real_fstat(fd)
+        return SimpleNamespace(
+            st_dev=info.st_dev, st_ino=info.st_ino, st_size=info.st_size,
+            st_mtime_ns=info.st_mtime_ns, st_ctime_ns=next(change_times),
+            st_birthtime_ns=path_info.st_ctime_ns,
+        )
+
+    monkeypatch.setattr(helper.sys, 'platform', 'win32')
+    monkeypatch.setattr(helper.os, 'fstat', changing_fstat)
+
+    with pytest.raises(ValueError, match='changed'):
+        helper._file_record(path)
+
+
 def test_prepared_pair_rejects_another_source_directory(model, converter, tmp_path):
     output = tmp_path / 'chat.gguf'
     assert prepare(model, converter, output).returncode == 0
