@@ -14,6 +14,7 @@ import re
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 
 
@@ -184,10 +185,12 @@ def verify_gemma_pair(base_model, base_gguf, cancel=None):
 
 
 def _quantizer(checkout):
+    names = ('llama-quantize.exe',) if sys.platform == 'win32' else ('llama-quantize', 'llama-quantize.exe')
+    access = os.R_OK if sys.platform == 'win32' else os.X_OK
     for folder in ('build/bin', 'build-cuda/bin', 'bin', '.', 'build/bin/Release', 'build/Release'):
-        for name in ('llama-quantize', 'llama-quantize.exe'):
+        for name in names:
             candidate = checkout / folder / name
-            if candidate.is_file() and os.access(candidate, os.X_OK):
+            if candidate.is_file() and os.access(candidate, access):
                 return candidate.resolve()
     raise ValueError('llama-quantize is missing; build the llama-quantize target in the selected llama.cpp checkout.')
 
