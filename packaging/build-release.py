@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def release_files() -> list[Path]:
     files = [
         ROOT / name
-        for name in ("pyproject.toml", "install.sh", "uninstall.sh", "README.md", "AGENTS.md", "LICENSE")
+        for name in ("pyproject.toml", "install.sh", "uninstall.sh", "README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE")
     ]
     files.extend((ROOT / "letracode").glob("*.py"))
     files.append(ROOT / "letracode/assets/io.letracode.LetraCode.svg")
@@ -39,11 +39,13 @@ def release_files() -> list[Path]:
     files.extend((ROOT / "docs").rglob("*.md"))
     files.extend((ROOT / "docs").rglob("*.json"))
     files.extend((ROOT / "tools").glob("*.py"))
-    files.extend((ROOT / ".github/workflows").glob("*.yml"))
+    for pattern in ("*.yml", "*.yaml", "*.md"):
+        files.extend((ROOT / ".github").rglob(pattern))
     files.extend((ROOT / "packaging/licenses").rglob("*.txt"))
     files.extend(ROOT / "packaging" / name for name in (
         "build-windows.py", "windows-launcher.py", "windows.iss",
         "windows-requirements.txt", "smoke-windows.py", "training-requirements.txt",
+        "gemma-training-requirements.txt",
     ))
     files.append(ROOT / ".gitattributes")
     missing = [path for path in files if not path.is_file()]

@@ -2,14 +2,35 @@ name: Windows and Fedora
 
 on:
   push:
+    branches: [main]
   pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
   contents: read
 
+# One run per PR revision. Main keeps its evidence even if another merge follows.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
+  repository:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - run: python -m pip install pytest
+      - name: Verify source archive completeness, links and reproducibility
+        run: python -m pytest tests/test_release.py tests/test_release_docs.py -q
+      - run: python -m compileall -q letracode packaging
+
   windows:
+    needs: repository
     runs-on: windows-2022
     timeout-minutes: 35
     strategy:
@@ -20,8 +41,8 @@ jobs:
       QT_QPA_PLATFORM: offscreen
       PYTHONUTF8: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
           architecture: x64
@@ -31,20 +52,21 @@ jobs:
       - run: python -m pytest -q --instafail --timeout=300 --timeout-method=thread --basetemp="${{ runner.temp }}/letracode-tests" --junitxml=windows-tests.xml
       - run: python -m compileall -q letracode packaging
       - run: python packaging/build-release.py
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: windows-tests-${{ matrix.python-version }}
           path: windows-tests.xml
 
   windows-package:
+    needs: repository
     runs-on: windows-2022
     timeout-minutes: 30
     env:
       PYTHONUTF8: '1'
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.13'
           architecture: x64
@@ -52,9 +74,9 @@ jobs:
       - name: Install verified Inno Setup compiler
         shell: pwsh
         run: |
-          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.3.exe'
-          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe' -OutFile $installer
-          $expected = '9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732'
+          $installer = Join-Path $env:RUNNER_TEMP 'innosetup-7.1.0-x64.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-7_1_0/innosetup-7.1.0-x64.exe' -OutFile $installer
+          $expected = '0362a383ed217d4c4239b5933866dd96d3eb2102737da92f80f6057a4b40df2f'
           if ((Get-FileHash $installer -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) { throw 'Inno Setup checksum mismatch' }
           $process = Start-Process $installer -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru -Wait
           if ($process.ExitCode -ne 0) { throw "Inno Setup installation failed: $($process.ExitCode)" }
@@ -65,8 +87,25 @@ jobs:
         run: |
           $version = python -c "from letracode import __version__; print(__version__)"
           python packaging/smoke-windows.py --installer "dist/LetraCode-$version-windows-x64-setup.exe" --portable "dist/LetraCode-$version-windows-x64-portable.zip" --work-dir "$env:RUNNER_TEMP/LetraCode Package Smoke"
+      - name: Record the candidate source and runtime
+        shell: python
+        env:
+          SOURCE_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          import importlib.metadata, json, os, pathlib, platform
+          from letracode import __version__
+          record = {
+              "version": __version__,
+              "build_commit": os.environ["GITHUB_SHA"],
+              "source_head": os.environ["SOURCE_HEAD"],
+              "run_url": f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              "python": platform.python_version(),
+              "packages": {name: importlib.metadata.version(name) for name in ("PySide6", "pypdf", "PyInstaller")},
+              "verification": "Package lifecycle passed; inspect all jobs in run_url for the full CI result. Real-model inference is separate."
+          }
+          pathlib.Path(f"dist/LetraCode-{__version__}-windows-build.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
       - name: Upload Windows downloads
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: LetraCode-windows-x64
           path: dist/LetraCode-*-windows-*
@@ -74,7 +113,7 @@ jobs:
           compression-level: 0
       - name: Upload native desktop screenshots and lifecycle evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: windows-package-verification
           path: |
@@ -84,6 +123,7 @@ jobs:
             build/windows/cache/LetraCode/warn-LetraCode.txt
 
   fedora:
+    needs: repository
     runs-on: ubuntu-latest
     container: fedora:44
     timeout-minutes: 20
@@ -91,7 +131,7 @@ jobs:
       QT_QPA_PLATFORM: offscreen
     steps:
       - run: dnf install -y git python3 python3-pyside6 python3-pypdf python3-pytest rpm-build redhat-rpm-config shadow-utils util-linux
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Test as an ordinary desktop user
         run: |
           useradd --create-home letracode-test
@@ -100,12 +140,12 @@ jobs:
       - run: python3 -m compileall -q letracode packaging
       - run: bash -n install.sh uninstall.sh packaging/build-rpm.sh
       - run: packaging/build-rpm.sh
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: LetraCode-fedora-and-source
           path: dist/*
           if-no-files-found: error
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           name: fedora-tests

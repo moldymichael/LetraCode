@@ -37,6 +37,37 @@ def test_portable_archive_preserves_binary_files_and_folder_layout(tmp_path):
         assert all(archive.read(name) == payload for name in archive.namelist())
 
 
+def test_windows_builder_finds_current_compiler_and_honors_explicit_path(tmp_path, monkeypatch):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("windows_release", ROOT / "packaging/build-windows.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    native = tmp_path / "Program Files"
+    legacy = tmp_path / "Program Files (x86)"
+    current = native / "Inno Setup 7/ISCC.exe"
+    old = legacy / "Inno Setup 6/ISCC.exe"
+    for path in (current, old):
+        path.parent.mkdir(parents=True)
+        path.write_bytes(b"compiler fixture")
+    monkeypatch.setenv("ProgramFiles", str(native))
+    monkeypatch.setenv("ProgramFiles(x86)", str(legacy))
+    monkeypatch.setattr(module.shutil, "which", lambda name: None)
+    assert module.compiler_path() == str(current.resolve())
+    assert module.compiler_path(str(old)) == str(old.resolve())
+
+
+def test_windows_bundle_includes_current_guides_and_training_inputs(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("windows_release", ROOT / "packaging/build-windows.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    module.copy_support_files(tmp_path)
+    for name in ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE",
+                 "docs/WINDOWS.md", "packaging/training-requirements.txt",
+                 "packaging/gemma-training-requirements.txt"):
+        assert (tmp_path / name).read_bytes() == (ROOT / name).read_bytes()
+
+
 def test_source_archives_include_platform_build_inputs_and_are_reproducible(tmp_path):
     output = tmp_path / "Release Output With Spaces"
     command = [sys.executable, str(ROOT / "packaging/build-release.py"), "--output-dir", str(output)]
@@ -50,11 +81,13 @@ def test_source_archives_include_platform_build_inputs_and_are_reproducible(tmp_
         archive.extractall(tmp_path / "Extracted Source")
     prefix = "LetraCode-0.6.0/"
     for name in (
-        "install.sh", "uninstall.sh", "AGENTS.md", "packaging/build-windows.py",
+        "install.sh", "uninstall.sh", "AGENTS.md", "CONTRIBUTING.md", "packaging/build-windows.py",
         "packaging/windows-launcher.py", "packaging/windows.iss",
         "packaging/windows-requirements.txt", "packaging/smoke-windows.py",
         "tests/test_release.py", "tests/conftest.py",
-        "packaging/training-requirements.txt", "letracode/training_backend.py",
+        "packaging/training-requirements.txt", "packaging/gemma-training-requirements.txt",
+        ".github/pull_request_template.md", ".github/ISSUE_TEMPLATE/bug_report.md",
+        "letracode/training_backend.py",
     ):
         assert prefix + name in names
     assert not any("__pycache__" in name or name.endswith(".pyc") for name in names)

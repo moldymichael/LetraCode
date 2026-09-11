@@ -16,7 +16,32 @@ git rev-parse HEAD
 
 Check these before editing an existing checkout. Do not reset, clean or discard uncommitted work. Source, installed application, model engine and user data are separate. A maintainer's dated installation record does not identify your local runtime.
 
-As checked September 11, 2026, source is 0.6.0 while the latest published release is 0.3.0. [Issue #6](https://github.com/moldymichael/LetraCode/issues/6) and [PR #8](https://github.com/moldymichael/LetraCode/pull/8) track different unresolved work. Check their live state and coordinate before editing the same area. Do not use a `*-red*` diagnostic branch as your normal baseline.
+As checked September 11, 2026, source is 0.6.0 while the latest published release is 0.3.0. [Issue #6](https://github.com/moldymichael/LetraCode/issues/6) and [PR #8](https://github.com/moldymichael/LetraCode/pull/8) record separate engine-launch and CI work. The engine-launch issue remains unresolved. Check their live state and coordinate before editing the same area. Do not use a `*-red*` diagnostic branch as your normal baseline.
+
+## Two-person branch and review workflow
+
+Keep `main` as the shared integrated baseline and keep change branches short lived. Before starting, check the [issues](https://github.com/moldymichael/LetraCode/issues) and [pull requests](https://github.com/moldymichael/LetraCode/pulls). Claim or describe the task in the relevant issue or PR so the other teammate knows which files and behavior are in motion. If work overlaps, agree on ownership or sequencing before both branches diverge.
+
+With a clean checkout and no work to preserve, update `main` and create one branch for the task:
+
+```text
+git fetch origin
+git switch main
+git pull --ff-only origin main
+git switch -c fix/short-description
+```
+
+Humans may use `fix/`, `feat/` or `docs/` according to the change. Codex-created branches use `codex/`. Do not combine unrelated issues to save a branch, and do not reuse a merged branch for new work.
+
+Push the branch and open a draft PR early when coordination would help. The PR should state the problem, current scope, affected platforms, verification already run, known gaps and any handoff the other teammate must perform. Keep the branch current with `main` before final review, without force-resetting or discarding either person's work.
+
+The author requests the other teammate's review after the focused checks pass. The reviewer checks the behavior, tests, platform claims, data/recovery impact and docs; they do not rewrite or push to the author's branch unless both people agree. The author resolves comments and reruns checks affected by later commits. Resolve review conversations only when the result is visible in the branch or the reason for declining a change is recorded.
+
+The team’s `main` policy requires one approving review from the other teammate plus these required CI contexts: `repository`, `windows (3.11)`, `windows (3.13)`, `windows (3.14)`, `windows-package` and `fedora`. New commits invalidate stale approvals, and the branch must be current with `main` before merging. A failed or unavailable required check blocks the merge: diagnose and repair it, keeping the failure visible in the PR. A green packaging job cannot substitute for failed application tests.
+
+Dependency update PRs follow the same review rule. Inspect the upstream release notes, changed lock or requirement values, compatibility with the supported Python/platform matrix and CI results. Automated update suggestions are not approval and are never auto-merged.
+
+Use GitHub’s merge-commit option to retain reviewed commit ancestry and its verification records. Merge only the reviewed commit set, then delete the merged topic branch and refresh each active checkout from `main`. Before handing off unfinished work, push the current branch and leave a short note with the exact commit, completed checks, remaining task and any local-only state. Never imply that unpushed or uninspected changes are shared.
 
 ## Windows development
 
@@ -113,6 +138,8 @@ For runtime and packaging changes, distinguish these checks:
 
 Do not describe all four as passing unless each was checked. The existing workflow's Windows host is Windows Server 2022. Its separate packaging job can pass even when source test jobs fail. Use the [Windows smoke test](docs/WINDOWS.md#first-smoke-test) for a small manual starting point.
 
+For a change that can affect both operating systems, divide verification by availability rather than assigning permanent platform roles. The author runs the checks available in their environment and records what remains. The other teammate runs the missing native check or confirms that CI covers it. Windows process, storage, packaging and installer changes need Windows evidence; Fedora installation, desktop integration and RPM changes need Fedora evidence. Cross-platform engine or data changes normally need both suites, with a real-engine/manual check when the claim depends on actual inference.
+
 ## Data and privacy rules
 
 Use disposable application data with `--data-dir` and copied sample files. This isolates storage; it does not sandbox read permissions or approved shell commands. Never run destructive tests on a live notes vault, model directory or production app data.
@@ -125,7 +152,7 @@ Running source does not require building an installer. Build only when validatin
 
 ### Windows installer and portable ZIP
 
-Use the Windows environment above. Install Inno Setup 6 using the compiler version/source and checksum in the [packaging workflow](.github/workflows/windows-and-fedora.yml), then run:
+Use the Windows environment above. Install Inno Setup 7 using the compiler version/source and checksum in the [packaging workflow](.github/workflows/windows-and-fedora.yml), then run:
 
 ```powershell
 .\.venv\Scripts\python.exe -m pip install -r packaging/windows-requirements.txt .
@@ -154,6 +181,8 @@ For native RPMs, install the additional RPM build dependencies listed in the wor
 
 ## Before a release
 
-Keep the commit, version metadata, build outputs, checksums and release notes aligned. Separate a test candidate from a published release. Do not call 0.6.0 release-ready while its required CI and launch-compatibility work remain unresolved. Verify real Windows inference, update/data retention and the Linux regression baseline; state remaining limitations explicitly.
+Follow the [release process](docs/RELEASING.md). It assigns a release owner and independent verifier for each release, keeps the commit, version, artifacts, checksums and notes aligned, and requires platform and real-engine evidence for the claims being published. The responsibilities can swap; neither teammate approves their own release change.
+
+Separate a test candidate from a published release. Do not call 0.6.0 release-ready while required CI and launch-compatibility work remain unresolved. Publishing or changing a release requires a separate explicit decision; build scripts and ordinary PR merges do not publish one.
 
 For an issue report, a reproducible failure is a completed contribution. Include the environment, steps, expected/actual behavior and relevant sanitized logs. A fix is not required. For a PR, include scope, tests, limitations and data/recovery implications. The repository templates provide a short starting point, not a requirement to audit unrelated code.

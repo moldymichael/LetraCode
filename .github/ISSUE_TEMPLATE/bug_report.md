@@ -10,6 +10,8 @@ assignees: ""
 
 Describe the expected behavior and what actually happened. Include the exact error.
 
+Check the [known-issues page](https://github.com/moldymichael/LetraCode/blob/main/docs/KNOWN-ISSUES.md) and search open issues first. If the failure is already tracked, add new environment or reproduction evidence there instead of opening a duplicate.
+
 ## Reproduce
 
 1.

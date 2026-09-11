@@ -1,5 +1,10 @@
 # Repository documentation cleanup implementation plan
 
+Historical pre-execution snapshot for the original documentation commit
+`98b9efd`. The unchecked boxes record the plan as written, not the current task
+status. Later repository/CI maintenance is described by its PR and verification
+records; the scope constraints below apply to that original documentation pass.
+
 > For agentic workers: execute this approved plan inline, with verification before completion.
 
 **Goal:** Make installation, contribution and verification understandable without prior project context.

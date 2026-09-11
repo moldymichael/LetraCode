@@ -10,21 +10,22 @@ The application uses Python and native Qt widgets on Fedora KDE and Windows. Cha
 | --- | --- |
 | Install on Windows | [Windows installation and first reply](docs/WINDOWS.md) |
 | Use the current interface | [User guide](docs/STRAND-EXPERIENCE.md) |
-| Run or modify the source | [Contributor setup: Windows and Fedora](https://github.com/moldymichael/LetraCode/blob/main/CONTRIBUTING.md) |
+| Check current limitations | [Known issues and current boundaries](docs/KNOWN-ISSUES.md) |
+| Run or modify the source | [Contributor setup: Windows and Fedora](CONTRIBUTING.md) |
 | Find technical records or older documentation | [Documentation index](docs/README.md) |
 
 ## Development version versus published download
 
 **Status checked September 11, 2026:** this source tree identifies as **0.6.0**. The latest published [GitHub release](https://github.com/moldymichael/LetraCode/releases) is **0.3.0**. They are not the same build. Cloning the repository does not update an installed copy, and a newer version number in source does not mean a newer release has been published.
 
-The 0.6.0 development line contains Chat, Knowledge, Improve and Settings, plus the comparison and source-reading updates. A Windows **test build** is available from a specific Actions run; the [Windows guide](docs/WINDOWS.md#development-test-build) identifies its commit and limitations. Its packaging job passed, but the full run did not. It is not a validated 0.6.0 release.
+The 0.6.0 development line contains Chat, Knowledge, Improve and Settings, plus the comparison and source-reading updates. Development artifacts are test candidates, not releases. The [Windows guide](docs/WINDOWS.md#development-test-builds) explains how to select a candidate by exact commit, workflow run and evidence rather than relying on a version label or one green packaging job.
 
-Two separate items remain under investigation:
+Windows launch compatibility and CI repairs are tracked separately:
 
 - [Issue #6](https://github.com/moldymichael/LetraCode/issues/6): launching installations that use `llama.exe serve` instead of a dedicated `llama-server.exe`.
-- [PR #8](https://github.com/moldymichael/LetraCode/pull/8): Windows/Fedora test portability and quantizer selection. It does **not** fix issue #6.
+- [PR #8](https://github.com/moldymichael/LetraCode/pull/8): Windows/Fedora test portability, native quantizer selection and model-file verification repairs. It does **not** fix issue #6.
 
-Use those threads for live status. Earlier test counts and installation records are evidence for the builds they name, not guarantees about every later checkout.
+Use the [known-issues page](docs/KNOWN-ISSUES.md) and those live threads for status. Earlier test counts and installation records are evidence for the builds they name, not guarantees about every later checkout.
 
 ## What you need
 
@@ -42,7 +43,7 @@ Neither llama.cpp nor model weights are bundled with LetraCode. Model size, cont
 
 ### Windows
 
-Follow the [Windows guide](docs/WINDOWS.md) to choose a published download or the explicitly labeled development test build. Ordinary installation does not require Git, Python, a compiler or a source checkout. Contributors who need editable source should use [CONTRIBUTING.md](https://github.com/moldymichael/LetraCode/blob/main/CONTRIBUTING.md#windows-development).
+Follow the [Windows guide](docs/WINDOWS.md) to choose a published download or an explicitly identified development test build. Ordinary installation does not require Git, Python, a compiler or a source checkout. Contributors who need editable source should use [CONTRIBUTING.md](CONTRIBUTING.md#windows-development).
 
 ### Fedora KDE
 
@@ -52,7 +53,7 @@ From the root of a source checkout, run in Konsole:
 ./install.sh
 ```
 
-The script explains its distribution dependencies and requests `sudo` for those packages. Application files are installed for your user, separately from data. `./install.sh --no-deps` is intended for systems whose required dependencies have already been checked. To run source without changing the installed application, use the [Fedora development instructions](https://github.com/moldymichael/LetraCode/blob/main/CONTRIBUTING.md#fedora-development).
+The script explains its distribution dependencies and requests `sudo` for those packages. Application files are installed for your user, separately from data. `./install.sh --no-deps` is intended for systems whose required dependencies have already been checked. To run source without changing the installed application, use the [Fedora development instructions](CONTRIBUTING.md#fedora-development).
 
 <a id="start-with-strand"></a>
 
@@ -101,7 +102,7 @@ Only approved teaching examples are optimized on. Comparison examples are held o
 
 | Platform | Default user data |
 | --- | --- |
-| Windows | `%LOCALAPPDATA%\letracode` |
+| Windows | `%LOCALAPPDATA%\LetraCode` |
 | Linux | `${XDG_DATA_HOME:-~/.local/share}/letracode` |
 
 Application files are separate. **Settings → Back up LetraCode** creates a restorable snapshot with a guide. Back up linked originals and large model/training artifacts separately. Evaluation export is a review bundle, not a restorable backup.
@@ -114,4 +115,4 @@ Stopping retains saved output. A paused chat offers **Start a fresh task in this
 
 ## For developers
 
-[CONTRIBUTING.md](https://github.com/moldymichael/LetraCode/blob/main/CONTRIBUTING.md) contains runnable setup and test commands, a source map, packaging instructions and expected verification evidence. [AGENTS.md](https://github.com/moldymichael/LetraCode/blob/main/AGENTS.md) records source/data handling rules. The project is licensed under [MIT](LICENSE); bundled dependencies and model weights have their own licenses.
+[CONTRIBUTING.md](CONTRIBUTING.md) contains the two-person branch/review workflow, runnable setup and test commands, a source map, packaging instructions and expected verification evidence. [RELEASING.md](docs/RELEASING.md) defines the separate release handoff and verification gate. [AGENTS.md](AGENTS.md) records source/data handling rules. The project is licensed under [MIT](LICENSE); bundled dependencies and model weights have their own licenses.

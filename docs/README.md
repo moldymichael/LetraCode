@@ -6,8 +6,9 @@ Start with [the project overview](../README.md). This index separates instructio
 
 | Document | Use / scope |
 | --- | --- |
-| [Windows guide](WINDOWS.md) | Installation, current test-candidate identity, engine setup, updates and safe testing. |
+| [Windows guide](WINDOWS.md) | Published installation, development-candidate selection, engine setup, updates and safe testing. |
 | [Strand user guide](STRAND-EXPERIENCE.md) | The 0.6.0 interface, permissions, examples and limitations; includes dated verification. |
+| [Known issues](KNOWN-ISSUES.md) | Current release/source difference, open engine and CI work, and runtime/platform boundaries. |
 | [Training guide](FINE-TUNING.md) | Optional training dependencies and workflow. Some version/UI wording predates the redesign; use the 0.6.0 guide for current navigation. |
 | [Comparison workflow](COMPARISON-WORKFLOW.md) | Current candidate-review behavior and its verification record. |
 | [Gemma support](GEMMA4.md) | Supported model preparation/training path and recorded evidence, not arbitrary Gemma/model support. |
@@ -16,13 +17,13 @@ Start with [the project overview](../README.md). This index separates instructio
 
 | Document | Use / scope |
 | --- | --- |
-| [Contributing](https://github.com/moldymichael/LetraCode/blob/main/CONTRIBUTING.md) | Windows/Fedora source setup, commands, code map, packaging and review expectations. |
-| [Agent instructions](https://github.com/moldymichael/LetraCode/blob/main/AGENTS.md) | Baseline selection, preservation and verification rules. |
+| [Contributing](../CONTRIBUTING.md) | Two-person branches/reviews, Windows/Fedora source setup, commands, code map and evidence expectations. |
+| [Release process](RELEASING.md) | Release-owner/verifier handoff, platform evidence, artifact checks and publication checklist. |
+| [Agent instructions](../AGENTS.md) | Baseline selection, preservation and verification rules. |
 | [Implementation history](CURRENT-STATE.md) | Dated repository status plus earlier milestones and maintainer-local installation history. |
 | [Reading recovery](READING-RECOVERY.md) | Paging, source coverage and automatic recovery behavior. |
 | [Memory migration recovery](MEMORY-MIGRATION-RECOVERY.md) | A migration failure investigation and its recovery checks. |
-| [Experience design](superpowers/specs/2026-09-10-strand-experience.md) | Intent for the redesign; consult code/tests for what exists. |
-| [Design specifications](superpowers/specs/) and [implementation plans](superpowers/plans/) | Dated design/execution records, not independent proof of completion. |
+| [Experience design](superpowers/specs/2026-09-10-strand-experience.md) and [repository-cleanup plan](superpowers/plans/2026-09-11-repository-cleanup.md) | Examples of dated design/execution records, not independent proof of completion. |
 | [Future task design](FUTURE-TASKS-DESIGN.md) | Proposed work; do not present it as implemented functionality. |
 
 ## Verification evidence
@@ -52,4 +53,6 @@ Recorded maintainer installations: [0.4.0](INSTALLED-0.4.0-UPDATE.md), [0.6.0](I
 
 ## Keeping this useful
 
-Update the user-facing guide when behavior changes. Link the relevant issue/PR and exact verification commit instead of copying an undated test count into several documents. Preserve historical results; annotate their scope when necessary. Add new documents to this index and use relative links inside the repository.
+Current behavior belongs in the project overview and user guides. Live work and failures belong in issues, PRs and Actions, with a concise effect recorded in [known issues](KNOWN-ISSUES.md). Dated test and installation evidence belongs in the verification and history records.
+
+Update the user-facing guide when behavior changes. Link the relevant issue/PR and exact verification commit instead of copying an undated test count into several documents. Preserve historical results; annotate their scope when necessary. Add new documents to this index and use relative file links inside the repository.

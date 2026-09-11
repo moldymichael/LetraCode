@@ -1,8 +1,10 @@
 # Current implementation state
 
-> **Repository snapshot: September 11, 2026.** Remote `main` at `c239fa4407f6b967be025fdf50c6aa124a296e2c` identifies as 0.6.0; the published release is 0.3.0. [PR #8](https://github.com/moldymichael/LetraCode/pull/8) tracks CI/quantizer work and [issue #6](https://github.com/moldymichael/LetraCode/issues/6) tracks unified engine invocation. A successful Windows packaging job does not establish a passing full suite. See the [Windows guide](WINDOWS.md) for the exact candidate and limitations, and the [documentation index](README.md) for navigation.
+> **Repository snapshot before the September 11, 2026 maintenance work:** remote `main` at `c239fa4407f6b967be025fdf50c6aa124a296e2c` identifies as 0.6.0; the published release is 0.3.0. [PR #8](https://github.com/moldymichael/LetraCode/pull/8) tracks CI/quantizer work and [issue #6](https://github.com/moldymichael/LetraCode/issues/6) tracks unified engine invocation. A successful Windows packaging job does not establish a passing full suite. See [known issues](KNOWN-ISSUES.md) for the concise current boundaries, the [Windows guide](WINDOWS.md) for selecting and testing a build, and the [documentation index](README.md) for navigation.
 >
 > Installation statements and machine paths below describe the maintainer's recorded local work. They do not mean that every contributor's installation, remote branch or published download contains those changes. Preserve the dated records; inspect the actual runtime when diagnosing another computer.
+>
+> This file is a chronological implementation record. Use issues, pull requests and Actions for live work; do not rewrite the dated results below when a later check changes status.
 
 ## Recorded 0.6.0 implementation and local installation
 
