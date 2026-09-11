@@ -114,17 +114,35 @@ Unsupported models remain usable for Chat but cannot use this trainer.
 Training produces a candidate; it never silently replaces Strand. Saved examples,
 completed optimization, successful conversion, and useful improvement are separate
 states. Retry conversion can use the retained adapter without repeating training.
-Compare with Strand runs every held-out question independently in the Chat runtime
-with the configured answer budget. It tests standalone answers without file/action
-tools, not the whole range of assistant behavior. Partial answers and errors remain
-incomplete. A model/base change is disclosed when it affects the comparison.
+**Compare with Strand** opens a comparison window immediately. Add fresh questions
+with an optional reference answer, then choose **Run comparison**. These questions
+are saved for this candidate separately from teaching examples. Questions matching
+the run's frozen teaching data are rejected; the original held-out questions always
+remain included. Changing the question set requires another comparison for adoption.
+
+The window shows verification/loading progress and independently scrollable full
+answers for Strand now and the trained candidate. Select each question to inspect
+both responses; Thinking text, when recorded, has its own tab. Each request uses
+the configured Chat answer budget. Standalone comparison excludes shared notes,
+project retrieval and action tools. Cut-off, stopped, empty or failed answers remain
+incomplete. Stop retains partial output; closing the window keeps the job running
+with Stop still available in Improve. A base-model change is disclosed. Earlier
+attempts remain selectable, including their saved judgments and errors.
 
 Read both answers. Check accuracy, completeness, clarity, useful style and whether
 anything got worse. Lower loss alone cannot answer these questions. Save a name,
-your judgment (including same, worse or mixed), and notes. A changed configuration
+your judgment (including same, worse or mixed), and notes. The comparison window
+also records a judgment for each question. A changed configuration
 or model artifact invalidates the comparison used for adoption. Use this version
 is explicit and guarded. Return to previous version restores the saved prior
 configuration; model artifacts are retained.
+
+**Export comparison…** creates a new JSON file containing the selected training
+run, full saved comparisons and history, prompt drafts, judgments and conversion
+receipts. The optimizer's `report.json` stays immutable and only contains its
+limited short built-in evaluation. This explicit comparison export includes local
+paths and full prompts, answers and notes; inspect it before sharing. It is separate
+from Chat's privacy-filtered Export Evaluation and from a restorable backup.
 
 ## Continuing and recovering work
 

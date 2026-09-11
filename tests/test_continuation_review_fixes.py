@@ -114,7 +114,7 @@ def test_provisional_completed_requests_retain_source_exposure_after_reopen(tmp_
                 call('read_file', {'path': str(path), 'offset': 0, 'max_chars': 7}, number)]}
         return {'role': 'assistant', 'content': 'The opening is available; the rest remains unread.'}
 
-    ConversationWorker(store, chat, Engine(reply)).run()
+    ConversationWorker(store, chat, Engine(reply), limits=RunLimits(max_actions=1)).run()
     if legacy_completion_marker:
         for row in store.messages(chat):
             if row['status'] == 'incomplete':
@@ -122,7 +122,8 @@ def test_provisional_completed_requests_retain_source_exposure_after_reopen(tmp_
                 data.pop('request_completed', None)
                 store.update_message(row['id'], row['content'], row['status'], payload=data)
     rows = Store(store.directory).messages(chat)
-    assert sum(row['status'] == 'incomplete' for row in rows) == 3
+    assert sum(row['status'] == 'incomplete' for row in rows) == 1
+    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'action_budget'
     state = evidence_state(rows, origin)
     assert state['files'][0]['exposed_ranges'] == [[0, 7]], 'Provisional status erased completed-request exposure'
     assert state['files'][0]['missing_ranges'] == [[7, 21]]

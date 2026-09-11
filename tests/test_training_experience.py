@@ -70,7 +70,7 @@ def test_comparison_generates_every_held_out_answer_with_chat_budget_and_no_adop
             self.config = config
         def start(self, cancel, status): pass
         def stop(self): pass
-        def complete(self, messages, tools, cancel, delta, thinking=False):
+        def complete(self, messages, tools, cancel, delta, thinking=False, *, on_reasoning=None):
             assert tools is None
             assert self.config.secondary_model_path == ''
             assert self.config.max_tokens == 777
@@ -94,7 +94,7 @@ def test_comparison_failure_preserves_partial_answers_and_cannot_claim_complete(
         def __init__(self, config, directory): self.config = config
         def start(self, cancel, status): pass
         def stop(self): pass
-        def complete(self, messages, tools, cancel, delta, thinking=False):
+        def complete(self, messages, tools, cancel, delta, thinking=False, *, on_reasoning=None):
             delta('partial response')
             if self.config.lora_path:
                 raise RuntimeError('output token limit')
@@ -364,3 +364,225 @@ def test_missing_converted_file_exposes_retry_and_hides_adoption_until_recovered
     assert not panel.convert_button.isEnabled()
     assert 'restore' in panel.stage.text().lower()
     window.close()
+
+
+class ComparisonPeer:
+    def __init__(self, config, directory):
+        self.config = config
+    def start(self, cancel, status):
+        pass
+    def stop(self):
+        pass
+    def complete(self, messages, tools, cancel, delta, thinking=False, *, on_reasoning=None):
+        assert tools is None
+        assert self.config.max_tokens == 777
+        on_reasoning('Thought before answering. ')
+        delta('A complete response. ')
+        return {'content': 'A complete response. ' * 200,
+                'reasoning_content': 'Thought before answering. ' * 200}
+
+
+def test_fresh_comparison_keeps_all_held_out_rows_and_full_replies_without_changing_snapshots(tmp_path, monkeypatch):
+    module = experience()
+    repo, run, original = completed(tmp_path, 3)
+    directory = repo.run_directory(run['id'])
+    before = {name: (directory / name).read_bytes() for name in ('config.json', 'train.jsonl', 'eval.jsonl')}
+    monkeypatch.setattr(module, 'LocalEngine', ComparisonPeer)
+    updates = []
+    result = module.compare_version(repo, run['id'], original, threading.Event(),
+                                    prompts=[{'prompt': ' Fresh question ', 'response': ' Optional reference '}],
+                                    on_update=updates.append, thinking=True)
+    assert result['status'] == 'complete'
+    assert result['id'] and result['schema_version'] == 2
+    assert [row['source'] for row in result['examples']] == ['held_out', 'held_out', 'held_out', 'fresh']
+    assert result['examples'][-1]['prompt'] == 'Fresh question'
+    assert result['examples'][-1]['response'] == 'Optional reference'
+    for row in result['examples']:
+        for side in ('current', 'candidate'):
+            assert row[side + '_status'] == 'complete'
+            assert row[side + '_output'] == 'A complete response. ' * 200
+            assert row[side + '_reasoning'] == 'Thought before answering. ' * 200
+    assert updates[0]['status'] == 'running'
+    assert updates[0]['examples'][0]['current_status'] == 'pending'
+    assert updates[-1] == result
+    assert any(row['examples'][0]['current_status'] == 'running' for row in updates)
+    assert updates[0]['examples'][0].get('current_output', '') == ''
+    assert module.version_review(repo, run['id'])['comparison_prompts'] == [
+        {'prompt': 'Fresh question', 'response': 'Optional reference'}]
+    assert module.comparison_is_current(repo, run['id'], original, thinking=True)
+    assert repo.run(run['id']) == run
+    assert before == {name: (directory / name).read_bytes() for name in before}
+    assert repo.store.setting('engine') == dataclasses.asdict(original)
+
+
+@pytest.mark.parametrize('prompts, message', [
+    ([{'prompt': '  '}], 'question|prompt'),
+    ([{'prompt': 'TRAINING    ONLY'}], 'training|teaching'),
+    ([{'prompt': ' UNSEEN  question 0 '}], 'held.out|comparison|repeated'),
+    ([{'prompt': 'Fresh'}, {'prompt': ' fresh '}], 'repeated|duplicate'),
+    ([{'prompt': 'x' * 20001}], '20,?000'),
+    ([{'prompt': str(n)} for n in range(21)], '20'),
+    ([{'prompt': 123}], 'text'),
+    ([{'prompt': 'Fresh', 'response': None}], 'text'),
+])
+def test_fresh_prompt_validation_rejects_leakage_duplicates_and_invalid_input(tmp_path, prompts, message):
+    module = experience()
+    repo, run, _ = completed(tmp_path, 1)
+    validate = getattr(module, 'validate_comparison_prompts', None)
+    assert callable(validate), 'Fresh comparison prompts require validation before model unload'
+    with pytest.raises(ValueError, match=message):
+        validate(repo, run['id'], prompts)
+    assert 'comparison_prompts' not in module.version_review(repo, run['id'])
+    assert repo.run(run['id']) == run
+
+
+def test_editing_fresh_prompt_draft_keeps_evidence_but_requires_new_comparison(tmp_path, monkeypatch):
+    module = experience()
+    repo, run, original = completed(tmp_path, 1)
+    monkeypatch.setattr(module, 'LocalEngine', ComparisonPeer)
+    first = module.compare_version(repo, run['id'], original, threading.Event(), prompts=[{'prompt': 'First fresh'}])
+    module.save_version_review(repo, run['id'], judgment='better', notes='Useful on this question.')
+    module.save_version_review(repo, run['id'], comparison_prompts=[{'prompt': ' A different fresh '}])
+    review = module.version_review(repo, run['id'])
+    assert review['comparison'] == first
+    assert review['comparison_prompts'] == [{'prompt': 'A different fresh', 'response': ''}]
+    assert not module.comparison_is_current(repo, run['id'], original)
+    second = module.compare_version(repo, run['id'], original, threading.Event())
+    review = module.version_review(repo, run['id'])
+    assert second['id'] != first['id']
+    assert second['examples'][-1]['prompt'] == 'A different fresh'
+    assert review['judgment'] == 'unreviewed'
+    assert review['comparison_history'][0]['comparison'] == first
+    assert review['comparison_history'][0]['judgment'] == 'better'
+    assert review['comparison_history'][0]['notes'] == 'Useful on this question.'
+    assert module.comparison_is_current(repo, run['id'], original)
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+def test_preparation_records_new_incomplete_attempt_before_expensive_checks(tmp_path, monkeypatch, cancelled):
+    module = experience()
+    repo, run, original = completed(tmp_path, 1)
+    monkeypatch.setattr(module, 'LocalEngine', ComparisonPeer)
+    first = module.compare_version(repo, run['id'], original, threading.Event())
+    module.save_version_review(repo, run['id'], judgment='better')
+    events = []
+    def fail_verification(*args):
+        review = module.version_review(repo, run['id'])
+        assert events, 'Progress must appear before large model verification'
+        assert review['comparison']['status'] == 'running'
+        assert review['comparison']['id'] != first['id']
+        assert review['judgment'] == 'unreviewed'
+        assert not module.comparison_is_current(repo, run['id'], original)
+        if cancelled:
+            raise module.Cancelled('Stopped while checking files.')
+        raise ValueError('The base model changed.')
+    monkeypatch.setattr(module, 'candidate_configuration', fail_verification)
+    result = module.compare_version(repo, run['id'], original, threading.Event(), events.append)
+    assert result['status'] == ('cancelled' if cancelled else 'incomplete')
+    assert 'checking' in result['error'] or 'changed' in result['error']
+    review = module.version_review(repo, run['id'])
+    assert review['comparison'] == result
+    assert review['comparison_history'][0]['comparison'] == first
+    assert not module.comparison_is_current(repo, run['id'], original)
+
+
+@pytest.mark.parametrize('failure', ['tool_call', 'output_limit', 'cancelled', 'empty'])
+def test_each_failed_answer_retains_full_output_reasoning_and_explicit_status(tmp_path, monkeypatch, failure):
+    module = experience()
+    repo, run, original = completed(tmp_path, 1)
+    class FailurePeer(ComparisonPeer):
+        def complete(self, messages, tools, cancel, delta, thinking=False, *, on_reasoning=None):
+            on_reasoning('Model thought. ' * 200)
+            if failure == 'empty':
+                return {'content': '', 'reasoning_content': 'Model thought. ' * 200}
+            if failure == 'tool_call':
+                return {'content': 'Visible before action. ' * 200,
+                        'reasoning_content': 'Model thought. ' * 200,
+                        'tool_calls': [{'id': 'call', 'type': 'function', 'function': {'name': 'read_file', 'arguments': '{}'}}]}
+            delta('Saved partial. ' * 200)
+            if failure == 'cancelled':
+                cancel.set()
+                raise module.Cancelled('Stopped mid-answer.')
+            raise RuntimeError('Output token limit reached.')
+    monkeypatch.setattr(module, 'LocalEngine', FailurePeer)
+    result = module.compare_version(repo, run['id'], original, threading.Event())
+    row = result['examples'][0]
+    assert result['status'] == ('cancelled' if failure == 'cancelled' else 'incomplete')
+    assert row['current_status'] == ('cancelled' if failure == 'cancelled' else 'incomplete')
+    assert row['current_reasoning'] == 'Model thought. ' * 200
+    if failure == 'tool_call':
+        assert row['current_output'] == 'Visible before action. ' * 200
+        assert 'actions' in row['current_error']
+    elif failure == 'empty':
+        assert row['current_output'] == ''
+        assert 'visible' in row['current_error']
+    else:
+        assert row['current_output'] == 'Saved partial. ' * 200
+    reopened = TrainingRepository(Store(repo.store.directory))
+    assert module.version_review(reopened, run['id'])['comparison'] == result
+    assert not module.comparison_is_current(reopened, run['id'], original)
+
+
+def test_prior_legacy_comparison_retains_adoption_check_and_is_archived_on_retry(tmp_path, monkeypatch):
+    module = experience()
+    repo, run, original = completed(tmp_path, 1)
+    monkeypatch.setattr(module, 'LocalEngine', ComparisonPeer)
+    result = module.compare_version(repo, run['id'], original, threading.Event())
+    result.pop('schema_version', None)
+    result.pop('id', None)
+    for row in result['examples']:
+        for key in ('source', 'current_status', 'candidate_status'):
+            row.pop(key, None)
+    module.save_version_review(repo, run['id'], comparison=result, judgment='same', notes='Legacy review')
+    assert module.comparison_is_current(repo, run['id'], original)
+    module.compare_version(repo, run['id'], original, threading.Event())
+    history = module.version_review(repo, run['id'])['comparison_history']
+    assert history[-1]['comparison'] == result
+    assert history[-1]['notes'] == 'Legacy review'
+
+
+def test_new_comparison_cannot_be_current_after_a_held_out_answer_is_removed(tmp_path, monkeypatch):
+    module = experience()
+    repo, run, original = completed(tmp_path, 2)
+    monkeypatch.setattr(module, 'LocalEngine', ComparisonPeer)
+    result = module.compare_version(repo, run['id'], original, threading.Event())
+    result['examples'].pop(0)
+    module.save_version_review(repo, run['id'], comparison=result)
+    assert not module.comparison_is_current(repo, run['id'], original)
+
+
+def test_fresh_prompt_validation_uses_frozen_training_rows_after_example_changes(tmp_path):
+    module = experience()
+    repo, run, _ = completed(tmp_path, 1)
+    teaching = next(row for row in repo.examples() if row['split'] == 'train')
+    repo.save_example('A replacement teaching question', 'New desired answer',
+                      example_id=teaching['id'], approved=True)
+    with pytest.raises(ValueError, match='training'):
+        module.save_version_review(repo, run['id'], comparison_prompts=[{'prompt': ' TRAINING ONLY '}])
+    assert repo.run(run['id']) == run
+
+
+def test_complete_comparison_with_side_error_is_not_current(tmp_path, monkeypatch):
+    module = experience()
+    repo, run, original = completed(tmp_path, 1)
+    monkeypatch.setattr(module, 'LocalEngine', ComparisonPeer)
+    result = module.compare_version(repo, run['id'], original, threading.Event())
+    result['examples'][0]['candidate_error'] = 'Output was interrupted.'
+    module.save_version_review(repo, run['id'], comparison=result)
+    assert not module.comparison_is_current(repo, run['id'], original)
+
+
+def test_new_fresh_draft_invalidates_legacy_comparison(tmp_path, monkeypatch):
+    module = experience()
+    repo, run, original = completed(tmp_path, 1)
+    monkeypatch.setattr(module, 'LocalEngine', ComparisonPeer)
+    result = module.compare_version(repo, run['id'], original, threading.Event())
+    result.pop('schema_version')
+    result.pop('id')
+    for row in result['examples']:
+        for key in ('source', 'current_status', 'candidate_status'):
+            row.pop(key)
+    module.save_version_review(repo, run['id'], comparison=result, judgment='better')
+    assert module.comparison_is_current(repo, run['id'], original)
+    module.save_version_review(repo, run['id'], comparison_prompts=[{'prompt': 'One fresh question'}])
+    assert not module.comparison_is_current(repo, run['id'], original)

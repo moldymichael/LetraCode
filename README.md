@@ -78,8 +78,13 @@ examples go into optimization; comparison examples are held out.
 LetraCode checks preparation before unloading Chat, reuses saved local training
 configuration, and can prepare the supported matching Gemma model. Numeric
 settings remain available under preparation details. If conversion fails after
-training, retry it from the retained adapter. Comparison uses the Chat runtime
-and settings, saves complete or partial answers, and does not automatically adopt.
+training, retry it from the retained adapter. **Compare with Strand** opens a
+comparison window. Add fresh questions, run both versions, and read their full
+answers side by side. Original held-out questions remain included. Progress,
+partial answers, errors, previous attempts and your judgments are retained.
+**Export comparison…** saves this evidence separately from the short optimizer
+evaluation in the run folder. Comparison uses the Chat runtime and settings
+and does not automatically adopt.
 A lower training loss is not proof of useful improvement. Record regressions,
 uncertain outcomes and your own judgment before choosing a version.
 

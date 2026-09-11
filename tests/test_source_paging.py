@@ -65,8 +65,8 @@ def test_character_pages_preserve_unicode_bom_crlf_and_whole_snapshot_hash(tmp_p
 
 
 @pytest.mark.parametrize('contents,offset,want,next_offset', [
-    ('', 0, '', None), ('', 5, '', None), ('abc', 3, '', None),
-    ('abc', 9, '', None), ('abc', 2, 'c', None), ('abc', 0, 'a', 1),
+    ('', 0, '', None), ('abc', 3, '', None),
+    ('abc', 2, 'c', None), ('abc', 0, 'a', 1),
 ])
 def test_character_page_boundaries(tmp_path, contents, offset, want, next_offset):
     path = tmp_path / 'source.txt'
@@ -80,15 +80,119 @@ def test_character_page_boundaries(tmp_path, contents, offset, want, next_offset
 @pytest.mark.parametrize('arguments', [
     {'offset': -1}, {'offset': True}, {'offset': '0'}, {'offset': None},
     {'max_chars': True}, {'max_chars': 0}, {'max_chars': 16001},
-    {'max_chars': 1.5}, {'offset': 0, 'start_line': 1},
-    {'max_chars': 100, 'max_lines': 3},
+    {'max_chars': 1.5}, {'offset': 5}, {'start_line': 2},
+    {'start_line': 0}, {'start_line': True}, {'start_line': '1'},
+    {'max_lines': 0}, {'max_lines': 401}, {'max_lines': True},
 ])
-def test_character_mode_rejects_invalid_and_mixed_arguments(tmp_path, arguments):
+def test_invalid_pagination_returns_an_executable_recovery_without_coverage(tmp_path, arguments):
     path = tmp_path / 'source.txt'
     path.write_text('keep')
     result = json.loads(reader(tmp_path).execute('read_file', {'path': str(path), **arguments}))
     assert 'error' in result
+    assert result['code'] == 'invalid_pagination' and result['recoverable'] is True
+    assert 'coverage' not in result and 'text' not in result
+    retry = result['retry_read_file']
+    assert retry == {'path': str(path), 'offset': 0, 'max_chars': 4000}
+    assert json.loads(reader(tmp_path).execute('read_file', retry))['text'] == 'keep'
     assert path.read_text() == 'keep'
+
+
+@pytest.mark.parametrize('arguments', [
+    {'offset': 7, 'start_line': 1, 'max_lines': 180},
+    {'offset': 7, 'start_line': 300, 'max_lines': None},
+    {'start_line': 2},
+])
+def test_mixed_paging_preserves_exact_character_or_line_cursor(tmp_path, arguments):
+    path = tmp_path / 'source.txt'
+    path.write_bytes('\ufeffcafé\r\nβeta\r\nlast'.encode())
+    page = read(reader(tmp_path), path, max_chars=3, **arguments)
+    assert page['offset'] == 7 and page['text'] == 'βet'
+    assert page['coverage']['ranges'] == [[7, 10]]
+    assert page['next_read_file'] == {'path': str(path), 'offset': 10, 'max_chars': 3}
+    tail = json.loads(reader(tmp_path).execute('read_file', page['next_read_file']))
+    assert tail['text'] == 'a\r\n'
+
+
+def test_character_size_with_line_limit_starts_at_beginning(tmp_path):
+    path = tmp_path / 'source.txt'
+    path.write_text('first\nsecond')
+    page = read(reader(tmp_path), path, max_chars=3, max_lines=1)
+    assert page['offset'] == 0 and page['text'] == 'fir'
+
+
+@pytest.mark.parametrize('arguments', [
+    {'offset': 7, 'max_chars': 0, 'start_line': 1},
+    {'start_line': 2, 'max_chars': 0},
+    {'start_line': 2, 'max_lines': 0},
+])
+def test_invalid_page_size_recovery_preserves_valid_source_cursor(tmp_path, arguments):
+    path = tmp_path / 'source.txt'
+    path.write_bytes('\ufeffcafé\r\nβeta\r\nlast'.encode())
+    tool = reader(tmp_path)
+    result = json.loads(tool.execute('read_file', {'path': str(path), **arguments}))
+    assert result['code'] == 'invalid_pagination'
+    assert result['retry_read_file'] == {'path': str(path), 'offset': 7, 'max_chars': 4000}
+    assert 'coverage' not in result
+    assert json.loads(tool.execute('read_file', result['retry_read_file']))['text'] == 'βeta\r\nlast'
+
+
+def test_unknown_character_cursor_never_uses_conflicting_line_start_for_recovery(tmp_path):
+    path = tmp_path / 'source.txt'
+    path.write_text('first\nsecond')
+    result = json.loads(reader(tmp_path).execute('read_file', {
+        'path': str(path), 'offset': None, 'start_line': 2}))
+    assert result['retry_read_file']['offset'] == 0
+
+
+@pytest.mark.parametrize('contents,arguments', [
+    ('', {'offset': 5}), ('', {'start_line': 2}),
+    ('abc', {'offset': 9}), ('abc', {'start_line': 2, 'max_chars': 1}),
+])
+def test_cursor_beyond_source_cannot_masquerade_as_successful_eof(tmp_path, contents, arguments):
+    path = tmp_path / 'source.txt'
+    path.write_text(contents)
+    result = json.loads(reader(tmp_path).execute('read_file', {'path': str(path), **arguments}))
+    assert result['code'] == 'invalid_pagination'
+    assert result['retry_read_file']['offset'] == 0
+    assert 'next_offset' not in result and 'coverage' not in result
+
+
+def test_pagination_recovery_does_not_replace_missing_source_or_permission_errors(tmp_path):
+    path = tmp_path / 'missing.txt'
+    result = json.loads(reader(tmp_path).execute('read_file', {'path': str(path), 'offset': -1}))
+    assert 'error' in result and 'retry_read_file' not in result
+    assert 'missing' in result['error'].lower()
+    denied = json.loads(reader(tmp_path, computer_enabled=False).execute(
+        'read_file', {'path': str(path), 'offset': -1}))
+    assert 'denied' in denied and 'retry_read_file' not in denied
+
+
+def test_canonical_continuation_reads_every_character_after_a_cut_line(tmp_path):
+    contents = '\ufefffirst\r\n' + 'café' * 6000 + 'DEEP_MARKER\r\nlast\r\n'
+    path = tmp_path / 'source.txt'
+    path.write_bytes(contents.encode())
+    tool = reader(tmp_path)
+    page = read(tool, path, start_line=1, max_lines=2)
+    covered_end = page['coverage']['ranges'][0][1]
+    assert covered_end == 15995
+    assert page['text'] == '1: \ufefffirst\n2: ' + ('café' * 4000)[:15987]
+    pieces = [contents[:covered_end]]
+    for _ in range(20):
+        arguments = page['next_read_file']
+        if arguments is None:
+            break
+        assert arguments['offset'] == covered_end
+        assert set(arguments) == {'path', 'offset', 'max_chars'}
+        page = json.loads(tool.execute('read_file', arguments))
+        assert 'error' not in page
+        assert page['sha256'] == hashlib.sha256(contents.encode()).hexdigest()
+        assert page['coverage']['ranges'][0][0] == covered_end
+        covered_end = page['coverage']['ranges'][0][1]
+        pieces.append(page['text'])
+    else:
+        pytest.fail('Canonical source continuation failed to finish.')
+    assert ''.join(pieces) == contents
+    assert covered_end == len(contents)
 
 
 def test_source_changes_between_pages_are_visible(tmp_path):

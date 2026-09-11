@@ -5,6 +5,7 @@ and the user's judgments live separately in ordinary persisted settings.
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import hashlib
 import json
@@ -37,13 +38,20 @@ def version_review(repo, ident):
 def save_version_review(repo, ident, **fields):
     if repo.run(ident) is None:
         raise ValueError('This training version does not exist.')
-    if set(fields) - {'name', 'notes', 'judgment', 'comparison', 'conversion'}:
+    if set(fields) - {'name', 'notes', 'judgment', 'comparison', 'conversion',
+                      'comparison_prompts', 'comparison_history'}:
         raise ValueError('Unknown version review field.')
     for key, limit in (('name', 120), ('notes', 12000)):
         if key in fields and (not isinstance(fields[key], str) or len(fields[key]) > limit):
             raise ValueError(f'{key} must be text of at most {limit} characters.')
     if 'judgment' in fields and fields['judgment'] not in ('unreviewed', 'better', 'same', 'worse', 'mixed'):
         raise ValueError('Choose a supported comparison judgment.')
+    if 'comparison_prompts' in fields:
+        fields['comparison_prompts'] = validate_comparison_prompts(repo, ident, fields['comparison_prompts'])
+    if 'comparison_history' in fields and (not isinstance(fields['comparison_history'], list)
+            or any(not isinstance(entry, dict) or not isinstance(entry.get('comparison'), dict)
+                   for entry in fields['comparison_history'])):
+        raise ValueError('Comparison history must contain saved comparison attempts.')
     value = dict(version_review(repo, ident), **fields, updated=now())
     repo.store.set_setting('training_review_' + ident, value)
     return value
@@ -296,72 +304,188 @@ def model_fingerprints(config, cancel):
     return result
 
 
+def validate_comparison_prompts(repo, ident, prompts):
+    """Validate fresh questions against the immutable run, without changing it."""
+    run = repo.run(ident)
+    if run is None:
+        raise ValueError('This training version does not exist.')
+    if not isinstance(prompts, list) or len(prompts) > 20:
+        raise ValueError('Provide a list of at most 20 fresh comparison questions.')
+    normalize = TrainingRepository._normalized_prompt
+    teaching = {normalize(row['prompt']) for row in run['examples']['train']}
+    held_out = {normalize(row['prompt']) for row in run['examples']['eval']}
+    seen = set()
+    result = []
+    for row in prompts:
+        if not isinstance(row, dict):
+            raise ValueError('Each fresh question must contain prompt text and an optional reference answer.')
+        prompt, response = row.get('prompt'), row.get('response', '')
+        if not isinstance(prompt, str) or not isinstance(response, str):
+            raise ValueError('A question and its optional reference answer must be text.')
+        prompt, response = prompt.strip(), response.strip()
+        if not prompt:
+            raise ValueError('Write a fresh comparison question before adding it.')
+        if len(prompt) > 20000 or len(response) > 20000:
+            raise ValueError('A fresh question or reference answer must be at most 20,000 characters.')
+        normalized = normalize(prompt)
+        if normalized in teaching:
+            raise ValueError('This question was used for training. Choose a different fresh question.')
+        if normalized in held_out:
+            raise ValueError('This question is already included in the held-out comparison.')
+        if normalized in seen:
+            raise ValueError('Remove the repeated fresh comparison question.')
+        seen.add(normalized)
+        result.append({'prompt': prompt, 'response': response})
+    return result
+
+
 def comparison_is_current(repo, ident, original, thinking=False):
-    comparison = version_review(repo, ident).get('comparison') or {}
+    review = version_review(repo, ident)
+    comparison = review.get('comparison') or {}
     current = dataclasses.replace(original, secondary_model_path='')
     if (comparison.get('status') != 'complete' or comparison.get('current_config') != dataclasses.asdict(current)
             or comparison.get('thinking') != thinking
             or comparison.get('system_sha256') != hashlib.sha256(SYSTEM.encode()).hexdigest()):
         return False
     try:
+        rows = comparison.get('examples', [])
+        fresh = validate_comparison_prompts(repo, ident, review.get('comparison_prompts', []))
+        compared_fresh = [dict(prompt=row['prompt'], response=row.get('response', ''))
+                          for row in rows if row.get('source') == 'fresh']
+        if compared_fresh != fresh:
+            return False
+        if 'schema_version' in comparison:
+            if comparison['schema_version'] != 2:
+                return False
+            expected = [dict(prompt=row['prompt'], response=row['response'], source='held_out')
+                        for row in repo.run(ident)['examples']['eval']]
+            expected.extend(dict(row, source='fresh') for row in fresh)
+            actual = [{key: row.get(key) for key in ('prompt', 'response', 'source')} for row in rows]
+            if (actual != expected
+                    or not rows or any(row.get(side + '_status') != 'complete'
+                                      or not row.get(side + '_output', '').strip()
+                                      or side + '_error' in row
+                                      for row in rows for side in ('current', 'candidate'))):
+                return False
         candidate = candidate_configuration(repo, ident, current, threading.Event())
         return (comparison.get('candidate_config') == dataclasses.asdict(candidate)
                 and comparison.get('current_fingerprints') == model_fingerprints(current, None)
                 and comparison.get('candidate_fingerprints') == model_fingerprints(candidate, None))
-    except (OSError, ValueError, Cancelled):
+    except (OSError, ValueError, Cancelled, KeyError, TypeError, AttributeError):
         return False
 
 
-def compare_version(repo, ident, original, cancel, on_status=lambda _: None, thinking=False):
+def compare_version(repo, ident, original, cancel, on_status=lambda _: None, thinking=False,
+                    *, prompts=None, on_update=lambda _: None):
+    on_status('Preparing comparison with Strand…')
+    previous = version_review(repo, ident)
+    fresh = validate_comparison_prompts(repo, ident,
+                                       previous.get('comparison_prompts', []) if prompts is None else prompts)
     current = dataclasses.replace(original, secondary_model_path='')
-    candidate = candidate_configuration(repo, ident, current, cancel)
-    rows = repo.run(ident)['examples']['eval']
-    report = {'status': 'running', 'created': now(), 'thinking': thinking,
+    held_out = repo.run(ident)['examples']['eval']
+    rows = [dict(prompt=row['prompt'], response=row['response'], source='held_out') for row in held_out]
+    rows.extend(dict(row, source='fresh') for row in fresh)
+    for row in rows:
+        for side in ('current', 'candidate'):
+            row.update({side + '_status': 'pending', side + '_output': '', side + '_reasoning': ''})
+    report = {'schema_version': 2, 'id': uuid.uuid4().hex, 'status': 'running',
+              'created': now(), 'thinking': thinking,
               'system_sha256': hashlib.sha256(SYSTEM.encode()).hexdigest(),
               'runtime': 'Local llama.cpp Chat engine; independent requests without action tools or project files',
-              'current_config': dataclasses.asdict(current), 'candidate_config': dataclasses.asdict(candidate),
-              'current_fingerprints': model_fingerprints(current, cancel),
-              'candidate_fingerprints': model_fingerprints(candidate, cancel),
-              'base_changed': current.model_path != candidate.model_path,
-              'examples': [dict(prompt=row['prompt'], response=row['response']) for row in rows]}
-    save_version_review(repo, ident, comparison=report, judgment='unreviewed')
+              'current_config': dataclasses.asdict(current), 'examples': rows}
+    history = list(previous.get('comparison_history') or [])
+    if previous.get('comparison'):
+        history.append({'comparison': copy.deepcopy(previous['comparison']),
+                        'judgment': previous.get('judgment', 'unreviewed'),
+                        'notes': previous.get('notes', ''), 'archived': now()})
+    # Replace eligibility before hashing large model files or starting an engine.
+    save_version_review(repo, ident, comparison=report, comparison_prompts=fresh,
+                        comparison_history=history, judgment='unreviewed')
+    last_update = 0.0
+
+    def publish(*, persist=False, force=True):
+        nonlocal last_update
+        if persist:
+            save_version_review(repo, ident, comparison=report)
+        timestamp = time.monotonic()
+        if force or timestamp - last_update >= .1:
+            on_update(copy.deepcopy(report))
+            last_update = timestamp
+
+    publish()
     try:
+        if cancel.is_set():
+            raise Cancelled('Comparison stopped before preparation. Saved answers remain available.')
+        candidate = candidate_configuration(repo, ident, current, cancel)
+        on_status('Verifying comparison model files…')
+        report.update(candidate_config=dataclasses.asdict(candidate),
+                      current_fingerprints=model_fingerprints(current, cancel),
+                      candidate_fingerprints=model_fingerprints(candidate, cancel),
+                      base_changed=current.model_path != candidate.model_path)
+        publish(persist=True)
         for label, config in (('current', current), ('candidate', candidate)):
+            if cancel.is_set():
+                raise Cancelled('Comparison stopped. Saved answers remain available.')
+            on_status(f'Loading {label} Strand for comparison…')
             engine = LocalEngine(config, repo.store.directory / 'training' / 'comparisons' / ident / label)
             try:
                 engine.start(cancel, on_status)
-                for index, row in enumerate(report['examples']):
+                for index, row in enumerate(rows):
                     if cancel.is_set():
                         raise Cancelled('Comparison stopped. Saved answers remain available.')
                     on_status(f'Comparing {label} Strand · answer {index + 1} of {len(rows)}')
-                    parts = []
+                    row[label + '_status'] = 'running'
+                    publish(persist=True)
+
+                    def append_delta(text):
+                        row[label + '_output'] += text
+                        publish(force=False)
+
+                    def append_reasoning(text):
+                        row[label + '_reasoning'] += text
+                        publish(force=False)
+
                     try:
                         reply = engine.complete([{'role': 'system', 'content': SYSTEM},
                                                  {'role': 'user', 'content': row['prompt']}],
-                                                None, cancel, parts.append, thinking=thinking)
-                        row[label + '_output'] = reply.get('content') or ''.join(parts)
+                                                None, cancel, append_delta, thinking=thinking,
+                                                on_reasoning=append_reasoning)
+                        row[label + '_output'] = reply.get('content') or row[label + '_output']
+                        row[label + '_reasoning'] = (reply.get('reasoning_content') or reply.get('reasoning')
+                                                    or row[label + '_reasoning'])
+                        if cancel.is_set():
+                            raise Cancelled('Comparison stopped. Saved answers remain available.')
                         if not row[label + '_output'].strip():
                             raise ValueError('The model returned no visible answer.')
                         if reply.get('tool_calls'):
                             raise ValueError('The model requested actions during a tools-free comparison.')
-                    except Cancelled:
-                        row[label + '_output'] = ''.join(parts)
+                        row[label + '_status'] = 'complete'
+                    except Cancelled as error:
+                        row[label + '_status'] = 'cancelled'
+                        row[label + '_error'] = str(error)
                         raise
                     except Exception as error:
-                        row[label + '_output'] = ''.join(parts)
+                        row[label + '_status'] = 'incomplete'
                         row[label + '_error'] = str(error)
-                    save_version_review(repo, ident, comparison=report)
+                    finally:
+                        publish(persist=True)
             finally:
                 engine.stop()
+        on_status('Checking that comparison model files stayed unchanged…')
         if (report['current_fingerprints'] != model_fingerprints(current, cancel)
                 or report['candidate_fingerprints'] != model_fingerprints(candidate, cancel)):
             raise ValueError('A model file changed during comparison. Run it again with unchanged files.')
-        report['status'] = 'incomplete' if any(key.endswith('_error') for row in report['examples'] for key in row) else 'complete'
+        if cancel.is_set():
+            raise Cancelled('Comparison stopped. Saved answers remain available.')
+        report['status'] = ('complete' if rows and all(row[side + '_status'] == 'complete'
+                                                    for row in rows for side in ('current', 'candidate'))
+                            else 'incomplete')
     except Cancelled as error:
         report.update(status='cancelled', error=str(error))
     except Exception as error:
         report.update(status='incomplete', error=str(error))
-    save_version_review(repo, ident, comparison=report)
+    report['finished'] = now()
+    publish(persist=True)
     return report
 
 

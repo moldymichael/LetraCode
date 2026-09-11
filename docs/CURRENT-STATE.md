@@ -15,6 +15,20 @@ The user-requested **0.6.0 installation is now complete**, and the canonical
 The obsolete 0.1.1 local-main baseline was fast-forwarded. See the
 [installation and source correction record](INSTALLED-0.6.0-UPDATE.md).
 
+The installed comparison workflow repair adds an immediate **Compare with Strand** window,
+fresh per-candidate questions, complete side-by-side answers, streaming progress,
+retained partial failures and history, per-question judgments and an explicit
+comparison export. It retains the original held-out questions, frozen training
+snapshots, model verification, explicit adoption and rollback. See the
+[repair and verification record](COMPARISON-WORKFLOW.md). The user-requested local
+installation is complete; see the [installation check](INSTALLED-COMPARISON-UPDATE.md).
+
+The current source checkout also adds [automatic source reading recovery](READING-RECOVERY.md):
+canonical character cursors, deterministic paging-error repair, missing-range
+continuation, context-fit checks, and final-response coverage evidence. It retains
+the existing run limits. The user-requested installation is complete; see the
+[installed reading update](INSTALLED-READING-UPDATE.md).
+
 ## Earlier implementation milestones
 
 The **0.5.0 QLoRA update** adds explicit CUDA 4-bit NF4 training with double

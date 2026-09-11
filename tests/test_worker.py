@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 from letracode.store import Store
+from letracode.continuation import RunLimits
+from letracode.evidence import evidence_state
 from letracode.worker import ConversationWorker, conversation_messages
 
 
@@ -294,18 +296,18 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
     store, chat, paths = linked_reading_chat(tmp_path, 8 * batch_size)
     batches = [paths[i:i + batch_size] for i in range(0, len(paths), batch_size)]
     engine = ReadingEngine(batches)
-    worker = ConversationWorker(store, chat, engine)
+    worker = ConversationWorker(store, chat, engine, limits=RunLimits(max_requests=12))
     worker.run()
 
     rows = store.messages(chat)
-    # These capped/compacted first pages never exposed the entire sources.
-    # Keep the scripted claim, label it provisional, then stop the stall loop.
+    # Full recovery needs more than this deliberately bounded test run. The
+    # controller must advance coverage until its budget, not repeat the claim.
     assert rows[-1]['status'] == 'paused'
-    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'no_progress'
+    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'request_budget'
     claims = [row for row in rows if row['content'] == 'Finished reading the requested files.']
-    assert len(claims) == 3 and all(row['status'] == 'incomplete' for row in claims)
+    assert len(claims) == 4 and all(row['status'] == 'incomplete' for row in claims)
     assert not any(row['status'] == 'error' for row in rows)
-    assert len(engine.requests) == 11
+    assert len(engine.requests) == 12
     assert engine.config.context_size == 32768
     for request in engine.requests:
         # Existing 32768-context / 3072-reply character allowance: 57392.
@@ -320,7 +322,7 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
         if request[-1]['role'] == 'tool':
             outcomes = [json.loads(m['content']) for m in request if m['role'] == 'tool']
             if 'text' in outcomes[-1]:
-                assert len(outcomes[-1]['text']) == 16000
+                assert 0 < len(outcomes[-1]['text']) <= 16000
             else:
                 # Only shorten the newest read after all older bulky bodies
                 # have yielded their space (32 call/result pairs add overhead).
@@ -331,13 +333,19 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
                for m in engine.requests[8] if m['role'] == 'tool')
 
     saved_tools = [row for row in rows if row['role'] == 'tool']
-    assert len(saved_tools) == len(paths)
+    assert len(saved_tools) > len(paths)
     for row, path in zip(saved_tools, paths):
         result = json.loads(json.loads(row['payload'])['message']['content'])
         assert result['path'] == str(path)
         assert len(result['text']) == 16000
         assert json.loads(row['content'].split('\n\nResult:\n', 1)[1]) == result
         assert 'context_truncated' not in result
+
+    origin = next(row['id'] for row in rows if row['role'] == 'user')
+    state = evidence_state(rows, origin)
+    assert state['incomplete']
+    assert any(json.loads(row['payload']).get('application_generated') == 'source_read_recovery' for row in rows)
+    assert any(file['exposed_ranges'] for file in state['files'])
 
     # An oversized completed turn can also be repacked after reopening the DB.
     reopened = Store(tmp_path / 'data')
@@ -353,12 +361,12 @@ def test_repeated_file_reads_fit_context_and_keep_full_saved_results(tmp_path, b
 def test_single_oversized_read_keeps_a_marked_preview_and_full_saved_result(tmp_path):
     store, chat, paths = linked_reading_chat(tmp_path, 1, escaped=True)
     engine = ReadingEngine([paths], context_size=8192, max_tokens=1024)
-    ConversationWorker(store, chat, engine).run()
+    ConversationWorker(store, chat, engine, limits=RunLimits(max_actions=1)).run()
     rows = store.messages(chat)
     assert rows[-1]['status'] == 'paused'
-    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'no_progress'
-    assert sum(row['status'] == 'incomplete' for row in rows) == 3
-    assert len(engine.requests) == 4
+    assert json.loads(rows[-1]['payload'])['checkpoint']['reason'] == 'action_budget'
+    assert sum(row['status'] == 'incomplete' for row in rows) == 1
+    assert len(engine.requests) == 2
     request = engine.requests[1]
     assert len(json.dumps(request, ensure_ascii=False)) <= 12336
     assert_paired_tools(request)

@@ -5,6 +5,7 @@ from pathlib import Path
 import threading
 
 from letracode.budgeting import RequestUsage
+from letracode.evidence import evidence_state
 from letracode.store import Store
 from letracode.worker import ConversationWorker
 
@@ -210,9 +211,10 @@ def test_pending_approval_blocks_all_later_model_requests_until_stop(tmp_path):
     assert store.messages(chat)[-1]['status']=='interrupted'
 
 
-def test_partial_source_answer_remains_provisional_and_stops_no_progress(tmp_path):
+def test_partial_source_answer_is_released_only_after_automatic_reads_expose_all_gaps(tmp_path):
     store,chat,paths,prompt=fixture(tmp_path,1)
-    paths[0].write_text('middle evidence '*500)
+    contents = 'middle evidence '*500
+    paths[0].write_text(contents)
     class Overclaim(Pages):
         def complete(self,messages,*args,**kwargs):
             self.requests.append(copy.deepcopy(messages))
@@ -224,10 +226,30 @@ def test_partial_source_answer_remains_provisional_and_stops_no_progress(tmp_pat
     engine=Overclaim(paths)
     ConversationWorker(store,chat,engine).run()
     rows=store.messages(chat)
+    origin = next(row['id'] for row in rows if row['role'] == 'user')
     claims=[r for r in rows if r['role']=='assistant' and 'All complete.' in r['content']]
-    assert len(claims)==3
-    assert all(r['status']=='incomplete' and not json.loads(r['payload'])['pause_context_closed'] for r in claims)
-    assert json.loads(rows[-1]['payload'])['checkpoint']['reason']=='no_progress'
+    assert len(claims) >= 2
+    assert all(r['status']=='incomplete' and not json.loads(r['payload'])['pause_context_closed']
+               for r in claims[:-1])
+    assert claims[-1] == rows[-1] and claims[-1]['status'] == 'complete'
+    for claim in claims:
+        state = evidence_state([row for row in rows if row['id'] <= claim['id']], origin)
+        assert state['incomplete'] is (claim['status'] == 'incomplete')
+    pages = [json.loads(json.loads(row['payload'])['message']['content'])
+             for row in rows if row['role'] == 'tool']
+    assert pages[0]['text'] == contents[:100]
+    assert ''.join(page['text'] for page in pages) == contents
+    cursor = 0
+    for page in pages:
+        assert page['offset'] == cursor
+        cursor += len(page['text'])
+        assert page['coverage']['ranges'] == [[page['offset'], cursor]]
+    automatic = [row for row in rows if json.loads(row['payload']).get('application_generated')
+                 == 'source_read_recovery']
+    assert len(automatic) == len(pages) - 1
+    assert evidence_state(rows, origin)['files'][0]['exposed_ranges'] == [[0, len(contents)]]
+    assert [row['content'] for row in rows if row['role'] == 'user'] == [prompt]
+    assert not any(row['status'] == 'paused' for row in rows)
     assert any(r['role']=='notice' and 'coverage is incomplete' in r['content'] for r in rows)
 
 

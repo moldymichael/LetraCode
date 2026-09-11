@@ -23,6 +23,7 @@ from .training_experience import (ExperienceWorker, check_readiness, compare_ver
 
 class FineTuningPanel(QWidget):
     busy_changed = Signal(bool)
+    comparison_updated = Signal(str, object)
 
     def __init__(self, store, main_window):
         super().__init__(main_window)
@@ -32,6 +33,8 @@ class FineTuningPanel(QWidget):
         self.repository.mark_interrupted()
         self.job = None
         self.chat_busy = False
+        self.comparison_dialog = None
+        self._comparison_run_id = None
         self.example_id = None
         self.example_source = ''
         self._editor_key = 'draft:' + uuid.uuid4().hex
@@ -492,6 +495,8 @@ class FineTuningPanel(QWidget):
             self.main_window.engine.stop()
         self.job = ExperienceWorker(operation, self)
         self.job.status.connect(self.progress.setText)
+        if self._comparison_run_id is not None:
+            self.job.status.connect(self.comparison_status)
         self.job.failed.connect(self.experience_failed)
         self.job.ready.connect(callback)
         self.job.finished.connect(self.job_finished)
@@ -501,6 +506,7 @@ class FineTuningPanel(QWidget):
     def experience_failed(self, error):
         self._train_after_check = False
         self.progress.setText(error)
+        self.comparison_status(error)
         if self._readiness_result is None:
             self.readiness.setText('Preparation needs attention\n' + error)
 
@@ -526,13 +532,40 @@ class FineTuningPanel(QWidget):
         self.progress.setText('Preparing local training…'); self.job.start()
 
     def compare(self):
-        if self.job is not None or self.chat_busy or not self.run_id:
+        if not self.run_id:
+            self.progress.setText('Choose a trained candidate to compare.'); return
+        from .training_comparison_ui import ComparisonDialog
+        if self.comparison_dialog is None or self.comparison_dialog.ident != self.run_id:
+            if self.comparison_dialog is not None:
+                self.comparison_dialog.close(); self.comparison_dialog.deleteLater()
+            self.comparison_dialog = ComparisonDialog(self, self.run_id)
+        elif not self.comparison_dialog.review_dirty and self.job is None:
+            self.comparison_dialog.reload()
+        self.comparison_dialog.show()
+        self.comparison_dialog.raise_()
+        self.comparison_dialog.activateWindow()
+
+    def run_comparison(self, ident, prompts):
+        if self.job is not None or self.chat_busy:
             return
-        ident = self.run_id
         config = dataclasses.replace(self.main_window.engine_config)
         thinking = self.main_window.mode.currentText() == 'Thinking'
-        self.start_experience(lambda cancel, status: compare_version(self.repository, ident, config, cancel, status, thinking),
-                              lambda result: self.progress.setText('Comparison complete. Read every answer and save your judgment.' if result['status'] == 'complete' else 'Comparison is incomplete. Saved answers and errors are shown; you can try again.'), unload=True)
+        self._comparison_run_id = ident
+        self.progress.setText('Starting comparison. Verifying model files; large models can take a while…')
+        try:
+            self.start_experience(lambda cancel, status: compare_version(self.repository, ident, config, cancel, status, thinking,
+                                  prompts=prompts, on_update=lambda report: self.comparison_updated.emit(ident, report)),
+                                  self.comparison_ready, unload=True)
+        except (OSError, ValueError) as error:
+            self.experience_failed(str(error))
+
+    def comparison_status(self, text):
+        if self.comparison_dialog is not None and self.comparison_dialog.ident == self._comparison_run_id:
+            self.comparison_dialog.progress.setText(text)
+
+    def comparison_ready(self, result):
+        self.progress.setText('Comparison complete. Read both answers and save your judgment.' if result['status'] == 'complete'
+                             else 'Comparison is incomplete. Saved answers and errors are available; you can try again.')
 
     def retry_conversion(self):
         if self.job is not None or self.chat_busy or not self.run_id:
@@ -605,14 +638,9 @@ class FineTuningPanel(QWidget):
                     text += '\nThe candidate uses a different base model. This comparison includes that model change as well as training.'
                 if comparison.get('error'):
                     text += '\n' + comparison['error']
-                for index, row in enumerate(comparison.get('examples', []), 1):
-                    text += f'\n\n── Comparison {index} ──\nQuestion: ' + row['prompt'] + '\nDesired answer: ' + row['response']
-                    for key, label in (('current', 'Strand now'), ('candidate', 'Candidate')):
-                        text += '\n\n' + label + ':\n' + row.get(key + '_output', 'No answer saved')
-                        if row.get(key + '_error'):
-                            text += '\nIncomplete: ' + row[key + '_error']
+                text += '\n\nOpen Compare with Strand to read complete answers side by side, add fresh questions, review previous attempts and export the saved comparison.'
             elif converted_artifact_state(self.repository, run['id']) == 'present':
-                text += '\n\nNext: Compare with Strand. Every saved comparison question will be answered by both versions independently in the Chat runtime.'
+                text += '\n\nNext: Compare with Strand opens a window where you can add fresh questions and run both versions. The original held-out questions stay included.'
             elif run['status'] == 'succeeded':
                 text += '\n\nThe trained adapter is preserved. Retry conversion after resolving preparation details; optimization will not repeat.'
                 text += '\n' + report.get('conversion_error', '')
@@ -758,6 +786,15 @@ class FineTuningPanel(QWidget):
             completed.deleteLater()
         self.busy_changed.emit(False); self.set_chat_busy(False)
         self.refresh_runs()
+        if self._comparison_run_id is not None:
+            review = version_review(self.repository, self._comparison_run_id)
+            comparison = review.get('comparison') or {}
+            self.progress.setText({'complete': 'Comparison complete. Open Compare with Strand to read and review the answers.',
+                'cancelled': 'Comparison stopped. Saved partial answers remain available.'}.get(comparison.get('status'),
+                'Comparison incomplete. Open Compare with Strand to inspect saved answers and errors.'))
+            if self.comparison_dialog is not None and self.comparison_dialog.ident == self._comparison_run_id:
+                self.comparison_dialog.reload()
+            self._comparison_run_id = None
         if self.main_window.closing_when_stopped:
             self.main_window.close()
         elif train_after and completed is not None and not completed.cancelled.is_set():
@@ -783,9 +820,11 @@ class FineTuningPanel(QWidget):
         review = version_review(self.repository, run['id']) if run else {}
         report = effective_report(self.repository, run['id']) if run else {}
         converted = run and run['status'] == 'succeeded' and converted_artifact_state(self.repository, run['id']) == 'present' and run['config'].get('base_gguf')
-        can_adopt = converted and run['id'] != self.store.setting('training_active_version') and review.get('comparison', {}).get('status') == 'complete' and review.get('judgment', 'unreviewed') != 'unreviewed'
+        from .training_comparison_ui import prompts_match
+        can_adopt = converted and run['id'] != self.store.setting('training_active_version') and review.get('comparison', {}).get('status') == 'complete' and prompts_match(review) and review.get('judgment', 'unreviewed') != 'unreviewed'
         self.adopt_button.setEnabled(not busy and bool(can_adopt))
-        self.compare_button.setEnabled(not busy and bool(converted) and bool(self.main_window.engine_config.model_path))
+        self.compare_button.setEnabled(bool(converted) or bool(review.get('comparison')))
+        self.compare_button.setToolTip('Open saved answers and add fresh comparison questions. Run comparison requires an available local model job.')
         self.convert_button.setEnabled(not busy and bool(run and can_retry_conversion(self.repository, run['id'])))
         self.review_button.setEnabled(not busy and bool(run))
         self.open_run_button.setEnabled(bool(run))
@@ -793,3 +832,5 @@ class FineTuningPanel(QWidget):
         self.judgment.setEnabled(not busy and bool(run))
         self.review_notes.setEnabled(not busy and bool(run))
         self.rollback_button.setEnabled(not busy and bool(self.store.setting('training_previous_engine')))
+        if self.comparison_dialog is not None:
+            self.comparison_dialog.update_controls()

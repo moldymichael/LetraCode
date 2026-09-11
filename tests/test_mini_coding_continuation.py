@@ -165,7 +165,7 @@ def mini_run(tmp_path):
     return {'store': store, 'chat': chat, 'folder': folder, 'paths': [app, tests],
             'origin': origin, 'peer': peer, 'boundary_rows': boundary_rows,
             'history': history, 'prompt': prompt, 'approvals': approvals,
-            'coverage': coverage_before_requests}
+            'coverage': coverage_before_requests, 'observed_hashes': observed_hashes}
 
 
 def test_two_rejected_finals_continue_with_valid_protocol_and_real_source_evidence(mini_run):
@@ -193,22 +193,51 @@ def test_two_rejected_finals_continue_with_valid_protocol_and_real_source_eviden
     assert all(row['status'] == 'incomplete' and json.loads(row['payload'])['request_completed']
                and json.loads(row['payload'])['task_outcome'] == 'source_incomplete'
                and json.loads(row['payload'])['source_exposure'] for row in provisional)
-    # The successful test command and withheld finals never prove exposure of
-    # edited versions. Even a retrieved final page is uncredited until submitted.
+    tools = [row for row in rows if row['role'] == 'tool']
+    tool_messages = [json.loads(row['payload'])['message'] for row in tools]
+    automatic = [json.loads(row['payload'])['message']['tool_calls'][0]
+                 for row in rows if json.loads(row['payload']).get('application_generated')
+                 == 'source_read_recovery']
+    assert len(automatic) == 2
+    assert all(call['function']['name'] == 'read_file' for call in automatic)
+    automatic_ids = {call['id'] for call in automatic}
+    automatic_pages = [json.loads(message['content']) for message in tool_messages
+                       if message['tool_call_id'] in automatic_ids]
+    app, tests = run['paths']
+    app_size, test_size = len(app.read_text()), len(tests.read_text())
+    assert [(page['path'], page['offset']) for page in automatic_pages] == [
+        (str(app), 0), (str(app), len(automatic_pages[0]['text']))]
+    assert ''.join(page['text'] for page in automatic_pages) == app.read_text()
+    assert all(page['sha256'] == hashlib.sha256(app.read_bytes()).hexdigest()
+               for page in automatic_pages)
+    app_before = {number: next(item for item in state['files'] if item['path'] == str(app))
+                  for number, state in run['coverage'].items() if number >= 9}
+    tests_before = {number: next(item for item in state['files'] if item['path'] == str(tests))
+                    for number, state in run['coverage'].items() if number >= 9}
+    # The command and withheld finals cannot prove edited-source exposure.
+    # Automatic reads provide that evidence only after a completed request.
     assert all(run['coverage'][number]['incomplete'] for number in range(9, 14))
-    for number in (9, 10, 11):
+    for number in (9, 10):
         assert all(not item['exposed_ranges'] for item in run['coverage'][number]['files'])
+    assert app_before[10]['retrieved_ranges'] == automatic_pages[0]['coverage']['ranges']
+    assert app_before[11]['exposed_ranges'] == automatic_pages[0]['coverage']['ranges']
+    assert app_before[11]['retrieved_ranges'] == [[0, app_size]]
+    assert app_before[12]['exposed_ranges'] == [[0, app_size]]
+    assert all(not tests_before[number]['exposed_ranges'] for number in range(9, 14))
+    assert tests_before[13]['retrieved_ranges'] == [[0, test_size]]
     assert evidence_state(rows, run['origin'])['incomplete'] is False
     for item in evidence_state(rows, run['origin'])['files']:
         assert item['source_sha256'] == hashlib.sha256(next(
             path for path in run['paths'] if str(path) == item['path']).read_bytes()).hexdigest()
         assert item['versions'][0]['complete_supported_text'], 'Saved original-version exposure was lost'
+        assert run['observed_hashes'][item['path']] == item['source_sha256']
     reopened = Store(store.directory)
     assert reopened.messages(chat) == rows
     assert evidence_state(reopened.messages(chat), run['origin']) == evidence_state(rows, run['origin'])
-    tools = [row for row in rows if row['role'] == 'tool']
     assert [json.loads(row['payload'])['message']['name'] for row in tools] == [
-        'read_file', 'read_file', *(['edit_file'] * 5), 'run_command', 'read_file', 'read_file']
+        'read_file', 'read_file', *(['edit_file'] * 5), 'run_command', *(['read_file'] * 4)]
+    paired([json.loads(row['payload'])['message'] for row in rows
+            if 'message' in json.loads(row['payload'])])
     saved_command = tools[7]
     executor = ToolExecutor([], reopened.directory, lambda _: pytest.fail('Saved recovery requested approval'),
                             threading.Event(), False, False, store=reopened, chat_id=chat)
@@ -232,17 +261,21 @@ def test_first_request_after_real_boundary_can_release_bulky_completed_segment(m
     assert len(run['boundary_rows']) == 1
     rows = run['boundary_rows'][0]
     # A character budget well above required intent/history, but below just
-    # the five saved edit arguments. This is the first request after boundary,
-    # before any new assistant/tool row exists to make the older segment optional.
+    # the five saved edit arguments. The pending automatic read still needs its
+    # paired call/result after the completed effectful segment is evicted.
     required_size = len(json.dumps(run['history'])) + len(run['prompt'])
     budget = required_size + 3000
     packed, trimmed = conversation_messages(rows, 'Mini Coding continuation.', budget)
     assert trimmed
     paired(packed)
     assert len(json.dumps(packed, ensure_ascii=False)) <= budget
-    assert not any(message.get('tool_calls') for message in packed)
+    calls = [call for message in packed for call in message.get('tool_calls', [])]
+    assert len(calls) == 1 and calls[0]['function']['name'] == 'read_file'
+    pending = json.loads(next(row for row in reversed(rows) if row['role'] == 'tool')['payload'])['message']
+    assert calls[0]['id'] == pending['tool_call_id']
+    assert [message['tool_call_id'] for message in packed if message['role'] == 'tool'] == [pending['tool_call_id']]
     assert all(any(message['role'] == role and message['content'] == content for message in packed)
                for role, content in run['history'])
-    assert packed[-1] == {'role': 'user', 'content': run['prompt']}
+    assert packed[-3] == {'role': 'user', 'content': run['prompt']}
     assert 'list_tool_results' in packed[0]['content'] and 'read_tool_result' in packed[0]['content']
     assert run['store'].messages(run['chat'])[:len(rows)] == rows

@@ -107,7 +107,7 @@ review, not proof that the answer is correct.
 
 ## Train, compare and adopt
 
-In **Train**, select the training Python and model folder. For conversion and
+In **Prepare and train**, select the training Python and model folder. For conversion and
 adoption, also select the matching base GGUF and a local llama.cpp source folder
 containing `convert_lora_to_gguf.py`. Install that checkout's conversion
 requirements in the training environment; use its own requirements documentation.
@@ -116,14 +116,14 @@ alone cannot establish that two models have matching weights.
 
 Review method, epochs, rank, length, microbatch, accumulation, checkpointing,
 seed, learning rate and device, select
-the review checkbox, and choose **Start local fine-tuning**. Each run snapshots
+the review checkbox, and choose **Check preparation and train**. Each run snapshots
 approved training/evaluation examples and its configuration. Overlong examples
 fail with an explanation rather than silently dropping response tokens.
 Inference is unloaded during training, and chat/model changes wait for the job.
 **Stop** terminates the owned training process tree. Reopening marks unfinished
 runs interrupted; it never automatically restarts training.
 
-**Versions & evaluation** shows status, base and candidate response loss,
+**Compare and choose → Show technical training report** shows status, base and candidate response loss,
 sample outputs and provenance. Loss excludes prompt tokens and is measured on
 the same held-out responses before and after optimization. Lower loss on that
 set is narrow evidence; compare sample answers and test real Strand tasks.
@@ -134,13 +134,30 @@ package versions, dataset/model/adapter hashes and optimization steps. CUDA
 figures cover this training process's allocator, not total system GPU usage.
 QLoRA makes training more memory efficient; better answers still depend on the
 base model, reviewed examples and evaluation. **Open run folder** exposes logs
-and artifacts.
+and artifacts. The optimizer's immutable `report.json` contains only the first
+three held-out generated samples with a short output budget. It is not the record
+of later comparisons against the currently configured Strand.
+
+After conversion, choose **Compare with Strand**. The window opens before any model
+job starts. Add fresh, self-contained questions (optional reference answers), then
+choose **Run comparison**. Original held-out questions remain included; fresh
+questions are checked against the run's frozen teaching data and never added to
+training examples. Both versions receive identical independent prompts using the
+current Chat settings, without shared notes, project context or tools. Select a
+question to read the full responses side by side, including separately recorded
+Thinking. Progress and errors are visible; **Stop** preserves partial answers.
+
+Save per-question ratings and your overall judgment and notes. Reruns retain earlier
+attempts, and editing the question set requires a new comparison for adoption.
+**Export comparison…** writes the full saved answers, partial failures, history,
+review and run information to a new JSON file. It contains full text and local paths,
+so inspect it before sharing. It does not alter the frozen training report.
 
 Conversion failure keeps the PEFT adapter and comparison report, but disables
-adoption. After a successful conversion, choose **Adopt selected version**.
+adoption. After a complete current comparison and saved judgment, choose **Use this version**.
 LetraCode verifies the recorded base/adapter hashes and loads them with the
 configured llama-server before saving the new engine settings. A failed load
-leaves the previous saved settings intact. **Roll back to previous model**
+leaves the previous saved settings intact. **Restore previous version**
 restores the last configuration. Previous weights and adapters remain on disk.
 Model Setup also supports selecting or clearing an optional GGUF LoRA adapter.
 

@@ -100,7 +100,7 @@ TOOL_SCHEMAS = [
     schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt or list_tool_results and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
     schema('list_tool_results','Discover saved tool results from this chat, including earlier paused or compacted turns, without rerunning actions. Metadata is partial; use read_tool_result for full saved output. Start after_id=0. For each next page keep through_id and set after_id=next_after_id. limit is 1–20, default 10.', {'after_id':{'type':'integer'},'through_id':{'type':'integer'},'limit':{'type':'integer'}}, []),
     schema('list_files','List any folder the OS account can read, including hidden names (no recursive enumeration). Sources prioritize relevance; they are not access boundaries.', {'path':STRING}, ['path']),
-    schema('read_file','Read numbered lines (start_line/max_lines) or exact Unicode character pages (offset/max_chars, default 4000, range 1–16000). Never mix modes. Follow next_offset with offset, including after a cut numbered line. Compare whole-source sha256 between pages for guarded UTF-8 edits. PDF/DOCX are read-only: source_sha256 and extraction.version identify evidence, never edit authority. Inspect source_truncated and extraction coverage even at EOF.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['path']),
+    schema('read_file','Read numbered lines (start_line/max_lines) or Unicode characters (offset/max_chars, default 4000, range 1–16000). Follow exact next_read_file args, including cut lines; invalid paging returns retry_read_file. Explicit offset wins; max_chars+start_line converts the line to an offset. sha256 is UTF-8 edit authority; PDF/DOCX are read-only (source_sha256/extraction.version). EOF alone proves no whole-file coverage: check source_truncated, extraction scope and verified exposure.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['path']),
     schema('search_project','Search bounded overlapping character windows of linked source text. Returns diverse partial passages with paths, source lines and character offsets; use read_file to page further.', {'query':STRING}, ['query']),
     # Hermes indexes schema.type as a scalar; anyOf keeps the same nullable contract.
     schema('write_file','Create or replace UTF-8 text with an approved diff and backup. expected_sha256 must match read_file for an existing file; null means create only if absent. Prefer edit_file for a small change.', {'path':STRING,'content':STRING,'expected_sha256':{'anyOf':[{'type':'string'},{'type':'null'}]}}, ['path','content','expected_sha256']),
@@ -321,32 +321,55 @@ class ToolExecutor:
         return {'entries':result, 'limit':300, 'hidden_files_omitted':False}
 
     def _read_file(self, args):
-        path = self._path(args)
-        character_mode = 'offset' in args or 'max_chars' in args
-        if character_mode and ('start_line' in args or 'max_lines' in args):
-            raise ValueError('Do not mix line and character paging arguments.')
-        offset, max_chars = args.get('offset', 0), args.get('max_chars', 4000)
-        if character_mode and (type(offset) is not int or offset < 0 or
-                               type(max_chars) is not int or not 1 <= max_chars <= 16000):
-            raise ValueError('offset must be nonnegative and max_chars must be 1–16000 integers.')
-        start, maximum = args.get('start_line',1), args.get('max_lines',180)
-        if type(start) is not int or type(maximum) is not int or start < 1 or not 1 <= maximum <= 400:
-            raise ValueError('start_line must be positive and max_lines must be 1–400.')
-        path = path.resolve()
+        path = self._path(args).resolve()
+        # Check the actual source first: missing, unreadable or unsupported
+        # files cannot be fixed by changing a page cursor.
         source = read_source(path)
         contents = source.pop('text')
+        character_mode = 'offset' in args or 'max_chars' in args
+        max_chars = args.get('max_chars', 4000)
+        valid_size = type(max_chars) is int and 1 <= max_chars <= 16000
+
+        def character_arguments(offset):
+            return {'path': str(path), 'offset': offset,
+                    'max_chars': max_chars if valid_size else 4000}
+
+        def pagination_error(message, offset=0):
+            # A suggested retry has no coverage: only text returned by a
+            # successful read can contribute evidence. Unknown cursors restart
+            # at the beginning rather than guessing from conflicting units.
+            return {'path': str(path), 'error': message,
+                    'code': 'invalid_pagination', 'recoverable': True,
+                    'retry_read_file': character_arguments(offset)}
+
+        start, maximum = args.get('start_line',1), args.get('max_lines',180)
+        if 'offset' in args:
+            offset = args['offset']
+            if type(offset) is not int or not 0 <= offset <= len(contents):
+                return pagination_error(f'offset must be an integer from 0 to {len(contents)}.')
+            # Explicit character positions are authoritative. Leftover line
+            # parameters, even malformed ones, cannot change this position.
+        else:
+            starts = line_starts(contents)
+            if type(start) is not int or not 1 <= start <= max(1, len(starts)):
+                return pagination_error(f'start_line must be an integer from 1 to {max(1, len(starts))}.')
+            offset = starts[start - 1] if starts else 0
+        if character_mode and not valid_size:
+            return pagination_error('max_chars must be an integer from 1 to 16000.', offset)
+        if not character_mode and (type(maximum) is not int or not 1 <= maximum <= 400):
+            return pagination_error('max_lines must be an integer from 1 to 400.', offset)
         common = {'path': str(path), 'total_chars': len(contents), **source}
         if character_mode:
             text = contents[offset:offset + max_chars]
             following = offset + len(text)
             next_offset = following if following < len(contents) else None
             return {**common, 'offset': offset, 'text': text, 'next_offset': next_offset,
+                    'next_read_file': character_arguments(next_offset) if next_offset is not None else None,
                     'coverage': {'version': 1, 'representation': 'raw-characters',
                                  'ranges': [[offset, following]] if text else []},
                     'output_truncated': next_offset is not None,
                     'truncated': next_offset is not None or source['source_truncated']}
         lines = contents.splitlines()
-        starts = line_starts(contents)
         end = min(len(lines), start + maximum - 1)
         parts, length = [], 0
         next_offset = starts[end] if end < len(lines) else None
@@ -364,6 +387,7 @@ class ToolExecutor:
         coverage_end = next_offset if next_offset is not None else len(contents)
         return {**common, 'start_line': start, 'total_lines': len(lines),
                 'text': ''.join(parts), 'next_offset': next_offset,
+                'next_read_file': character_arguments(next_offset) if next_offset is not None else None,
                 'coverage': {'version': 1, 'representation': 'numbered-lines',
                              'ranges': [[coverage_start, coverage_end]] if coverage_start < coverage_end else []},
                 'output_truncated': output_truncated,

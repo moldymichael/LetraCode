@@ -17,6 +17,7 @@ from .engine import Cancelled, ContextOverflowError
 from .pause_context import payload as row_payload, resolve_intent
 from .continuation import RunHalted, RunLimits, RunProgress, interrupted_outcome
 from .evidence import evidence_state, request_exposure, source_evidence, summary as evidence_summary
+from .reading import SourceReadRecovery
 from .tools import ApprovalRequest, TOOL_SCHEMAS, ToolExecutor, tool_enabled
 from .store import now
 
@@ -188,6 +189,14 @@ def conversation_messages(rows, system, budget, *, measure=None, receipt=None):
             current = []
         if row['status'] in ('error', 'streaming', 'interrupted'):
             continue
+        if (row['role'] == 'assistant'
+                and payload.get('application_generated') == 'source_read_recovery'):
+            # Every controller read is a durable, paired context boundary.
+            # Keep the original intent, but let older receipts yield room for
+            # the next full page before the ten-round segment is exhausted.
+            if current:
+                turns.append(current)
+                current = []
         message = attributed_message(row, payload)
         if (row['role'] == 'assistant' and row['status'] == 'incomplete'
                 and payload.get('task_outcome') == 'source_incomplete'
@@ -547,6 +556,7 @@ class ConversationWorker(QThread):
                 raise ContextOverflowError('The reserved reply leaves no room for core instructions and the user request.')
             self.status.emit('Reading current Memory and project context…')
             retrieval_budget = min(20000, int((context_size - reply_size - 128) * 1.3))
+            initial_retrieval_budget = retrieval_budget
             model_path = getattr(self.engine.config, 'model_path', '')
             provenance = (f'Local model file: {Path(model_path).name if model_path else "not configured"}. '
                           f'Context: {context_size} tokens; maximum response: {reply_size} tokens. '
@@ -611,7 +621,7 @@ class ConversationWorker(QThread):
                             capabilities={'read_files': bool(self.computer_enabled), 'actions': bool(self.actions_enabled),
                                           'web': bool(self.web_enabled), 'tools': bool(self.use_tools)},
                             available_tools=[tool['function']['name'] for tool in tools],
-                            retrieval_reduced=bool(overflow),
+                            retrieval_reduced=retrieval_budget < initial_retrieval_budget,
                             included_tool_results=[dict(message) for message in messages if message['role'] == 'tool'])
                         if trimmed or overflow:
                             self.status.emit('Using bounded context; full conversation and tool results remain saved.')
@@ -632,6 +642,81 @@ class ConversationWorker(QThread):
                      *(['exposure_observed'] if field == 'exposed_ranges' else []))}
                     for item in evidence_state(current, origin)['files']], sort_keys=True)
 
+            reading = SourceReadRecovery()
+            recovery_observation = None
+
+            def recover_source(*, path=None, retry=None):
+                """Deliver one page, under the same permissions and budgets.
+
+                Each page must pass through a subsequent completed model request
+                before the coverage ledger can advance. Bounded sizing attempts
+                are saved too; a compacted preview cannot count as delivery.
+                """
+                nonlocal recovery_observation, retrieval_budget
+                current = check_run()
+                if not any(tool['function']['name'] == 'read_file' for tool in tools):
+                    return False
+                state = evidence_state(current, origin)
+                arguments = reading.next_read(state, path)
+                if arguments is None:
+                    arguments = retry
+                if arguments is None:
+                    return False
+                pagination_retry_used = False
+                # At most one cursor restart and log2(16000) size reductions.
+                for attempt in range(16):
+                    self.progress.reserve_actions(1)
+                    check_run()
+                    call = {'id': 'source-recovery-' + uuid.uuid4().hex, 'type': 'function',
+                            'function': {'name': 'read_file', 'arguments': json.dumps(arguments)}}
+                    message = {'role': 'assistant', 'content': '', 'tool_calls': [call]}
+                    self.store.add_message(self.chat_id, 'assistant',
+                        'Continuing source reading automatically.', payload={
+                            'message': message, 'application_generated': 'source_read_recovery',
+                            'request_completed': False, 'continuation': self.run_record()})
+                    self.changed.emit()
+                    self.status.emit('Reading next source page automatically…')
+                    # Signals may stop the job or save steering. Pair the call
+                    # before propagating that interruption.
+                    try:
+                        check_run()
+                    except (RunHalted, Cancelled) as error:
+                        self.save_tool_result(call, arguments, json.dumps({
+                            'error': 'Not executed: source reading was stopped.',
+                            'executed': False, 'code': getattr(error, 'reason', 'cancelled')}))
+                        raise
+                    result = executor.execute('read_file', arguments)
+                    ident = self.save_tool_result(call, arguments, result)
+                    outcome = json.loads(result)
+                    check_run()
+                    if 'denied' in outcome:
+                        raise RunHalted('approval_denied', 'File reading was denied. Automatic reading stopped.')
+                    if outcome.get('code') == 'invalid_pagination' and not pagination_retry_used:
+                        # A source may shrink below the cursor since its last
+                        # observation. Read the new snapshot from a valid start.
+                        arguments = outcome['retry_read_file']
+                        pagination_retry_used = True
+                        continue
+                    if 'error' in outcome:
+                        self.progress.observe('read_file', arguments, outcome, ident)
+                        return True
+                    planned = request_exposure(packed_messages(), check_run())
+                    if not any(ident in item.get('source_result_ids', []) for item in planned) and retrieval_budget:
+                        # Prioritize the explicitly requested source over
+                        # optional automatic excerpts when context is tight.
+                        retrieval_budget = 0
+                        planned = request_exposure(packed_messages(), check_run())
+                    if any(ident in item.get('source_result_ids', []) for item in planned):
+                        # A reread can add exposure without adding retrieval.
+                        # Account for it after the next completed request, never
+                        # halt before that request gets to see the viable page.
+                        recovery_observation = (arguments, outcome, ident)
+                        return True
+                    if arguments['max_chars'] == 1:
+                        raise ContextOverflowError('A source page cannot fit beside required instructions and tools, even at one character. Source coverage remains incomplete.')
+                    arguments = reading.smaller_page(arguments)
+                raise RunHalted('no_progress', 'Source paging could not produce a deliverable page within bounded recovery attempts.')
+
             batch_retry_used = False
             while True:
                 # This is a new bounded segment, not an enlarged round loop.
@@ -641,6 +726,16 @@ class ConversationWorker(QThread):
                     prior_exposure = source_signature(current, 'exposed_ranges')
                     messages = packed_messages()
                     exposure = request_exposure(messages, current)
+                    if recovery_observation is not None:
+                        arguments, _, ident = recovery_observation
+                        if not any(ident in item.get('source_result_ids', []) for item in exposure):
+                            # A segment checkpoint can add overhead after the
+                            # previous preflight. Refit before spending a model
+                            # request on a preview with no source exposure.
+                            recover_source(path=arguments['path'])
+                            current = check_run()
+                            messages = packed_messages()
+                            exposure = request_exposure(messages, current)
                     self.progress.reserve_request()
                     rounds = round_index + 1
                     draft, reasoning = '', ''
@@ -688,15 +783,28 @@ class ConversationWorker(QThread):
                         data['reasoning'] = reasoning
                     self.store.update_message(message_id, draft, payload=data)
                     message_id = None
-                    if prior_exposure != source_signature(self.store.messages(self.chat_id), 'exposed_ranges'):
+                    exposure_changed = prior_exposure != source_signature(self.store.messages(self.chat_id), 'exposed_ranges')
+                    if exposure_changed:
                         self.progress.observe_source_exposure()
+                    observation_halt = None
+                    if recovery_observation is not None:
+                        arguments, outcome, ident = recovery_observation
+                        recovery_observation = None
+                        try:
+                            self.progress.observe('read_file', arguments, outcome, ident, progress=exposure_changed)
+                        except RunHalted as error:
+                            # Classify this response and pair all its proposed
+                            # calls before propagating a deferred read blocker.
+                            observation_halt = error
                     self.changed.emit()
                     if not calls:
-                        current = check_run()
+                        current = self.store.messages(self.chat_id)
                         coverage = evidence_state(current, origin)
                         source_work = any(row['id'] >= origin and row['role'] == 'tool'
                             and row_payload(row).get('message', {}).get('name') in ('read_file', 'search_project')
                             for row in current)
+                        if source_work:
+                            data['coverage'] = coverage
                         if source_work and coverage['incomplete']:
                             data['task_outcome'] = 'source_incomplete'
                             self.store.update_message(response_id, draft, 'incomplete', payload=data)
@@ -706,9 +814,17 @@ class ConversationWorker(QThread):
                                 + evidence_summary(coverage, max_files=3),
                                 payload={'coverage': coverage, 'task_outcome': 'source_incomplete'})
                             self.changed.emit()
+                            if observation_halt is not None:
+                                raise observation_halt
+                            if recover_source():
+                                continue
                             self.progress.observe('provisional_response', {},
                                 {'error': 'The model ended without resolving incomplete source coverage; no new action or evidence.'}, response_id)
                             continue
+                        if observation_halt is not None:
+                            self.store.update_message(response_id, draft, 'incomplete', payload=data)
+                            raise observation_halt
+                        check_run()
                         data.update(pause_context_closed=True, task_outcome='response_unverified',
                                     terminal_input_cursor=input_cursor)
                         self.store.update_message(response_id, draft, payload=data)
@@ -717,7 +833,9 @@ class ConversationWorker(QThread):
                         return
 
                     oversized = len(calls) > 8
-                    halted = None
+                    halted = observation_halt
+                    recovery_pending = []
+                    recovery_paths = set()
                     try:
                         self.progress.reserve_actions(len(calls))
                     except RunHalted as error:
@@ -788,12 +906,47 @@ class ConversationWorker(QThread):
                         else:
                             try:
                                 progress = (prior != source_signature(self.store.messages(self.chat_id))) if name == 'read_file' else None
-                                self.progress.observe(name, effect_args if isinstance(effect_args, dict) else {}, outcome, ident, progress=progress)
+                                # Repair invalid paging and repeated source pages
+                                # before a third identical attempt can halt the
+                                # run. Only application-validated paging errors
+                                # are retried; ordinary I/O failures stay bounded.
+                                recovery = None
+                                if name == 'read_file' and isinstance(args, dict):
+                                    if outcome.get('code') == 'invalid_pagination':
+                                        recovery = {'path': args.get('path'), 'retry': outcome.get('retry_read_file')}
+                                    elif 'error' not in outcome and progress is False:
+                                        # A model-chosen smaller page may still
+                                        # provide new exposure on the next call.
+                                        # Intervene for already exposed text or
+                                        # an exact repeated, unexposed page.
+                                        current = self.store.messages(self.chat_id)
+                                        state = evidence_state(current, origin)
+                                        descriptors = source_evidence(name, outcome)
+                                        for descriptor in descriptors:
+                                            file = next((file for file in state['files'] if
+                                                file['path'] == descriptor['path']), None)
+                                            repeated_page = any(row['role'] == 'tool' and origin <= row['id'] < ident
+                                                and descriptor in row_payload(row).get('source_evidence', [])
+                                                for row in current)
+                                            if repeated_page or file and all(any(left <= start and end <= right
+                                                    for left, right in file['exposed_ranges'])
+                                                    for start, end in descriptor['ranges']):
+                                                recovery = {'path': outcome.get('path')}
+                                if recovery is not None:
+                                    recovery_path = recovery['path']
+                                    if recovery_path not in recovery_paths:
+                                        recovery_paths.add(recovery_path)
+                                        recovery_pending.append((recovery, name, effect_args, outcome, ident, progress))
+                                else:
+                                    self.progress.observe(name, effect_args if isinstance(effect_args, dict) else {}, outcome, ident, progress=progress)
                             except RunHalted as error:
                                 halted = error
                     check_run()
                     if halted:
                         raise halted
+                    for recovery, name, arguments, outcome, ident, progress in recovery_pending:
+                        if not recover_source(**recovery):
+                            self.progress.observe(name, arguments, outcome, ident, progress=progress)
                     if oversized:
                         if batch_retry_used:
                             raise RunHalted('tool_batch_limit', 'Paused after two oversized action batches; neither batch was executed.')
