@@ -1,5 +1,5 @@
 """Windows quantizer selection must use a native executable."""
-from pathlib import Path
+from types import SimpleNamespace
 
 
 def test_windows_quantizer_prefers_native_exe(tmp_path, monkeypatch):
@@ -14,6 +14,6 @@ def test_windows_quantizer_prefers_native_exe(tmp_path, monkeypatch):
     unix.chmod(0o755)
     native.chmod(0o755)
 
-    monkeypatch.setattr(training_models.sys, 'platform', 'win32')
+    monkeypatch.setattr(training_models, 'sys', SimpleNamespace(platform='win32'), raising=False)
 
     assert training_models._quantizer(tmp_path) == native.resolve()
