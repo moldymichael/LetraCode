@@ -42,10 +42,26 @@ def model(tmp_path):
     return base
 
 
+def _write_quantizer_peer(checkout, body):
+    if sys.platform == 'win32':
+        # The Windows fixture launches a real python.exe copy as llama-quantize.exe;
+        # its first argument is this dual-purpose GGUF/Python intermediate.
+        (checkout / 'quantizer-peer.py').write_text('GGUF = None\n' + body)
+        return
+    binary = checkout / 'build' / 'bin' / 'llama-quantize'
+    binary.write_text(f'#!{sys.executable}\n' + body)
+    binary.chmod(0o755)
+
+
 @pytest.fixture
-def converter(tmp_path):
+def converter(tmp_path, monkeypatch):
     checkout = tmp_path / 'llama.cpp'
     checkout.mkdir()
+    _write_quantizer_peer(checkout, '''import sys
+from pathlib import Path
+assert len(sys.argv) == 3 and sys.argv[2] == 'Q4_K_M'
+Path(sys.argv[1]).write_bytes(b'GGUFmatching chat weights')
+''')
     (checkout / 'convert_hf_to_gguf.py').write_text('''import argparse, os
 from pathlib import Path
 p = argparse.ArgumentParser()
@@ -57,17 +73,28 @@ assert a.outtype == 'f16'
 assert os.environ['HF_HUB_OFFLINE'] == '1'
 assert os.environ['TRANSFORMERS_OFFLINE'] == '1'
 assert (Path(a.model) / 'model.safetensors').read_bytes() == b'original full precision weights'
-Path(a.outfile).write_bytes(b'GGUFintermediate')
+peer = Path(__file__).with_name('quantizer-peer.py')
+if peer.is_file():
+    Path(a.outfile).write_bytes(peer.read_bytes())
+else:
+    Path(a.outfile).write_bytes(b'GGUFintermediate')
 ''')
-    binary = checkout / 'build' / 'bin' / 'llama-quantize'
-    binary.parent.mkdir(parents=True)
-    binary.write_text(f'#!{sys.executable}\n' + '''import sys
+    folder = checkout / 'build' / 'bin'
+    folder.mkdir(parents=True)
+    if sys.platform == 'win32':
+        binary = folder / 'llama-quantize.exe'
+        shutil.copy2(sys.executable, binary)
+        # A copied python.exe needs the original runtime location for stdlib/DLLs.
+        monkeypatch.setenv('PYTHONHOME', sys.base_prefix)
+    else:
+        binary = folder / 'llama-quantize'
+        binary.write_text(f'#!{sys.executable}\n' + '''import sys
 from pathlib import Path
 assert len(sys.argv) == 4 and sys.argv[3] == 'Q4_K_M'
-assert Path(sys.argv[1]).read_bytes() == b'GGUFintermediate'
+assert Path(sys.argv[1]).read_bytes().startswith(b'GGUF')
 Path(sys.argv[2]).write_bytes(b'GGUFmatching chat weights')
 ''')
-    binary.chmod(0o755)
+        binary.chmod(0o755)
     return checkout
 
 
@@ -223,8 +250,8 @@ def test_relative_training_python_still_runs_inside_fresh_scratch(model, convert
 
 @pytest.mark.parametrize('failure', ['failed', 'missing_output'])
 def test_quantization_failure_preserves_diagnostics_without_publishing(model, converter, tmp_path, failure):
-    binary = converter / 'build' / 'bin' / 'llama-quantize'
-    binary.write_text(f'#!{sys.executable}\nimport sys\nprint("quantizer diagnostics")\nsys.exit({7 if failure == "failed" else 0})\n')
+    body = f'import sys\nprint("quantizer diagnostics")\nsys.exit({7 if failure == "failed" else 0})\n'
+    _write_quantizer_peer(converter, body)
     output = tmp_path / 'chat.gguf'
     result = prepare(model, converter, output)
     assert result.returncode != 0
