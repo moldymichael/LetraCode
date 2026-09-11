@@ -263,7 +263,7 @@ def test_compare_uses_real_managed_chat_transport_for_every_question(tmp_path):
     spec = importlib.util.spec_from_file_location('training_comparison_peer', Path(__file__).with_name('test_engine.py'))
     peer = importlib.util.module_from_spec(spec); spec.loader.exec_module(peer)
     repo, run, original = completed(tmp_path, 4)
-    binary = tmp_path / 'llama-server'
+    binary = tmp_path / ('llama-server-peer.exe' if sys.platform == 'win32' else 'llama-server')
     binary.write_text(peer.PEER_SOURCE); binary.chmod(0o700)
     original.executable = str(binary)
     result = module.compare_version(repo, run['id'], original, threading.Event())
