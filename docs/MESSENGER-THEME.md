@@ -66,3 +66,32 @@ model, GPU workload or the exact build installed on the maintainer's computer.
 Native Windows/Fedora CI and teammate review remain separate from Linux offscreen
 verification. The branch temporarily used a dependency-download workflow to set up
 Qt in the isolated development environment; it is removed from the final change.
+
+### Recorded verification, September 12
+
+Application source commit: `8a59c2e113cedaa7a9f6a443cf6e13e228f2d02c`.
+In the isolated Linux environment (Python 3.13.5, Qt/PySide6 6.8.3), as an ordinary
+user, this command completed with **1,175 passed, 18 skipped, 1 deselected and
+6 existing multiprocessing deprecation warnings** in 252.98 seconds:
+
+```sh
+QT_QPA_PLATFORM=offscreen python -m pytest -q \
+  --deselect=tests/test_gemma_backend.py::test_frozen_cpu_ple_lookup_transfers_only_rows
+```
+
+The one deselection is an optional-training dependency issue: this environment
+has torch but not accelerate. The same test fails for that reason on the unchanged
+baseline. The test itself and training code are not changed or skipped in source.
+All 16 messenger-theme/scroll tests passed, including actual Qt mouse-thumb drag,
+wheel input, manual end navigation, reflow, selection, palette persistence and
+rich-text/security checks. Compileall, shell syntax, archive/document tests and
+`git diff --check` passed.
+
+The temporary source-transfer workflow applied a SHA-256-verified copy of the
+locally tested patch, but its Ubuntu test attempt lacked libEGL.so.1 and stopped
+at collection (18 errors). Its pipeline incorrectly masked the pytest exit code
+with tee. Its green workflow badge is **not test evidence**. Both temporary
+workflows and the transfer payload are removed from the final diff. The normal
+Windows/Fedora PR workflow runs pytest directly and remains the authoritative
+platform verification; inspect that PR's checks before merging. No native
+Windows/Fedora or real-model result is asserted by this local record.
