@@ -32,7 +32,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libegl1 libopengl0 libgl1
       - run: python -m pip install PySide6-Essentials==6.8.3 pytest pypdf
       - name: Prepare offline Qt verification dependencies
-        run: python -m pip download --only-binary=:all: --no-deps PySide6-Essentials==6.8.3 shiboken6==6.8.3 -d qt-wheels
+        run: |
+          python -m pip download --only-binary=:all: --no-deps PySide6-Essentials==6.8.3 shiboken6==6.8.3 -d qt-wheels
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: qt-verification-wheels
