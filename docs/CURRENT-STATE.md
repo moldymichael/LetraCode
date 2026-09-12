@@ -1,5 +1,19 @@
 # Current implementation state
 
+## September 12, 2026 — messenger and streaming-scroll development
+
+The `codex/messenger-theme-scroll-fix` change starts from remote main
+`8772a1916c1d65b6514aa2ffdaf024c8e6e886b8`. It implements the approved neutral
+messenger with two editable bubble colors and fixes manual scrolling to the
+actual bottom during generation. It retains the existing native Qt interface,
+SQLite schema, memory, training and permission paths. See the
+[change and verification record](MESSENGER-THEME.md). The version remains 0.6.0;
+identify this development build by source revision, not version alone. These
+changes do not assert an update to the maintainer's local checkout or installed
+application, and no release has been published as part of this work.
+
+## Earlier repository and installation records
+
 > **Repository snapshot before the September 11, 2026 maintenance work:** remote `main` at `c239fa4407f6b967be025fdf50c6aa124a296e2c` identifies as 0.6.0; the published release is 0.3.0. [PR #8](https://github.com/moldymichael/LetraCode/pull/8) tracks CI/quantizer work and [issue #6](https://github.com/moldymichael/LetraCode/issues/6) tracks unified engine invocation. A successful Windows packaging job does not establish a passing full suite. See [known issues](KNOWN-ISSUES.md) for the concise current boundaries, the [Windows guide](WINDOWS.md) for selecting and testing a build, and the [documentation index](README.md) for navigation.
 >
 > Installation statements and machine paths below describe the maintainer's recorded local work. They do not mean that every contributor's installation, remote branch or published download contains those changes. Preserve the dated records; inspect the actual runtime when diagnosing another computer.

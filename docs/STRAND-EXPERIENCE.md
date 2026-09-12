@@ -24,6 +24,31 @@ automatically. While a job runs, you can switch chats, search, copy, browse file
 and prepare drafts. The activity indicator returns to the running chat. Sending
 another request or changing the engine waits until the current job ends.
 
+## Messenger appearance and scrolling
+
+The messenger keeps the window, buttons, sidebar and chat canvas neutral. Only
+message bubbles and their color-picker previews use your chosen colors. You is
+on the right; Strand (or a named model in a two-model conversation) is on the
+left. Sender names and saved-message times stay outside the bubbles.
+
+Use **Bubble colors** in the Chat sidebar or Settings. Click a bubble to open
+the native color picker, or edit its six-digit hex value. **Swap** exchanges the
+two colors; **Reset** restores the default blue and pink without changing the
+background mode. **Paper** is light neutral and **Graphite** is dark neutral.
+Changes apply immediately and persist across restarts. Text and links use black
+or white to stay readable on the selected bubble color. Theme preferences do
+not change saved messages, exports, model settings or permissions.
+
+While a reply is generating, scroll normally or drag the scrollbar to reach
+the actual bottom. Once there, new output follows. Scrolling up stops following;
+it does not stop the model. Dragging the scrollbar or selecting text temporarily
+defers visible replacements so they do not move the drag target or destroy the
+selection. Output continues to be saved. Releasing the drag or clearing the
+selection displays pending output. **Latest message**, or **View → Jump to
+latest message** (Ctrl+End), clears the reading selection and returns to the
+latest saved text. The contact header reports local model state, not internet
+presence.
+
 ## Files and saved information
 
 Knowledge shows shared notes, workspace notes and added sources. Shared notes

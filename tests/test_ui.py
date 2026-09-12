@@ -26,7 +26,10 @@ def test_native_project_context_and_draft_survive_reopen(tmp_path):
     assert again.files_panel._select_path(s.memory.root_for(p) / 'Fact.md')
     assert s.memory.file_snapshot('Fact.md', project_id=p)['text'] == 'A durable fact'
     assert again.composer.toPlainText() == 'An unfinished question'
-    assert again.styleSheet() == ''
+    # Messenger styling is window-local; retain the system application font.
+    assert again.messenger_theme.surface == 'paper'
+    assert again.font().family() == app.font().family()
+    assert app.styleSheet() == ''
     again.close()
 
 

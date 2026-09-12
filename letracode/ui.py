@@ -1,4 +1,4 @@
-"""Native Qt Widgets interface; no fixed palette, style or application font."""
+"""Native Qt messenger interface with neutral chrome and editable bubble colors."""
 from __future__ import annotations
 
 import dataclasses
@@ -15,9 +15,12 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
     QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QPushButton,
     QSpinBox, QSplitter, QTabWidget, QTextBrowser, QToolBar, QTreeWidget, QTreeWidgetItem,
-    QVBoxLayout, QWidget, QToolButton, QSizePolicy)
+    QVBoxLayout, QWidget, QToolButton, QSizePolicy, QScrollArea)
 
 from . import __version__
+from .transcript import SafeBrowser
+from .messenger_theme import (MessengerTheme, AppearancePanel, neutral_palette,
+    chrome_stylesheet, bubble_html, messenger_icon)
 from .dialogs import ApprovalDialog, ModelDialog
 from .engine import EngineConfig, LocalEngine
 from .worker import ConversationWorker
@@ -41,12 +44,6 @@ def assistant_html(text, font):
     # App-created receipt links are added separately after this boundary.
     return re.sub(r'<a\b[^>]*href="([^"]*)"[^>]*>(.*?)</a>',
         lambda match: match.group(2) if QUrl(html.unescape(match.group(1))).scheme().lower() == 'letracode' else match.group(0), rendered, flags=re.S)
-
-
-class SafeBrowser(QTextBrowser):
-    def loadResource(self, kind, url):
-        # Model text must never fetch images, local files, styles, or remote content.
-        return None
 
 
 class Composer(QPlainTextEdit):
@@ -73,6 +70,7 @@ class MainWindow(QMainWindow):
     def __init__(self, store):
         super().__init__()
         self.store = store
+        self.messenger_theme = MessengerTheme.from_settings(store.setting('messenger_theme', {}))
         self.chat_id = None
         self.project_id = None
         self.worker = None
@@ -118,9 +116,13 @@ class MainWindow(QMainWindow):
         self.workspaces.addTab(self.training_panel, 'Improve')
         self.settings_panel = SettingsPanel(store, self)
         self.workspaces.addTab(self.settings_panel, 'Settings')
+        self.settings_appearance = AppearancePanel(self.messenger_theme)
+        self.settings_appearance.theme_changed.connect(self.apply_messenger_theme)
+        self.settings_panel.widget().layout().insertWidget(0, self.settings_appearance)
         self.setCentralWidget(self.workspaces)
         self.training_panel.busy_changed.connect(self.set_busy)
         self.workspaces.currentChanged.connect(self.refresh_area)
+        self.apply_messenger_theme(self.messenger_theme, persist=False)
         self.refresh_tree()
         previous = self.store.setting('last_chat')
         if previous and self.store.chat(previous):
@@ -140,17 +142,17 @@ class MainWindow(QMainWindow):
     def build_ui(self):
         self.splitter = QSplitter()
         self.setCentralWidget(self.splitter)
-        sidebar = QWidget(); side = QVBoxLayout(sidebar)
+        sidebar = QWidget(); sidebar.setObjectName('chatSidebar'); side = QVBoxLayout(sidebar)
         side.setContentsMargins(12,12,8,12)
-        title = QLabel('LetraCode')
+        title = QLabel('LetraCode · Messenger')
         font = title.font(); font.setBold(True); font.setPointSizeF(font.pointSizeF()+3); title.setFont(font)
         side.addWidget(title)
-        subtitle = QLabel('Strand · your local assistant')
+        subtitle = QLabel('On this computer'); subtitle.setObjectName('muted')
         subtitle.setWordWrap(True); side.addWidget(subtitle)
         side.addSpacing(10)
         self.search = QLineEdit()
         self.search.setAccessibleName('Search saved chats')
-        self.search.setPlaceholderText('Search chats…')
+        self.search.setPlaceholderText('Find a conversation…')
         self.search.setClearButtonEnabled(True)
         self.search.textChanged.connect(lambda _: self.refresh_tree())
         side.addWidget(self.search)
@@ -162,24 +164,41 @@ class MainWindow(QMainWindow):
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self.tree_menu)
         self.tree.currentItemChanged.connect(self.tree_selected)
+        self.tree.setMinimumHeight(115)
         side.addWidget(self.tree,1)
-        self.new_chat_button = QPushButton(QIcon.fromTheme('list-add'),'New chat')
+        self.new_chat_button = QPushButton(messenger_icon('add', self.messenger_theme.neutral['ink']),'New chat')
         self.new_chat_button.clicked.connect(self.new_chat)
-        self.new_project_button = QPushButton(QIcon.fromTheme('folder-new'),'New workspace…')
+        self.new_project_button = QPushButton(messenger_icon('folder', self.messenger_theme.neutral['ink']),'New workspace…')
         self.new_project_button.clicked.connect(self.new_project)
         side.addWidget(self.new_chat_button); side.addWidget(self.new_project_button)
-        self.splitter.addWidget(sidebar)
+        self.appearance_panel = AppearancePanel(self.messenger_theme)
+        self.appearance_panel.theme_changed.connect(self.apply_messenger_theme)
+        side.addWidget(self.appearance_panel)
+        sidebar_scroll = QScrollArea(); sidebar_scroll.setWidgetResizable(True)
+        sidebar_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        sidebar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        sidebar_scroll.setMinimumWidth(230); sidebar_scroll.setWidget(sidebar)
+        self.splitter.addWidget(sidebar_scroll)
 
-        main = QWidget(); center = QVBoxLayout(main); center.setContentsMargins(12,12,12,12)
-        header = QHBoxLayout()
-        self.chat_title = QLabel('A little room to think.')
-        font = self.chat_title.font(); font.setBold(True); font.setPointSizeF(font.pointSizeF()+2); self.chat_title.setFont(font)
+        main = QWidget(); main.setObjectName('chatRoom'); center = QVBoxLayout(main); center.setContentsMargins(14,12,14,12)
+        header_widget = QWidget(); header_widget.setObjectName('contactHeader')
+        header = QHBoxLayout(header_widget); header.setContentsMargins(3, 2, 3, 9)
+        avatar = QLabel('>_'); avatar.setObjectName('contactAvatar')
+        avatar.setAlignment(Qt.AlignmentFlag.AlignCenter); avatar.setFixedSize(51, 51)
+        avatar.setAccessibleName('Local assistant')
+        header.addWidget(avatar)
+        contact = QVBoxLayout(); contact.setSpacing(2)
+        self.contact_name = QLabel('Strand'); self.contact_name.setObjectName('contactName')
+        self.contact_status = QLabel('Local assistant'); self.contact_status.setObjectName('muted')
+        self.chat_title = QLabel('A little room to think.'); self.chat_title.setObjectName('chatTitle')
         self.chat_title.setTextFormat(Qt.TextFormat.PlainText)
-        header.addWidget(self.chat_title,1)
-        self.model_button = QPushButton(QIcon.fromTheme('configure'),'Model…')
+        self.chat_title.setWordWrap(True)
+        contact.addWidget(self.contact_name); contact.addWidget(self.contact_status); contact.addWidget(self.chat_title)
+        header.addLayout(contact, 1)
+        self.model_button = QPushButton('Model…')
         self.model_button.clicked.connect(self.model_setup)
         header.addWidget(self.model_button)
-        center.addLayout(header)
+        center.addWidget(header_widget)
         self.model_label = QLabel()
         self.model_label.setTextFormat(Qt.TextFormat.PlainText)
         self.model_label.setWordWrap(True)
@@ -229,16 +248,20 @@ class MainWindow(QMainWindow):
         self.load_older_button.clicked.connect(self.load_older_messages)
         self.load_older_button.hide(); center.addWidget(self.load_older_button)
         self.transcript = SafeBrowser()
+        self.transcript.setObjectName('chatTranscript')
+        self.transcript.document().setDocumentMargin(20)
         self.transcript.setAccessibleName('Saved conversation with Strand')
         self.transcript.setOpenLinks(False)
         self.transcript.setOpenExternalLinks(False)
         self.transcript.anchorClicked.connect(self.open_link)
         self.transcript.selectionChanged.connect(self.queue_render)
+        self.transcript.verticalScrollBar().sliderReleased.connect(self.queue_render)
+        self.transcript.viewport_resized.connect(self.queue_render)
         center.addWidget(self.transcript,1)
         row = QHBoxLayout()
-        self.copy_button = QPushButton(QIcon.fromTheme('edit-copy'),'Copy last reply')
+        self.copy_button = QPushButton(messenger_icon('chat', self.messenger_theme.neutral['ink']),'Copy last reply')
         self.copy_button.clicked.connect(self.copy_reply)
-        self.retry_button = QPushButton(QIcon.fromTheme('view-refresh'),'Ask again')
+        self.retry_button = QPushButton(messenger_icon('chat', self.messenger_theme.neutral['ink']),'Ask again')
         self.retry_button.clicked.connect(self.retry_reply)
         self.continue_button = QPushButton('Continue exchange')
         self.continue_button.setToolTip('Continue the shared conversation for the selected number of replies. Send or clear your draft first.')
@@ -254,19 +277,28 @@ class MainWindow(QMainWindow):
         self.example_action = menu.addAction('Create example from last reply…', self.learn_from_reply)
         self.reply_menu.setMenu(menu)
         self.copy_button.hide(); self.retry_button.hide(); self.learn_button.hide()
-        row.addWidget(self.reply_menu); row.addWidget(self.continue_button); row.addStretch()
+        self.latest_button = QPushButton('↓ Latest message')
+        self.latest_button.setAccessibleName('Jump to latest message')
+        self.latest_button.setToolTip('Clear the reading selection and show the latest saved text.')
+        self.latest_button.clicked.connect(self.jump_to_latest)
+        self.transcript.reading_changed.connect(self.update_latest_button)
+        self.latest_button.hide()
+        row.addWidget(self.reply_menu); row.addWidget(self.continue_button)
+        row.addWidget(self.latest_button); row.addStretch()
         self.mode = QComboBox(); self.mode.addItems(['Instant','Thinking'])
         self.mode.setToolTip('Thinking asks compatible models to reason before replying. Emitted thinking appears live in a separate, collapsible block. Support depends on your model and engine.')
         self.mode.setCurrentText(self.store.setting('mode','Instant'))
         row.addWidget(self.mode)
         center.addLayout(row)
         self.composer = Composer()
-        self.composer.setPlaceholderText('Ask a question…   Ctrl+Enter to send; Enter for a new line.')
+        self.composer.setPlaceholderText('Message Strand…   Ctrl+Enter to send; Enter for a new line.')
         self.composer.fit_draft()
         self.composer.textChanged.connect(self.schedule_save)
         self.composer.textChanged.connect(self.update_conversation_controls)
         self.composer.submitted.connect(self.send)
-        center.addWidget(self.composer)
+        self.composer_row = QHBoxLayout()
+        self.composer_row.addWidget(self.composer, 1)
+        center.addLayout(self.composer_row)
         controls = QHBoxLayout()
         self.computer = QCheckBox('Read local files')
         self.computer.setChecked(self.store.setting('computer',True))
@@ -284,11 +316,14 @@ class MainWindow(QMainWindow):
             controls.addWidget(check)
         options_layout.addWidget(self.actions)
         controls.addStretch()
-        self.stop_button = QPushButton(QIcon.fromTheme('process-stop'),'Stop')
+        self.stop_button = QPushButton(messenger_icon('stop', self.messenger_theme.neutral['ink']),'Stop')
         self.stop_button.setEnabled(False); self.stop_button.clicked.connect(self.stop)
-        self.send_button = QPushButton(QIcon.fromTheme('mail-send'),'Send')
+        self.send_button = QPushButton(messenger_icon('send', self.messenger_theme.neutral['ink']),'Send')
         self.send_button.clicked.connect(self.send)
-        controls.addWidget(self.stop_button); controls.addWidget(self.send_button)
+        controls.addWidget(self.stop_button)
+        self.send_button.setMinimumWidth(78)
+        self.send_button.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Expanding)
+        self.composer_row.addWidget(self.send_button)
         center.addLayout(controls)
         self.splitter.addWidget(main)
 
@@ -308,13 +343,43 @@ class MainWindow(QMainWindow):
         context.addWidget(self.capability_hint)
         context.addStretch()
         self.splitter.addWidget(self.context_panel)
-        self.splitter.setSizes([205,800,250])
+        self.splitter.setSizes([260, 800, 250])
         self.splitter.setStretchFactor(1,1)
         self.conversation_mode.currentIndexChanged.connect(self.conversation_options_changed)
         self.first_speaker.currentIndexChanged.connect(self.conversation_options_changed)
         self.reply_count.valueChanged.connect(self.conversation_options_changed)
         for check in (self.computer, self.internet, self.effects, self.actions):
             check.toggled.connect(self.update_capability_hint)
+
+    def apply_messenger_theme(self, theme, *, persist=True):
+        theme = MessengerTheme.from_settings(theme.to_settings())
+        if persist:
+            try:
+                self.store.set_setting('messenger_theme', theme.to_settings())
+            except (OSError, sqlite3.Error) as error:
+                self.appearance_panel.set_theme(self.messenger_theme)
+                if hasattr(self, 'settings_appearance'):
+                    self.settings_appearance.set_theme(self.messenger_theme)
+                self.statusBar().showMessage('Colors could not be saved: ' + str(error))
+                return
+        self.messenger_theme = theme
+        self.setPalette(neutral_palette(theme))
+        self.setStyleSheet(chrome_stylesheet(theme))
+        self.setWindowIcon(messenger_icon('chat', theme.neutral['ink']))
+        for button, kind in ((self.new_chat_button, 'add'), (self.new_project_button, 'folder'),
+                             (self.send_button, 'send'), (self.stop_button, 'stop')):
+            button.setIcon(messenger_icon(kind, theme.neutral['ink']))
+        self.appearance_panel.set_theme(theme)
+        if hasattr(self, 'settings_appearance'):
+            self.settings_appearance.set_theme(theme)
+        self.refresh_tree()
+        self.rendered_html = None
+        self.render_chat()
+
+    def show_bubble_colors(self):
+        self.workspaces.setCurrentWidget(self.settings_panel)
+        self.settings_panel.ensureWidgetVisible(self.settings_appearance)
+        self.settings_appearance.you_picker.setFocus()
 
     def action(self, menu, title, callback, shortcut=None):
         action = QAction(title,self)
@@ -341,6 +406,8 @@ class MainWindow(QMainWindow):
         view = self.menuBar().addMenu('&View')
         self.show_context_action = self.action(view,'Focus details',self.set_context_visible)
         self.show_context_action.setCheckable(True); self.show_context_action.setChecked(False)
+        self.action(view,'Jump to latest message',self.jump_to_latest,'Ctrl+End')
+        self.action(view,'Bubble colors…',self.show_bubble_colors)
         self.action(view,'Zoom in',lambda:self.transcript.zoomIn(),'Ctrl++')
         self.action(view,'Zoom out',lambda:self.transcript.zoomOut(),'Ctrl+-')
         settings = self.menuBar().addMenu('&Settings')
@@ -359,17 +426,17 @@ class MainWindow(QMainWindow):
         selected = ('chat',self.chat_id) if self.chat_id else ('project',self.project_id) if self.project_id else ('global',None)
         self.tree.blockSignals(True); self.tree.clear()
         global_item = QTreeWidgetItem(self.tree,['Everyday']); global_item.setData(0,Qt.ItemDataRole.UserRole,('global',None))
-        global_item.setIcon(0,QIcon.fromTheme('mail-message'))
+        global_item.setIcon(0,messenger_icon('chat', self.messenger_theme.neutral['ink']))
         project_items = {}
         for project in self.store.projects():
             item = QTreeWidgetItem(self.tree,[project['title']]); item.setData(0,Qt.ItemDataRole.UserRole,('project',project['id']))
-            item.setIcon(0,QIcon.fromTheme('folder'))
+            item.setIcon(0,messenger_icon('folder', self.messenger_theme.neutral['ink']))
             project_items[project['id']] = item
         current = None
         for chat in self.store.chats(self.search.text()):
             parent = project_items.get(chat['project_id'],global_item)
             item = QTreeWidgetItem(parent,[chat['title']]); item.setData(0,Qt.ItemDataRole.UserRole,('chat',chat['id']))
-            item.setToolTip(0,chat['title']); item.setIcon(0,QIcon.fromTheme('text-x-generic'))
+            item.setToolTip(0,chat['title']); item.setIcon(0,messenger_icon('chat', self.messenger_theme.neutral['ink']))
             if selected == ('chat',chat['id']):
                 current = item
         if selected[0] == 'project':
@@ -692,6 +759,9 @@ class MainWindow(QMainWindow):
             self.render_timer.start()
 
     def render_chat(self):
+        loaded = getattr(self.engine, 'loaded_models', ())
+        self.contact_status.setText('● Generating locally' if self.worker else
+                                    '● Local model loaded' if loaded else '○ Local model not loaded')
         model = Path(self.engine_config.model_path).name if self.engine_config.model_path else 'No model selected'
         if self.engine_config.lora_path:
             model += ' + adapter ' + Path(self.engine_config.lora_path).name
@@ -706,8 +776,6 @@ class MainWindow(QMainWindow):
             self.model_label.setText(f'Model A · {model} · {a_state}\nModel B · {second} · {b_state}\n{state} · {self.reply_count.value()} replies per exchange')
         else:
             self.model_label.setText(f'{model}  ·  Local inference' if self.engine_config.model_path else 'Choose a local model in Model Setup to begin.')
-        scrollbar = self.transcript.verticalScrollBar()
-        previous = scrollbar.value(); bottom = previous >= scrollbar.maximum()-50
         limit = self.history_limits.get(self.chat_id, 200)
         # Query only the displayed tail, not the complete history on every streamed delta.
         messages = self.store.rows('SELECT * FROM (SELECT * FROM messages WHERE chat_id=? ORDER BY id DESC LIMIT ?) ORDER BY id',
@@ -766,6 +834,7 @@ class MainWindow(QMainWindow):
             status = message_status(message)
             if status == 'Response saved · Task outcome unverified': status = ''
             state = f' · {status}' if status else ''
+            message_start = len(chunks)
             chunks.append(f'<hr><p><b>{html.escape(name)}{html.escape(state)}</b></p>')
             reasoning = ''
             if role == 'assistant':
@@ -794,19 +863,34 @@ class MainWindow(QMainWindow):
                 chunks.append(f'<p><small><a href="letracode:receipt/{message["id"]}">Used for this reply</a> · '
                               f'<a href="letracode:copy/{message["id"]}">Copy</a> · '
                               f'<a href="letracode:example/{message["id"]}">Create example</a></small></p>')
-        rendered = '\n'.join(chunks)
+            if role in ('user', 'assistant'):
+                body = '\n'.join(chunks[message_start + 1:])
+                del chunks[message_start:]
+                chunks.append(bubble_html(message, name, state, body, self.messenger_theme,
+                                          self.transcript.fontMetrics(), self.transcript.viewport().width()))
+        rendered = ('<html><head><style>a { color:' + self.messenger_theme.neutral['ink'] + '; text-decoration: underline; } '
+                    'pre { white-space: pre-wrap; }</style></head><body>' + '\n'.join(chunks) + '</body></html>')
+
         if rendered != self.rendered_html or self.rendered_chat != self.chat_id:
-            # Reading an older selection during streaming must not repeatedly destroy it.
-            reading_selection = self.transcript.textCursor().hasSelection() and self.rendered_chat == self.chat_id
-            if not reading_selection:
-                self.transcript.setHtml(rendered)
+            if self.transcript.replace_html(rendered, reset=self.rendered_chat != self.chat_id):
                 self.rendered_html, self.rendered_chat = rendered, self.chat_id
-                scrollbar.setValue(scrollbar.maximum() if bottom else previous)
+        self.update_latest_button()
         if self.chat_id:
             chat = self.store.chat(self.chat_id)
             if chat: self.chat_title.setText(chat['title'])
         self.copy_button.setEnabled(any(m['role']=='assistant' and m['content'] for m in messages))
         self.update_conversation_controls()
+
+    def update_latest_button(self):
+        self.latest_button.setVisible(not self.transcript.at_bottom() or self.transcript.textCursor().hasSelection())
+
+    def jump_to_latest(self):
+        cursor = self.transcript.textCursor()
+        cursor.clearSelection()
+        self.transcript.setTextCursor(cursor)
+        self.render_chat()
+        self.transcript.follow_latest()
+        self.update_latest_button()
 
     def show_approval(self,pending):
         if pending.event.is_set() or not self.worker:

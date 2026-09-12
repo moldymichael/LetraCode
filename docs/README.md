@@ -7,6 +7,7 @@ Start with [the project overview](../README.md). This index separates instructio
 | Document | Use / scope |
 | --- | --- |
 | [Windows guide](WINDOWS.md) | Published installation, development-candidate selection, engine setup, updates and safe testing. |
+| [Messenger theme and scroll fix](MESSENGER-THEME.md) | September 12 development change, native appearance, regression evidence and installation boundaries. |
 | [Strand user guide](STRAND-EXPERIENCE.md) | The 0.6.0 interface, permissions, examples and limitations; includes dated verification. |
 | [Known issues](KNOWN-ISSUES.md) | Current release/source difference, open engine and CI work, and runtime/platform boundaries. |
 | [Training guide](FINE-TUNING.md) | Optional training dependencies and workflow. Some version/UI wording predates the redesign; use the 0.6.0 guide for current navigation. |
