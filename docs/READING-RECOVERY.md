@@ -147,3 +147,7 @@ git diff --check
   The final focused/full runs above include that corrected expectation.
 - Native Windows, a fresh real-model run and release packaging were not run for
   this repair. Existing historical platform/model results above remain separate.
+
+The maintainer's installed app was subsequently updated with only the three
+changed modules. See the [installation and rollback record](INSTALLED-SOURCE-LIMITATIONS-UPDATE.md)
+for the separate combined-candidate suite, installed replay and live-data checks.
