@@ -10,6 +10,7 @@ Start with [the project overview](../README.md). This index separates instructio
 | [Strand user guide](STRAND-EXPERIENCE.md) | The 0.6.0 interface, permissions, examples and limitations; includes dated verification. |
 | [Known issues](KNOWN-ISSUES.md) | Current release/source difference, open engine and CI work, and runtime/platform boundaries. |
 | [Training guide](FINE-TUNING.md) | Optional training dependencies and workflow. Some version/UI wording predates the redesign; use the 0.6.0 guide for current navigation. |
+| [Conversation training](CONVERSATION-TRAINING.md) | Editable complete conversations, recorded tools, context-only turns and structured JSONL. |
 | [Comparison workflow](COMPARISON-WORKFLOW.md) | Current candidate-review behavior and its verification record. |
 | [Gemma support](GEMMA4.md) | Supported model preparation/training path and recorded evidence, not arbitrary Gemma/model support. |
 
@@ -38,6 +39,7 @@ Results apply to the commits, dates, environments and test types stated in each 
 | [Real-model acceptance](REAL-MODEL-ACCEPTANCE.md) | Named local engine/model runs and their limits. |
 | [Supervised coding proof](SUPERVISED-CODING-PROOF.md) | Observed coding-workflow evidence and unresolved outcomes. |
 | [Fine-tuning verification](FINE-TUNING-VERIFICATION.md) | Original training integration checks. |
+| [Conversation training verification](CONVERSATION-TRAINING-VERIFICATION.md) | Native-template supervision, structured editor/storage and actual tiny-model optimization. |
 | [QLoRA verification](QLORA-VERIFICATION.md) | Recorded CUDA 4-bit training evidence. |
 | [Gemma verification data](GEMMA4-VERIFICATION.json) | Structured evidence accompanying the Gemma record. |
 | [Hermes template verification](HERMES-TEMPLATE-VERIFICATION.md) | A specific model/template investigation. |

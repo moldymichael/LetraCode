@@ -26,6 +26,7 @@ from .engine import Cancelled, LocalEngine
 from .processes import start_process, stop_process
 from .store import now
 from .training import TrainingRepository
+from .training_examples import comparison_example, example_identity
 from .training_models import verify_gemma_pair, gemma_manifest_path
 from .training_worker import BACKEND_SCRIPT, file_hash, training_model_family
 
@@ -198,7 +199,7 @@ def approved_examples(repo):
         raise ValueError('Keep at least one different approved example for comparison; it will not be trained on.')
     seen = set()
     for row in selected['train'] + selected['eval']:
-        prompt = TrainingRepository._normalized_prompt(row['prompt'])
+        prompt = example_identity(row)
         if prompt in seen:
             raise ValueError('Repeated prompts must be resolved before training. Test questions must differ from teaching questions.')
         seen.add(prompt)
@@ -354,14 +355,18 @@ def comparison_is_current(repo, ident, original, thinking=False):
                           for row in rows if row.get('source') == 'fresh']
         if compared_fresh != fresh:
             return False
+        held_out = repo.run(ident)['examples']['eval']
+        if any('messages' in row for row in held_out) and comparison.get('schema_version') != 3:
+            return False
         if 'schema_version' in comparison:
-            if comparison['schema_version'] != 2:
+            if comparison['schema_version'] not in (2, 3):
                 return False
-            expected = [dict(prompt=row['prompt'], response=row['response'], source='held_out')
-                        for row in repo.run(ident)['examples']['eval']]
+            expected = [held_out_comparison(row) for row in held_out]
             expected.extend(dict(row, source='fresh') for row in fresh)
-            actual = [{key: row.get(key) for key in ('prompt', 'response', 'source')} for row in rows]
+            actual = [{key: row.get(key) for key in expected_row}
+                      for row, expected_row in zip(rows, expected)]
             if (actual != expected
+                    or len(rows) != len(expected)
                     or not rows or any(row.get(side + '_status') != 'complete'
                                       or not row.get(side + '_output', '').strip()
                                       or side + '_error' in row
@@ -375,6 +380,27 @@ def comparison_is_current(repo, ident, original, thinking=False):
         return False
 
 
+def held_out_comparison(row):
+    """Keep legacy comparisons readable; structured targets retain their context."""
+    if 'messages' in row:
+        return dict(comparison_example(row), source='held_out')
+    return dict(prompt=row['prompt'], response=row['response'], source='held_out')
+
+
+def comparison_request(row):
+    if 'messages' not in row:
+        return [{'role': 'system', 'content': SYSTEM},
+                {'role': 'user', 'content': row['prompt']}], None
+    messages = copy.deepcopy(row['messages'])
+    for message in messages:
+        message.pop('train', None)
+        for call in message.get('tool_calls', []):
+            arguments = call['function']['arguments']
+            if not isinstance(arguments, str):
+                call['function']['arguments'] = json.dumps(arguments, ensure_ascii=False, allow_nan=False)
+    return messages, copy.deepcopy(row['tools']) or None
+
+
 def compare_version(repo, ident, original, cancel, on_status=lambda _: None, thinking=False,
                     *, prompts=None, on_update=lambda _: None):
     on_status('Preparing comparison with Strand…')
@@ -383,15 +409,16 @@ def compare_version(repo, ident, original, cancel, on_status=lambda _: None, thi
                                        previous.get('comparison_prompts', []) if prompts is None else prompts)
     current = dataclasses.replace(original, secondary_model_path='')
     held_out = repo.run(ident)['examples']['eval']
-    rows = [dict(prompt=row['prompt'], response=row['response'], source='held_out') for row in held_out]
+    rows = [held_out_comparison(row) for row in held_out]
     rows.extend(dict(row, source='fresh') for row in fresh)
     for row in rows:
         for side in ('current', 'candidate'):
             row.update({side + '_status': 'pending', side + '_output': '', side + '_reasoning': ''})
-    report = {'schema_version': 2, 'id': uuid.uuid4().hex, 'status': 'running',
+    report = {'schema_version': 3 if any('messages' in row for row in held_out) else 2,
+              'id': uuid.uuid4().hex, 'status': 'running',
               'created': now(), 'thinking': thinking,
               'system_sha256': hashlib.sha256(SYSTEM.encode()).hexdigest(),
-              'runtime': 'Local llama.cpp Chat engine; independent requests without action tools or project files',
+              'runtime': 'Local llama.cpp Chat engine; one independent generation per target. Recorded tool context is supplied; tools are never executed.',
               'current_config': dataclasses.asdict(current), 'examples': rows}
     history = list(previous.get('comparison_history') or [])
     if previous.get('comparison'):
@@ -446,19 +473,22 @@ def compare_version(repo, ident, original, cancel, on_status=lambda _: None, thi
                         publish(force=False)
 
                     try:
-                        reply = engine.complete([{'role': 'system', 'content': SYSTEM},
-                                                 {'role': 'user', 'content': row['prompt']}],
-                                                None, cancel, append_delta, thinking=thinking,
+                        messages, available_tools = comparison_request(row)
+                        reply = engine.complete(messages, available_tools, cancel, append_delta, thinking=thinking,
                                                 on_reasoning=append_reasoning)
                         row[label + '_output'] = reply.get('content') or row[label + '_output']
                         row[label + '_reasoning'] = (reply.get('reasoning_content') or reply.get('reasoning')
                                                     or row[label + '_reasoning'])
                         if cancel.is_set():
                             raise Cancelled('Comparison stopped. Saved answers remain available.')
-                        if not row[label + '_output'].strip():
-                            raise ValueError('The model returned no visible answer.')
                         if reply.get('tool_calls'):
-                            raise ValueError('The model requested actions during a tools-free comparison.')
+                            if not available_tools:
+                                raise ValueError('The model requested actions during a tools-free comparison.')
+                            row[label + '_tool_calls'] = copy.deepcopy(reply['tool_calls'])
+                            calls_text = json.dumps(reply['tool_calls'], ensure_ascii=False, indent=2)
+                            row[label + '_output'] += '\n\nTool calls (recorded only, not executed):\n' + calls_text
+                        if not row[label + '_output'].strip():
+                            raise ValueError('The model returned no visible answer or tool call.')
                         row[label + '_status'] = 'complete'
                     except Cancelled as error:
                         row[label + '_status'] = 'cancelled'
@@ -506,12 +536,21 @@ def verify_conversion_source(run, directory, cancel):
         raise ValueError('The original model weight files changed since training.')
     current_tokenizers = {p.name for p in base.iterdir() if p.is_file() and (
         p.name.startswith('tokenizer') or p.name in ('special_tokens_map.json', 'added_tokens.json', 'chat_template.jinja'))}
+    template_folders = ('chat_templates', 'additional_chat_templates')
+    for folder in template_folders:
+        named_templates = base / folder
+        if named_templates.is_symlink():
+            raise ValueError('The original tokenizer template folder must not be a symlink.')
+        current_tokenizers.update(p.relative_to(base).as_posix() for p in named_templates.glob('*.jinja') if p.is_file())
     if current_tokenizers != set(tokenizers):
         raise ValueError('The original tokenizer files changed since training.')
     for root, records in ((base, {name: record.get('sha256') for name, record in weights.items()}),
                           (base, tokenizers), (directory / 'adapter', adapter_files)):
         for name, expected in records.items():
-            if Path(name).name != name or name in ('.', '..') or not expected:
+            path = Path(name)
+            named_template = (records is tokenizers and path.parent.as_posix() in template_folders
+                              and path.suffix == '.jinja' and '\\' not in name)
+            if (path.name != name and not named_template) or name in ('.', '..') or not expected:
                 raise ValueError('Invalid file provenance in the preserved training report.')
             if file_hash(root / name, cancel) != expected:
                 raise ValueError(f'Training source or adapter file changed: {name}.')

@@ -7,6 +7,10 @@ retried from retained artifacts, and adoption requires a current Chat-runtime
 comparison and saved judgment. The technical training requirements below still
 apply; older names and measured runs describe the previous implementation.
 
+Complete conversations, assistant function calls, linked tool results and
+context-only assistant turns are now supported. See [conversation training](CONVERSATION-TRAINING.md)
+for the editor, versioned JSONL format and native-template requirements.
+
 # Fine-Tuning and chat thinking
 
 LetraCode 0.5.0 adds CUDA 4-bit QLoRA to the Fine-Tuning workspace introduced in 0.4.0.
@@ -58,9 +62,9 @@ before installation and verify `torch.cuda.is_available()` afterwards.
 Choose the environment's Python executable, not LetraCode.exe or pythonw.exe.
 The training model folder must contain original **unquantized, text-only Llama**
 weights in safetensors format, config.json, tokenizer files and a chat template.
-The tokenizer must support a consistent user/assistant generation prefix.
-Remote custom code is disabled. Qwen, Mistral, Gemma, multimodal, quantized and
-adapter-only training folders are rejected by this first backend. They may
+The tokenizer must provide a verifiable native chat/tool template.
+Remote custom code is disabled. Besides the supported original Gemma 4 E2B/E4B
+path, other Gemma, Qwen, Mistral, quantized and adapter-only training folders are rejected. They may
 still be used as normal GGUF chat models when supported by llama.cpp.
 
 **4-bit QLoRA** loads those original weights into NF4 with double quantization,
@@ -84,7 +88,7 @@ does not establish that its training weights fit this GPU. A 35B model's nominal
 
 ## Review examples
 
-1. Open **Fine-Tuning → Examples**. Write a prompt and the desired response,
+1. Open **Improve → Examples**. Write a user message and the desired assistant response,
    or choose **Learn from reply…** in Chat to prepare a draft for correction.
 2. Choose **Training example** or **Held-out evaluation**. Save and review each
    example, then choose **Approve example**. Editing approved text requires
@@ -93,7 +97,7 @@ does not establish that its training weights fit this GPU. A 35B model's nominal
    ignoring case and repeated whitespace, are refused when creating a run.
 
 Import JSONL files up to 16 MiB and 10,000 rows. Each row may contain prompt and
-response, or exactly one user message followed by one assistant message. All
+response, or a [structured conversation with tools](CONVERSATION-TRAINING.md#import-and-export). All
 imports start as drafts, including files that contain an approved flag.
 
 ```json
@@ -101,9 +105,10 @@ imports start as drafts, including files that contain an approved flag.
 {"prompt":"What should you do when evidence conflicts?","response":"Explain the disagreement and compare the sources.","split":"eval"}
 ```
 
-The simple dataset format does not train multi-turn conversations, system
-instructions or tool-call records. A copied chat reply is a starting point for
-review, not proof that the answer is correct.
+Use conversation cards or the structured format for multiple turns and tool
+exchanges. System/user/tool messages and context-only assistant turns supply
+context; selected assistant text and tool calls are optimized. A copied chat
+reply is a starting point for review, not proof that the answer is correct.
 
 ## Train, compare and adopt
 
@@ -143,7 +148,9 @@ job starts. Add fresh, self-contained questions (optional reference answers), th
 choose **Run comparison**. Original held-out questions remain included; fresh
 questions are checked against the run's frozen teaching data and never added to
 training examples. Both versions receive identical independent prompts using the
-current Chat settings, without shared notes, project context or tools. Select a
+current Chat settings, without shared notes or project retrieval. Structured
+held-out conversations retain their recorded context and tool definitions;
+generated calls are displayed without execution. Fresh questions are tool-free. Select a
 question to read the full responses side by side, including separately recorded
 Thinking. Progress and errors are visible; **Stop** preserves partial answers.
 

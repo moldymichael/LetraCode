@@ -75,6 +75,14 @@ can be turned off there. Model tools is an advanced compatibility switch.
 
 ## Teaching with examples
 
+Improve → Examples starts with editable user and assistant cards. Add follow-up
+messages, assistant function calls and linked tool results to teach complete
+conversations. Results can be collapsed while reviewing. Available function
+definitions are edited with the example. Mark an assistant turn **Context only**
+to retain it without teaching its answer or calls. Only selected assistant turns
+are training targets; recorded tools are never executed. See the
+[conversation training guide](CONVERSATION-TRAINING.md) for the format and controls.
+
 An example should contain enough context to understand the question and the
 answer you want. For instance:
 
@@ -124,7 +132,9 @@ The window shows verification/loading progress and independently scrollable full
 answers for Strand now and the trained candidate. Select each question to inspect
 both responses; Thinking text, when recorded, has its own tab. Each request uses
 the configured Chat answer budget. Standalone comparison excludes shared notes,
-project retrieval and action tools. Cut-off, stopped, empty or failed answers remain
+project retrieval. A structured held-out conversation supplies its own prior
+messages and tool definitions for the first teaching turn; returned calls are
+displayed without execution. Fresh questions are tool-free. Cut-off, stopped, empty or failed answers remain
 incomplete. Stop retains partial output; closing the window keeps the job running
 with Stop still available in Improve. A base-model change is disclosed. Earlier
 attempts remain selectable, including their saved judgments and errors.

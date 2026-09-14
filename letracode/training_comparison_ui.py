@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 from PySide6.QtCore import Qt
@@ -9,7 +10,8 @@ from PySide6.QtWidgets import (QComboBox, QDialog, QFileDialog, QFormLayout,
     QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QSplitter,
     QTabWidget, QVBoxLayout, QWidget)
 
-from .training_experience import save_version_review, validate_comparison_prompts, version_review
+from .training_experience import (held_out_comparison, save_version_review,
+                                  validate_comparison_prompts, version_review)
 
 
 JUDGMENTS = (('Not reviewed', 'unreviewed'), ('Candidate is better', 'better'),
@@ -47,7 +49,9 @@ class ComparisonDialog(QDialog):
         self.heading = QLabel(); self.heading.setTextFormat(Qt.TextFormat.PlainText)
         layout.addWidget(self.heading)
         hint = QLabel('Both versions answer each question independently with your Chat settings. '
-                      'Shared notes, project files and tools are excluded. Add fresh questions to test useful behavior beyond the training evaluation.')
+                      'Conversation examples use their recorded context and tool definitions for the first teaching turn. '
+                      'Generated calls are shown without executing them. Shared notes and project files are excluded. '
+                      'Add fresh questions to test behavior beyond the training evaluation.')
         hint.setWordWrap(True); layout.addWidget(hint)
         self.attempts = QComboBox(); self.attempts.currentIndexChanged.connect(self.select_attempt)
         layout.addWidget(self.attempts)
@@ -148,11 +152,14 @@ class ComparisonDialog(QDialog):
             self.display_rows = self.report.get('examples', [])
         else:
             review = version_review(self.repo, self.ident)
-            rows = [dict(prompt=r['prompt'], response=r['response'], source='held_out')
+            rows = [held_out_comparison(r)
                     for r in self.repo.run(self.ident)['examples']['eval']]
             rows.extend(dict(r, source='fresh') for r in review.get('comparison_prompts', []))
-            previous = {(r['prompt'], r.get('response', '')): r for r in self.report.get('examples', [])}
-            self.display_rows = [previous.get((r['prompt'], r.get('response', '')), r) for r in rows]
+            def identity(row):
+                return json.dumps({key: row.get(key) for key in
+                    ('prompt', 'response', 'messages', 'tools', 'target_message', 'target_index')}, sort_keys=True)
+            previous = {identity(r): r for r in self.report.get('examples', [])}
+            self.display_rows = [previous.get(identity(r), r) for r in rows]
         self.questions.blockSignals(True); self.questions.clear()
         for index, row in enumerate(self.display_rows):
             source = 'Fresh' if row.get('source') == 'fresh' else 'Held out'
@@ -169,7 +176,23 @@ class ComparisonDialog(QDialog):
         selection = (self.report.get('id'), index, row['prompt'], self.report.get('status') != 'running')
         changed = selection != self._shown_question
         self._shown_question = selection
-        self.question_text.setPlainText(row['prompt'] + ('\n\nReference: ' + row['response'] if row.get('response') else ''))
+        if 'messages' in row:
+            sections = []
+            if row.get('tools'):
+                sections.append('Available tools:\n' + json.dumps(row['tools'], ensure_ascii=False, indent=2))
+            for message in row['messages']:
+                body = message.get('content', '')
+                if message.get('tool_calls'):
+                    body += '\n' + json.dumps(message['tool_calls'], ensure_ascii=False, indent=2)
+                label = message['role'].capitalize()
+                if message.get('tool_call_id'):
+                    label += ' · ' + message['tool_call_id']
+                sections.append(label + ':\n' + body)
+            sections.append('Reference for this assistant turn:\n' + row['response'])
+            text = '\n\n'.join(sections)
+        else:
+            text = row['prompt'] + ('\n\nReference: ' + row['response'] if row.get('response') else '')
+        self.question_text.setPlainText(text)
         for key, label in (('current', 'Strand now'), ('candidate', 'Trained candidate')):
             state = row.get(key + '_status') or ('incomplete' if row.get(key + '_error') else 'saved' if key + '_output' in row else 'pending')
             error = row.get(key + '_error', '')

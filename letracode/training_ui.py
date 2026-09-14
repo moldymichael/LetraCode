@@ -14,6 +14,8 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog
     QSpinBox, QSplitter, QTabWidget, QVBoxLayout, QWidget)
 
 from .training import TrainingConfig, TrainingRepository
+from .training_conversation_ui import ConversationEditor
+from .training_examples import normalize_example
 from .training_worker import ActivationWorker, TrainingWorker
 from .training_experience import (ExperienceWorker, check_readiness, compare_version,
     can_retry_conversion, converted_artifact_state,
@@ -67,8 +69,7 @@ class FineTuningPanel(QWidget):
         if isinstance(draft, dict) and draft:
             self.load_draft(draft, draft.get('key') or draft.get('id') or self._editor_key)
         self.refresh_examples()
-        self.prompt.textChanged.connect(self.editor_changed)
-        self.response.textChanged.connect(self.editor_changed)
+        self.conversation.changed.connect(self.editor_changed)
         self.split.currentIndexChanged.connect(self.editor_changed)
         # Also invalidate approval for a recovered edit from an older app version.
         self.editor_changed()
@@ -80,21 +81,18 @@ class FineTuningPanel(QWidget):
 
     def _examples_tab(self):
         page = QWidget(); outer = QVBoxLayout(page)
-        hint = QLabel('A good example stands on its own: include what the question means and the answer you want. Keep a few different questions for comparison; Strand will not train on those. New examples stay drafts until you approve them.')
+        hint = QLabel('Review the complete conversation in order. Assistant turns marked Learn are teaching targets; other messages provide context. Keep different conversations for comparison. New and edited examples need your approval.')
         hint.setWordWrap(True); outer.addWidget(hint)
         body = QSplitter(); outer.addWidget(body, 1)
         self.examples_list = QListWidget(); self.examples_list.currentItemChanged.connect(self.select_example)
         body.addWidget(self.examples_list)
         editor = QWidget(); form = QVBoxLayout(editor)
-        form.addWidget(QLabel('Question, with any background needed'))
-        self.prompt = QPlainTextEdit(); self.prompt.setPlaceholderText('For example: Explain a metaphor to a beginner using one everyday example.')
-        self.prompt.setAccessibleName('Training question and background')
-        form.addWidget(self.prompt, 1)
-        form.addWidget(QLabel('Desired response'))
-        self.response = QPlainTextEdit(); self.response.setPlaceholderText('Write or correct the answer Strand should learn. Include enough detail to show what makes it useful.')
-        self.response.setAccessibleName('Desired answer for Strand')
-        form.addWidget(self.response, 1)
-        self.split = QComboBox(); self.split.addItem('Teach this answer', 'train'); self.split.addItem('Keep for comparison', 'eval')
+        self.conversation = ConversationEditor()
+        # Compatibility accessors below still expose the simple pair text widgets.
+        self._empty_prompt = QPlainTextEdit(self); self._empty_prompt.hide()
+        self._empty_response = QPlainTextEdit(self); self._empty_response.hide()
+        form.addWidget(self.conversation, 1)
+        self.split = QComboBox(); self.split.addItem('Teach this conversation', 'train'); self.split.addItem('Keep for comparison', 'eval')
         form.addWidget(self.split)
         row = QHBoxLayout()
         self._button('New example', self.new_example, row)
@@ -264,11 +262,20 @@ class FineTuningPanel(QWidget):
         self.progress.setText(str(error))
         QMessageBox.warning(self, 'Improve Strand', str(error))
 
+    @property
+    def prompt(self):
+        return self.conversation.text_editor('user') or self._empty_prompt
+
+    @property
+    def response(self):
+        return self.conversation.text_editor('assistant', last=True) or self._empty_response
+
     def persist_draft(self):
         draft = {'id': self.example_id, 'key': self._editor_key,
             'prompt': self.prompt.toPlainText(), 'response': self.response.toPlainText(),
+            'conversation_editor': self.conversation.draft_state(),
             'split': self.split.currentData(), 'source': self.example_source}
-        if self.example_id or draft['prompt'] or draft['response']:
+        if self.example_id or self.conversation.has_draft_content():
             self._drafts[self._editor_key] = draft
         else:
             self._drafts.pop(self._editor_key, None)
@@ -281,8 +288,15 @@ class FineTuningPanel(QWidget):
             self._editor_key = key
             self.example_id = draft.get('id')
             self.example_source = draft.get('source', '')
-            self.prompt.setPlainText(draft.get('prompt', ''))
-            self.response.setPlainText(draft.get('response', ''))
+            self._empty_prompt.clear(); self._empty_response.clear()
+            if 'conversation_editor' in draft:
+                self.conversation.load_draft_state(draft['conversation_editor'])
+            elif 'messages' in draft:
+                self.conversation.set_conversation(draft['messages'], draft.get('tools', []))
+            else:
+                self.conversation.set_conversation([
+                    {'role': 'user', 'content': draft.get('prompt', '')},
+                    {'role': 'assistant', 'content': draft.get('response', '')}], [])
             self.split.setCurrentIndex(1 if draft.get('split') == 'eval' else 0)
         finally:
             self._loading = False
@@ -292,11 +306,18 @@ class FineTuningPanel(QWidget):
             return
         if self.example_id:
             row = next((r for r in self.repository.examples() if r['id'] == self.example_id), None)
-            if row and (self.prompt.toPlainText().strip(), self.response.toPlainText().strip(), self.split.currentData()) != (row['prompt'], row['response'], row['split']):
-                if row['approved']:
-                    self.repository.save_example(row['prompt'], row['response'], split=row['split'],
-                        source=row['source'], example_id=row['id'])
-                self.progress.setText('Unsaved draft retained. Save and approve these edits before training.')
+            if row:
+                try:
+                    changed = normalize_example(self.conversation.conversation()) != normalize_example(row)
+                except ValueError:
+                    changed = True
+                changed = changed or self.split.currentData() != row['split']
+                if changed:
+                    if row['approved']:
+                        # Revoke the old snapshot without trying to save an invalid edit.
+                        self.repository.save_example(messages=row['messages'], tools=row['tools'],
+                            split=row['split'], source=row['source'], example_id=row['id'])
+                    self.progress.setText('Unsaved draft retained. Save and approve these edits before training.')
         self.persist_draft()
         self.refresh_examples()
 
@@ -312,7 +333,8 @@ class FineTuningPanel(QWidget):
         for key, draft in self._drafts.items():
             if draft.get('id') is not None:
                 continue
-            item = QListWidgetItem('Unsaved draft\n' + draft.get('prompt', '')[:100].replace('\n', ' '))
+            title = draft.get('prompt', '') or draft.get('response', '') or 'Conversation in progress'
+            item = QListWidgetItem('Unsaved draft\n' + title[:100].replace('\n', ' '))
             item.setData(Qt.ItemDataRole.UserRole, key); self.examples_list.addItem(item)
             if key == self._editor_key:
                 self.examples_list.setCurrentItem(item)
@@ -330,7 +352,8 @@ class FineTuningPanel(QWidget):
         row = self._drafts.get(key) or next((r for r in self.repository.examples() if r['id'] == key), None)
         if row:
             self.load_draft(row, key)
-            self.persist_draft()
+            # Older, non-active recovered drafts can still refer to an approved snapshot.
+            self.editor_changed()
 
     def new_example(self):
         self.persist_draft()
@@ -347,9 +370,17 @@ class FineTuningPanel(QWidget):
         self.persist_draft(); self.tabs.setCurrentIndex(0)
         self.progress.setText('Review this example as a standalone question and answer. Earlier context is editable above; source files and tool results are not copied automatically. Add any facts the answer needs, then approve it. Saving does not train Strand.')
 
+    def capture_conversation(self, messages, tools=None, source=''):
+        self.new_example()
+        self.conversation.set_conversation(messages, tools or [])
+        self.example_source = source
+        self.persist_draft(); self.tabs.setCurrentIndex(0)
+        self.progress.setText('Review the captured conversation, available functions and learned assistant turns. Edit sensitive or incomplete content before approval. Saving does not train Strand.')
+
     def save_example(self, checked=False):
         try:
-            row = self.repository.save_example(self.prompt.toPlainText(), self.response.toPlainText(),
+            conversation = self.conversation.conversation()
+            row = self.repository.save_example(messages=conversation['messages'], tools=conversation['tools'],
                 split=self.split.currentData(), source=self.example_source, example_id=self.example_id)
             self._drafts.pop(self._editor_key, None)
             self.example_id = row['id']; self._editor_key = row['id']
@@ -364,7 +395,7 @@ class FineTuningPanel(QWidget):
         row = self.save_example()
         if row:
             try:
-                self.repository.save_example(row['prompt'], row['response'], split=row['split'],
+                self.repository.save_example(messages=row['messages'], tools=row['tools'], split=row['split'],
                     approved=True, source=row['source'], example_id=row['id'])
                 self.refresh_examples(); self.progress.setText('Example approved for its selected use.')
             except ValueError as error:
@@ -658,7 +689,7 @@ class FineTuningPanel(QWidget):
         details = report.get('training_details') or {}
         config = run['config']
         if details.get('model_family') == 'gemma4':
-            text += '\nModel family: Gemma 4\nTraining scope: text responses\n'
+            text += '\nModel family: Gemma 4\nTraining scope: selected assistant text and function calls\n'
             if details.get('frozen_ple_cpu') is True:
                 text += 'Frozen per-layer embeddings: CPU\n'
             if report.get('gemma_pair'):
@@ -690,9 +721,9 @@ class FineTuningPanel(QWidget):
         if report:
             if details.get('model_family') == 'gemma4':
                 text += 'Generated comparisons: greedy, thinking off, up to 64 new tokens.\n'
-                if details.get('max_train_example_tokens'):
-                    text += f"Longest training example: {details['max_train_example_tokens']} tokens\n"
-            text += f"\nHeld-out response loss\nBase: {report['base_loss']:.6f}\nCandidate: {report['candidate_loss']:.6f}\n"
+            if details.get('max_train_example_tokens'):
+                text += f"Longest training conversation: {details['max_train_example_tokens']} tokens\n"
+            text += f"\nHeld-out learned-assistant loss\nBase: {report['base_loss']:.6f}\nCandidate: {report['candidate_loss']:.6f}\n"
             if method == 'qlora':
                 text += 'Both evaluations use the same 4-bit base; the candidate adds the trained adapter.\n'
             text += '\nThis comparison does not establish overall task quality.\n'
