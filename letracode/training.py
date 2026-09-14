@@ -12,6 +12,7 @@ import uuid
 from . import filesystem as fs
 from .store import now
 from .strand import safe_directory, safe_read, safe_write
+from .training_examples import example_identity, example_summary, normalize_example
 
 
 MAX_IMPORT_BYTES = 16 * 1024 * 1024
@@ -103,15 +104,27 @@ class TrainingRepository:
                     created TEXT NOT NULL, updated TEXT NOT NULL);
                 CREATE INDEX IF NOT EXISTS training_runs_order ON training_runs(created, id);
             ''')
+            columns = {row['name'] for row in db.execute('PRAGMA table_info(training_examples)')}
+            if 'conversation' not in columns:
+                db.execute('ALTER TABLE training_examples ADD COLUMN conversation TEXT')
 
     @staticmethod
-    def _example(row):
+    def _example(row, *, normalize_legacy=True):
         value = dict(row)
         value['approved'] = bool(value['approved'])
+        conversation = value.pop('conversation', None)
+        if conversation is not None:
+            value.update(normalize_example(json.loads(conversation)))
+            value['prompt'], value['response'] = example_summary(value)
+        elif normalize_legacy:
+            value.update(normalize_example(value))
         return value
 
     def examples(self, split=None):
-        if split is not None and split not in SPLITS:
+        return self._examples(split)
+
+    def _examples(self, split=None, *, normalize_legacy=True):
+        if split is not None and (not isinstance(split, str) or split not in SPLITS):
             raise ValueError("split must be 'train' or 'eval'")
         sql = 'SELECT * FROM training_examples'
         args = ()
@@ -120,7 +133,7 @@ class TrainingRepository:
             args = (split,)
         sql += ' ORDER BY created,rowid'
         with self.store.connection() as db:
-            return [self._example(row) for row in db.execute(sql, args)]
+            return [self._example(row, normalize_legacy=normalize_legacy) for row in db.execute(sql, args)]
 
     @staticmethod
     def _fields(prompt, response, split, source):
@@ -131,31 +144,53 @@ class TrainingRepository:
         prompt, response = prompt.strip(), response.strip()
         if len(prompt) > MAX_TEXT or len(response) > MAX_TEXT:
             raise ValueError(f'Prompt and response are limited to {MAX_TEXT} characters')
-        if split not in SPLITS:
+        if not isinstance(split, str) or split not in SPLITS:
             raise ValueError("split must be 'train' or 'eval'")
         if not isinstance(source, str) or len(source) > 1000:
             raise ValueError('source must be text of at most 1000 characters')
         return prompt, response, source.strip()
 
-    def save_example(self, prompt, response, split='train', approved=False, source='', example_id=None):
-        prompt, response, source = self._fields(prompt, response, split, source)
+    @staticmethod
+    def _content(prompt, response, split, source, messages, tools):
+        if not isinstance(split, str) or split not in SPLITS:
+            raise ValueError("split must be 'train' or 'eval'")
+        if not isinstance(source, str) or len(source) > 1000:
+            raise ValueError('source must be text of at most 1000 characters')
+        if messages is None:
+            if tools is not None:
+                raise ValueError('tools require messages')
+            prompt, response, source = TrainingRepository._fields(prompt, response, split, source)
+            return prompt, response, source, None
+        if prompt is not None or response is not None:
+            raise ValueError('Use either messages or a prompt/response pair')
+        example = normalize_example({'messages': messages, 'tools': [] if tools is None else tools})
+        prompt, response = example_summary(example)
+        return prompt, response, source.strip(), json.dumps(example, ensure_ascii=False, allow_nan=False)
+
+    def save_example(self, prompt=None, response=None, split='train', approved=False, source='', example_id=None,
+                     *, messages=None, tools=None):
+        prompt, response, source, conversation = self._content(prompt, response, split, source, messages, tools)
         if type(approved) is not bool:
             raise ValueError('approved must be true or false')
         timestamp = now()
         with self.store.connection() as db:
             if example_id is None:
                 ident = uuid.uuid4().hex
-                db.execute('INSERT INTO training_examples VALUES (?,?,?,?,?,?,?,?)',
-                           (ident, prompt, response, split, int(approved), source, timestamp, timestamp))
+                db.execute('''INSERT INTO training_examples
+                           (id,prompt,response,split,approved,source,created,updated,conversation)
+                           VALUES (?,?,?,?,?,?,?,?,?)''',
+                           (ident, prompt, response, split, int(approved), source, timestamp, timestamp, conversation))
             else:
                 current = db.execute('SELECT * FROM training_examples WHERE id=?', (example_id,)).fetchone()
                 if current is None:
                     raise ValueError('Training example does not exist')
-                changed = (prompt, response, split) != (current['prompt'], current['response'], current['split'])
+                proposed = json.loads(conversation) if conversation is not None else {'prompt': prompt, 'response': response}
+                changed = (normalize_example(proposed) != normalize_example(self._example(current))
+                           or split != current['split'])
                 final_approval = False if changed else approved
-                db.execute('''UPDATE training_examples SET prompt=?,response=?,split=?,approved=?,source=?,updated=?
+                db.execute('''UPDATE training_examples SET prompt=?,response=?,split=?,approved=?,source=?,updated=?,conversation=?
                               WHERE id=?''',
-                           (prompt, response, split, int(final_approval), source, timestamp, example_id))
+                           (prompt, response, split, int(final_approval), source, timestamp, conversation, example_id))
                 ident = example_id
             row = db.execute('SELECT * FROM training_examples WHERE id=?', (ident,)).fetchone()
         return self._example(row)
@@ -168,29 +203,21 @@ class TrainingRepository:
     def _import_row(value, line):
         if not isinstance(value, dict):
             raise ValueError(f'Invalid JSONL schema on line {line}')
-        if 'messages' in value:
-            unsupported = set(value) - {'messages', 'split', 'approved', 'source'}
-            if unsupported:
-                raise ValueError(f'JSONL line {line} contains unsupported fields: {sorted(unsupported)}')
-            if 'prompt' in value or 'response' in value:
-                raise ValueError(f'Invalid JSONL schema on line {line}')
-            messages = value['messages']
-            if (not isinstance(messages, list) or len(messages) != 2
-                    or [message.get('role') for message in messages if isinstance(message, dict)] != ['user', 'assistant']
-                    or any(set(message) != {'role', 'content'} for message in messages if isinstance(message, dict))):
-                raise ValueError(f'Invalid messages on line {line}: expected exactly one user then one assistant message; system messages are unsupported')
-            prompt, response = messages[0].get('content'), messages[1].get('content')
-        else:
-            unsupported = set(value) - {'prompt', 'response', 'split', 'approved', 'source'}
-            if unsupported:
-                raise ValueError(f'JSONL line {line} contains unsupported fields: {sorted(unsupported)}')
-            if 'prompt' not in value or 'response' not in value:
-                raise ValueError(f'Invalid JSONL schema on line {line}')
-            prompt, response = value['prompt'], value['response']
-        split = value.get('split', 'train')
-        source = value.get('source', 'import')
-        prompt, response, source = TrainingRepository._fields(prompt, response, split, source)
-        return prompt, response, split, source
+        allowed = ({'schema_version', 'messages', 'tools'} if 'messages' in value else {'prompt', 'response'})
+        unsupported = set(value) - (allowed | {'split', 'approved', 'source'})
+        if unsupported:
+            raise ValueError(f'JSONL line {line} contains unsupported fields: {sorted(unsupported)}')
+        try:
+            normalize_example(value)
+            if 'approved' in value and type(value['approved']) is not bool:
+                raise ValueError('approved must be true or false')
+            split = value.get('split', 'train')
+            prompt, response, source, conversation = TrainingRepository._content(
+                value.get('prompt'), value.get('response'), split, value.get('source', 'import'),
+                value.get('messages'), value.get('tools'))
+        except (ValueError, TypeError) as error:
+            raise ValueError(f'JSONL line {line}: {error}') from error
+        return prompt, response, split, source, conversation
 
     def import_jsonl(self, path):
         path = Path(path)
@@ -216,17 +243,20 @@ class TrainingRepository:
         timestamp = now()
         ids = [uuid.uuid4().hex for _ in rows]
         with self.store.connection() as db:
-            db.executemany('INSERT INTO training_examples VALUES (?,?,?,?,0,?,?,?)',
-                           [(ident, prompt, response, split, source, timestamp, timestamp)
-                            for ident, (prompt, response, split, source) in zip(ids, rows)])
+            db.executemany('''INSERT INTO training_examples
+                           (id,prompt,response,split,approved,source,created,updated,conversation)
+                           VALUES (?,?,?,?,0,?,?,?,?)''',
+                           [(ident, prompt, response, split, source, timestamp, timestamp, conversation)
+                            for ident, (prompt, response, split, source, conversation) in zip(ids, rows)])
             saved = {row['id']: self._example(row) for row in db.execute(
                 f"SELECT * FROM training_examples WHERE id IN ({','.join(['?'] * len(ids))})", ids)}
             return [saved[ident] for ident in ids]
 
     def export_jsonl(self, path):
-        content = ''.join(json.dumps({key: row[key] for key in ('prompt', 'response', 'split', 'approved', 'source')},
+        content = ''.join(json.dumps({**self._dataset_row(row),
+                                      **{key: row[key] for key in ('split', 'approved', 'source')}},
                                      ensure_ascii=False, allow_nan=False) + '\n'
-                          for row in self.examples()).encode('utf-8')
+                          for row in self._examples(normalize_legacy=False)).encode('utf-8')
         destination = Path(path)
         destination.parent.mkdir(parents=True, exist_ok=True)
         expected = None
@@ -243,18 +273,18 @@ class TrainingRepository:
         if not isinstance(config, TrainingConfig):
             raise TypeError('config must be a TrainingConfig')
         configuration = config.to_dict()
-        examples = self.examples()
+        examples = self._examples(normalize_legacy=False)
         approved = {split: [dict(row) for row in examples if row['approved'] and row['split'] == split]
                     for split in SPLITS}
         if not approved['train']:
             raise ValueError('At least one approved training example is required')
         if not approved['eval']:
             raise ValueError('At least one approved evaluation example is required')
-        training_prompts = {self._normalized_prompt(row['prompt']) for row in approved['train']}
-        if any(self._normalized_prompt(row['prompt']) in training_prompts for row in approved['eval']):
+        training_prompts = {example_identity(row) for row in approved['train']}
+        if any(example_identity(row) in training_prompts for row in approved['eval']):
             raise ValueError('Duplicate prompt found across approved training/evaluation data')
         for split, rows in approved.items():
-            if len({self._normalized_prompt(row['prompt']) for row in rows}) != len(rows):
+            if len({example_identity(row) for row in rows}) != len(rows):
                 raise ValueError(f'Duplicate prompt in approved {split} examples; review the repeated examples')
         ident = uuid.uuid4().hex
         directory = self.store.directory / 'training' / 'runs' / ident
@@ -276,11 +306,17 @@ class TrainingRepository:
         return self.run(ident)
 
     @staticmethod
+    def _dataset_row(row):
+        if 'messages' in row:
+            return normalize_example(row)
+        return {'prompt': row['prompt'], 'response': row['response']}
+
+    @staticmethod
     def _snapshot_files(configuration, examples):
         snapshots = {'config.json': json.dumps(configuration, ensure_ascii=False, indent=2).encode('utf-8')}
         for split in ('train', 'eval'):
             snapshots[f'{split}.jsonl'] = ''.join(
-                json.dumps({'prompt': row['prompt'], 'response': row['response']}, ensure_ascii=False) + '\n'
+                json.dumps(TrainingRepository._dataset_row(row), ensure_ascii=False) + '\n'
                 for row in examples[split]).encode('utf-8')
         return snapshots
 

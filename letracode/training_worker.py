@@ -17,6 +17,7 @@ from .engine import Cancelled, EngineConfig, LocalEngine
 from .processes import start_process, stop_process
 from .strand import safe_read
 from .training_models import verify_gemma_pair
+from .training_examples import comparison_example, normalize_example
 
 
 BACKEND_SCRIPT = Path(__file__).with_name('training_backend.py')
@@ -167,11 +168,14 @@ def validate_training_report(report, config):
 def validate_gemma_source(report, pair):
     """Bind the trainer's observed source files to the preflight GGUF pair."""
     source = pair['source']
-    files = source['files']
+    # Pair manifests predate portable report keys and use native separators.
+    files = {name.replace('\\', '/'): record for name, record in source['files'].items()}
     provenance = report['provenance']
     expected_tokenizer = {name: record['sha256'] for name, record in files.items()
-        if '/' not in name and (name.startswith('tokenizer') or name in (
-            'special_tokens_map.json', 'added_tokens.json', 'chat_template.jinja'))}
+        if ('/' not in name and (name.startswith('tokenizer') or name in (
+            'special_tokens_map.json', 'added_tokens.json', 'chat_template.jinja')))
+        or (Path(name).parent.as_posix() in ('chat_templates', 'additional_chat_templates')
+            and Path(name).suffix == '.jinja')}
     expected = {'model_config_sha256': files['config.json']['sha256'],
                 'model_weight_manifest': source['weights'],
                 'tokenizer_manifest': expected_tokenizer}
@@ -181,7 +185,9 @@ def validate_gemma_source(report, pair):
 
 
 def read_report(directory, cancel, run):
-    raw = safe_read(directory / 'report.json', 2 * 1024 * 1024)
+    # Reports now include up to three complete held-out conversations, whose
+    # frozen JSONL dataset may be 16 MiB, plus formatting and provenance.
+    raw = safe_read(directory / 'report.json', 32 * 1024 * 1024)
     if not raw:
         raise ValueError('Training exited without an evaluation report.')
     report = json.loads(raw)
@@ -204,10 +210,16 @@ def read_report(directory, cancel, run):
     if not isinstance(comparisons, list) or len(comparisons) != len(held_out):
         raise ValueError('Training did not preserve held-out comparisons.')
     for comparison, expected in zip(comparisons, held_out):
+        display = comparison_example(expected) if 'messages' in expected else expected
         if (not isinstance(comparison, dict)
                 or any(not isinstance(comparison.get(key), str) for key in ('prompt', 'response', 'base_output', 'candidate_output'))
-                or any(comparison[key] != expected[key] for key in ('prompt', 'response'))):
+                or any(comparison[key] != display[key] for key in ('prompt', 'response'))):
             raise ValueError('Training comparison does not match the approved held-out examples.')
+        if 'messages' in expected:
+            if ('messages' not in comparison
+                    or normalize_example({key: comparison[key] for key in
+                        ('schema_version', 'messages', 'tools') if key in comparison}) != normalize_example(expected)):
+                raise ValueError('Training comparison does not match the complete approved held-out conversation.')
     versions = report.get('package_versions')
     if (not isinstance(versions, dict)
             or any(not isinstance(versions.get(name), str) or not versions[name]

@@ -226,3 +226,114 @@ def test_legacy_training_configuration_keeps_full_precision_cpu_defaults(tmp_pat
     assert restored.device == 'cpu'
     assert restored.gradient_accumulation_steps == 1
     assert restored.gradient_checkpointing is False
+
+
+def structured_conversation(question='Question'):
+    return [
+        {'role': 'system', 'content': 'Be precise.'},
+        {'role': 'user', 'content': question},
+        {'role': 'assistant', 'content': 'Earlier context.', 'train': False},
+        {'role': 'user', 'content': 'Use the earlier context.'},
+        {'role': 'assistant', 'content': 'Reviewed answer.'},
+    ]
+
+
+def test_structured_save_roundtrip_and_content_split_target_tool_approval_invalidation(tmp_path):
+    repo = repository(tmp_path)
+    messages = structured_conversation()
+    saved = repo.save_example(messages=messages, approved=True)
+    assert saved['schema_version'] == 2
+    assert saved['prompt'] == 'Question'
+    assert saved['response'] == 'Reviewed answer.'
+    assert TrainingRepository(repo.store).examples()[0]['messages'][2]['train'] is False
+    unchanged = repo.save_example(messages=messages, approved=True, source='Review metadata',
+                                  example_id=saved['id'])
+    assert unchanged['approved'] is True
+    messages[2]['train'] = True
+    target_edit = repo.save_example(messages=messages, approved=True, example_id=saved['id'])
+    assert target_edit['approved'] is False
+    repo.save_example(messages=messages, approved=True, example_id=saved['id'])
+    changed_split = repo.save_example(messages=messages, split='eval', approved=True, example_id=saved['id'])
+    assert changed_split['approved'] is False
+    repo.save_example(messages=messages, split='eval', approved=True, example_id=saved['id'])
+    tools = [{'type': 'function', 'function': {'name': 'read', 'parameters': {'type': 'object'}}}]
+    changed_tools = repo.save_example(messages=messages, tools=tools, split='eval', approved=True,
+                                      example_id=saved['id'])
+    assert changed_tools['approved'] is False
+    messages[2]['content'] = 'Edited earlier context.'
+    changed_context = repo.save_example(messages=messages, tools=tools, split='eval', approved=True,
+                                        example_id=saved['id'])
+    assert changed_context['approved'] is False
+
+
+def test_structured_export_import_preserves_all_messages_and_revokes_approval(tmp_path):
+    repo = repository(tmp_path)
+    repo.save_example(messages=structured_conversation(), split='eval', approved=True)
+    path = tmp_path / 'conversation.jsonl'
+    repo.export_jsonl(path)
+    exported = json.loads(path.read_text())
+    assert exported['schema_version'] == 2
+    assert len(exported['messages']) == 5
+    assert exported['messages'][2]['train'] is False
+    assert 'prompt' not in exported and 'response' not in exported
+    imported = repository(tmp_path / 'copy').import_jsonl(path)[0]
+    assert imported['messages'] == exported['messages']
+    assert imported['tools'] == []
+    assert imported['approved'] is False
+    assert imported['split'] == 'eval'
+
+
+def test_import_rejects_unknown_nested_fields_and_invalid_metadata_atomically(tmp_path):
+    repo = repository(tmp_path)
+    path = tmp_path / 'conversation.jsonl'
+    for bad in ({'messages': structured_conversation(), 'approved': 'yes'},
+                {'messages': structured_conversation(), 'split': []},
+                {'messages': structured_conversation(), 'prompt': 'mixed'},
+                {'messages': [{'role': 'user', 'content': 'p', 'weight': 1},
+                              {'role': 'assistant', 'content': 'r'}]}):
+        path.write_text(json.dumps({'prompt': 'good', 'response': 'valid'}) + '\n' + json.dumps(bad))
+        with pytest.raises(ValueError, match='line 2'):
+            repo.import_jsonl(path)
+        assert repo.examples() == []
+
+
+def test_existing_database_migrates_without_changing_legacy_frozen_run_bytes(tmp_path):
+    store = Store(tmp_path / 'data')
+    with store.connection() as db:
+        db.execute('''CREATE TABLE training_examples (
+            id TEXT PRIMARY KEY, prompt TEXT NOT NULL, response TEXT NOT NULL,
+            split TEXT NOT NULL, approved INTEGER NOT NULL, source TEXT NOT NULL,
+            created TEXT NOT NULL, updated TEXT NOT NULL)''')
+        db.execute("INSERT INTO training_examples VALUES ('old','Old prompt','Old response','train',1,'chat','before','before')")
+    repo = TrainingRepository(store)
+    row = repo.examples()[0]
+    assert row['messages'] == [{'role': 'user', 'content': 'Old prompt'},
+                               {'role': 'assistant', 'content': 'Old response', 'train': True}]
+    assert row['approved'] is True and row['created'] == 'before'
+    repo.save_example('eval', 'answer', split='eval', approved=True)
+    run = repo.create_run(config(tmp_path))
+    directory = repo.run_directory(run['id'])
+    before = {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()}
+    assert before['train.jsonl'] == b'{"prompt": "Old prompt", "response": "Old response"}\n'
+    assert 'messages' not in run['examples']['train'][0]
+    reopened = TrainingRepository(store).verify_run_snapshot(run['id'])
+    assert reopened['examples'] == run['examples']
+    assert {p.name: p.read_bytes() for p in directory.iterdir() if p.is_file()} == before
+
+
+def test_structured_snapshots_preserve_context_and_conditioning_deduplication(tmp_path):
+    repo = repository(tmp_path)
+    repo.save_example(messages=structured_conversation(), approved=True)
+    different_context = structured_conversation()
+    different_context[2]['content'] = 'Distinct earlier context.'
+    repo.save_example(messages=different_context, split='eval', approved=True)
+    run = repo.create_run(config(tmp_path))
+    saved = json.loads((repo.run_directory(run['id']) / 'train.jsonl').read_text())
+    assert saved['schema_version'] == 2 and len(saved['messages']) == 5
+    assert saved['messages'][2]['train'] is False
+    assert repo.verify_run_snapshot(run['id']) == run
+    duplicate_context = structured_conversation()
+    duplicate_context[-1]['content'] = 'Different target, same conditioning.'
+    repo.save_example(messages=duplicate_context, split='eval', approved=True)
+    with pytest.raises(ValueError, match='Duplicate'):
+        repo.create_run(config(tmp_path))

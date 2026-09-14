@@ -6,6 +6,17 @@
 >
 > This file is a chronological implementation record. Use issues, pull requests and Actions for live work; do not rewrite the dated results below when a later check changes status.
 
+## September 14, 2026 conversation-training development
+
+The focused `codex/conversation-training` change adds [editable complete training
+conversations](CONVERSATION-TRAINING.md), recorded function definitions and linked
+calls/results, context-only assistant turns, structured snapshots and verified
+native-template assistant-only loss. [Verification](CONVERSATION-TRAINING-VERIFICATION.md)
+separates the desktop suite, actual local tokenizer checks and tiny-model
+optimization/conversion proof. This is source development; the installed
+application and live data were not replaced as part of this change. Team review
+and required CI remain the integration gate.
+
 ## Recorded 0.6.0 implementation and local installation
 
 The **0.6.0 Strand experience** reworks the installed 0.5.0 Gemma lineage into

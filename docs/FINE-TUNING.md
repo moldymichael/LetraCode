@@ -1,16 +1,46 @@
-# Current 0.6.0 workflow
+# Teach Strand and try a trained version
 
-The interface is now **Improve → Examples → Prepare and train → Compare and choose**.
-Start with the [beginner guide](STRAND-EXPERIENCE.md). Preparation runs before Chat
-is unloaded, advanced configuration is collapsed, failed conversion can be
-retried from retained artifacts, and adoption requires a current Chat-runtime
-comparison and saved judgment. The technical training requirements below still
-apply; older names and measured runs describe the previous implementation.
+Open **Improve** and follow **1. Examples → 2. Set up and train →
+3. Compare and choose**. You write examples of the responses you want, train a
+trial version, then compare its answers before deciding whether to use it.
+Saving examples does not start training or change your current Strand.
 
-# Fine-Tuning and chat thinking
+A **teaching example** is used to learn. A **comparison example** is kept out of
+training so you can test the result; technical reports call it *held out*. The
+trained trial version is also called a *candidate*.
 
-LetraCode 0.5.0 adds CUDA 4-bit QLoRA to the Fine-Tuning workspace introduced in 0.4.0.
-Its adapters apply to the configured local chat model, including conversations
+## Try a first lesson
+
+1. In **1. Examples**, write both fields. For **You say**, try “Explain a metaphor
+   to someone new to poetry.” For **Strand should respond**, write “A metaphor
+   describes one thing as another. ‘Time is a river’ suggests it keeps moving
+   forward.” Strand does not generate the answer in this editor. **Show an
+   example** opens a read-only illustration without replacing your work.
+2. Leave **Use this to teach Strand** selected, review your wording, then choose
+   **Save and approve**. Use **Save draft** instead when you are still editing;
+   drafts are excluded from training and testing.
+3. Choose **New example**. Write a different request, such as “Explain a simile
+   to someone new to poetry,” and the reference answer you want, such as “A simile
+   compares things using ‘like’ or ‘as.’ ‘The moon is like a lantern’ compares
+   their light.” Select **Use this to test Strand**, then **Save and approve**.
+4. Choose **Next: set up training →**. Setup shows the approved counts; it needs
+   at least one teaching example and one different comparison example. This
+   small lesson demonstrates the workflow.
+
+**Add a follow-up** adds another request-and-response pair to the conversation.
+**More conversation options** reveals individual messages, background-only
+assistant turns, system instructions and recorded tools. See
+[conversation training](CONVERSATION-TRAINING.md) for those options and JSONL.
+
+Training needs local model files and a separate Python environment. If yours
+are already installed, go to [set up and train](#set-up-and-train); otherwise
+follow the environment instructions below.
+
+## Training and regular Chat
+
+CUDA 4-bit QLoRA was introduced in 0.5.0, following the 0.4.0 Fine-Tuning workspace.
+The older verification records retain those version and interface names.
+Trained adapters apply to the configured local chat model, including conversations
 using Strand identity, Memory and action tools. Model training and file-based
 Memory are separate: saving a note never trains weights.
 
@@ -44,8 +74,8 @@ py -m venv "$env:USERPROFILE\letracode-training"
 Package installation requires internet access. Training itself uses local files
 and offline mode. Follow the [PyTorch installer](https://pytorch.org/get-started/locally/)
 for a CUDA build compatible with your GPU and driver, then install the remaining
-requirements in that environment. New configurations recommend **4-bit QLoRA
-(NVIDIA GPU)**; previously saved full-precision settings retain their meaning.
+requirements in that environment. New configurations recommend **NVIDIA GPU ·
+use less memory (QLoRA)**; previously saved full-precision settings retain their meaning.
 Ordinary LoRA supports CPU or CUDA. QLoRA requires CUDA and fails with a clear
 message if unavailable; it never silently changes training method.
 
@@ -58,9 +88,9 @@ before installation and verify `torch.cuda.is_available()` afterwards.
 Choose the environment's Python executable, not LetraCode.exe or pythonw.exe.
 The training model folder must contain original **unquantized, text-only Llama**
 weights in safetensors format, config.json, tokenizer files and a chat template.
-The tokenizer must support a consistent user/assistant generation prefix.
-Remote custom code is disabled. Qwen, Mistral, Gemma, multimodal, quantized and
-adapter-only training folders are rejected by this first backend. They may
+The tokenizer must provide a verifiable native chat/tool template.
+Remote custom code is disabled. Besides the supported original Gemma 4 E2B/E4B
+path, other Gemma, Qwen, Mistral, quantized and adapter-only training folders are rejected. They may
 still be used as normal GGUF chat models when supported by llama.cpp.
 
 **4-bit QLoRA** loads those original weights into NF4 with double quantization,
@@ -73,7 +103,7 @@ The final partial group is included. These choices follow the
 [Transformers bitsandbytes guide](https://huggingface.co/docs/transformers/quantization/bitsandbytes)
 and [PEFT QLoRA guide](https://huggingface.co/docs/peft/developer_guides/quantization).
 
-**LoRA (full precision)** retains float32 base weights and q_proj/v_proj adapters.
+**CPU or GPU · full precision (LoRA)** retains float32 base weights and q_proj/v_proj adapters.
 Base weights alone use approximately four bytes per parameter. In QLoRA,
 quantized linear weights use about half a byte per parameter plus quantization
 metadata; embeddings, adapters, activations and runtime buffers also need memory.
@@ -82,18 +112,21 @@ microbatch 1, accumulation 4, length 512 and rank 8. Running a large GGUF in cha
 does not establish that its training weights fit this GPU. A 35B model's nominal
 4-bit weights alone exceed 8 GiB. Failed runs and logs remain available.
 
-## Review examples
+## Review and import examples
 
-1. Open **Fine-Tuning → Examples**. Write a prompt and the desired response,
-   or choose **Learn from reply…** in Chat to prepare a draft for correction.
-2. Choose **Training example** or **Held-out evaluation**. Save and review each
-   example, then choose **Approve example**. Editing approved text requires
-   review again. Drafts are excluded from runs.
-3. Keep evaluation prompts separate from training prompts. Duplicate prompts,
-   ignoring case and repeated whitespace, are refused when creating a run.
+Use **Save and approve** after reviewing both sides of an example. Editing its
+content or changing whether it teaches or tests Strand requires approval again.
+Chat's **Create example** action can prepare a draft from a reply for correction;
+review it before using it as a lesson.
+
+Keep comparison examples distinct from teaching examples. Repeated context
+leading up to a learned response is refused across or within the approved sets. For a simple exchange,
+that means the same question, ignoring case and repeated whitespace. For a
+conversation, it includes the prior messages and available tools before the
+first assistant turn selected for learning.
 
 Import JSONL files up to 16 MiB and 10,000 rows. Each row may contain prompt and
-response, or exactly one user message followed by one assistant message. All
+response, or a [structured conversation with tools](CONVERSATION-TRAINING.md#import-and-export). All
 imports start as drafts, including files that contain an approved flag.
 
 ```json
@@ -101,31 +134,58 @@ imports start as drafts, including files that contain an approved flag.
 {"prompt":"What should you do when evidence conflicts?","response":"Explain the disagreement and compare the sources.","split":"eval"}
 ```
 
-The simple dataset format does not train multi-turn conversations, system
-instructions or tool-call records. A copied chat reply is a starting point for
-review, not proof that the answer is correct.
+Use conversation cards or the structured format for multiple turns and tool
+exchanges. System/user/tool messages and context-only assistant turns supply
+context; selected assistant text and tool calls are optimized. A copied chat
+reply is a starting point for review, not proof that the answer is correct.
 
-## Train, compare and adopt
+## Set up and train
 
-In **Prepare and train**, select the training Python and model folder. For conversion and
-adoption, also select the matching base GGUF and a local llama.cpp source folder
-containing `convert_lora_to_gguf.py`. Install that checkout's conversion
-requirements in the training environment; use its own requirements documentation.
+In **2. Set up and train**, check **Your examples** and the names shown under
+**Model and tools · set up once**. The location fields open automatically when
+a required location is missing. Use **Choose or change model and tool locations**
+to inspect or change them at any time; these basic choices are separate from
+optional training settings.
+
+| Setup field | What to select |
+| --- | --- |
+| **Original model folder** | The folder with the original `.safetensors` weights, `config.json`, tokenizer files and native chat template. A chat `.gguf` file alone cannot be trained. |
+| **Matching chat model** | A `.gguf` made from those same original weights, used to try the trained version in Chat. |
+| **Training environment** | The environment's Python executable: for example, `~/letracode-training/bin/python` on Linux or `letracode-training\Scripts\python.exe` on Windows. |
+| **Conversion tools folder** | A local llama.cpp source checkout containing `convert_lora_to_gguf.py`; the chat engine executable alone is insufficient. |
+
+Install that checkout's conversion requirements in the training environment;
+use its own requirements documentation.
 The GGUF must derive from the same original model weights. A compatible shape
 alone cannot establish that two models have matching weights.
 
-Review method, epochs, rank, length, microbatch, accumulation, checkpointing,
-seed, learning rate and device, select
-the review checkbox, and choose **Check preparation and train**. Each run snapshots
-approved training/evaluation examples and its configuration. Overlong examples
+For supported original Gemma 4 E2B/E4B weights, **Create matching chat model**
+can create the matching GGUF locally. This helper is only for that Gemma path;
+for Llama, select a matching GGUF. It does not download a model.
+
+Choose **Check setup**. This checks the selected files, training packages,
+conversion tools and complete examples without starting training. If a check
+fails, its reason appears in the setup result; **Show full check details** opens
+the technical details. Correct the reported problem and check again.
+
+After setup passes, review the counts and select **I have reviewed the approved
+examples shown above**. This enables **Train a trial version**. Starting training
+rechecks setup before optimization; changing the examples or settings requires
+another successful check. **Adjust training settings (optional)** contains
+CPU/GPU choices, example length, batch size and learning rate.
+
+Each run freezes its approved teaching/comparison examples and configuration. Overlong examples
 fail with an explanation rather than silently dropping response tokens.
 Inference is unloaded during training, and chat/model changes wait for the job.
 **Stop** terminates the owned training process tree. Reopening marks unfinished
 runs interrupted; it never automatically restarts training.
 
-**Compare and choose → Show technical training report** shows status, base and candidate response loss,
-sample outputs and provenance. Loss excludes prompt tokens and is measured on
-the same held-out responses before and after optimization. Lower loss on that
+## Compare and choose
+
+**3. Compare and choose → Show technical training report** shows status, base and candidate response loss,
+sample outputs and provenance. Loss measures the selected assistant turns;
+user/system messages, tool results and context-only assistant turns are excluded.
+It uses the same held-out conversations before and after optimization. Lower loss on that
 set is narrow evidence; compare sample answers and test real Strand tasks.
 In QLoRA both baseline and candidate use the same quantized base; the baseline
 is not an unquantized-model benchmark. The report includes training precision,
@@ -143,7 +203,9 @@ job starts. Add fresh, self-contained questions (optional reference answers), th
 choose **Run comparison**. Original held-out questions remain included; fresh
 questions are checked against the run's frozen teaching data and never added to
 training examples. Both versions receive identical independent prompts using the
-current Chat settings, without shared notes, project context or tools. Select a
+current Chat settings, without shared notes or project retrieval. Structured
+held-out conversations retain their recorded context and tool definitions;
+generated calls are displayed without execution. Fresh questions are tool-free. Select a
 question to read the full responses side by side, including separately recorded
 Thinking. Progress and errors are visible; **Stop** preserves partial answers.
 

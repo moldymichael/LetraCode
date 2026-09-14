@@ -1,7 +1,7 @@
 """Offline LoRA and 4-bit QLoRA trainer for a separate Python environment.
 
-The local tokenizer chat template formats user/assistant examples. Exact generation
-prefix matching ensures response-only loss; no truncation or fallback formatting.
+The local tokenizer renders complete recorded conversations and tool schemas.
+Verified native boundaries ensure assistant-only loss; no truncation or tool replay.
 """
 from __future__ import annotations
 
@@ -22,6 +22,9 @@ import sys
 if __name__ == '__main__':
     script_directory = str(Path(__file__).resolve().parent)
     sys.path[:] = [entry for entry in sys.path if str(Path(entry).resolve()) != script_directory]
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from letracode.training_examples import normalize_example, example_identity, comparison_example
 
 
 def progress(message):
@@ -75,38 +78,451 @@ def load_datasets(run_dir):
     seen = set()
     for split in ('train', 'eval'):
         rows = []
-        for line in (Path(run_dir) / f'{split}.jsonl').read_text(encoding='utf-8').splitlines():
+        for index, line in enumerate((Path(run_dir) / f'{split}.jsonl').read_text(encoding='utf-8').splitlines(), 1):
             if not line.strip():
                 continue
-            row = json.loads(line)
-            if not isinstance(row, dict) or any(not isinstance(row.get(key), str) or not row[key].strip() for key in ('prompt', 'response')):
-                raise ValueError(f'{split}: every example requires nonempty prompt and response strings.')
-            prompt = ' '.join(row['prompt'].split()).casefold()
-            if prompt in seen:
-                raise ValueError('Duplicate prompt across training/evaluation examples; review the split.')
-            seen.add(prompt)
-            rows.append({'prompt': row['prompt'], 'response': row['response']})
+            try:
+                row = normalize_example(json.loads(line))
+            except (ValueError, TypeError) as error:
+                raise ValueError(f'{split} line {index}: invalid prompt/response conversation: {error}') from error
+            identity = example_identity(row)
+            if identity in seen:
+                raise ValueError('Duplicate prompt/context across training/evaluation examples; review the split.')
+            seen.add(identity)
+            rows.append(row)
         if not rows:
             raise ValueError(f'{split} dataset must contain approved examples.')
         datasets.append(rows)
     return datasets
 
 
+_NATIVE_MARKERS = ('<|im_start|>', '<|im_end|>', '<|turn>', '<turn|>',
+                   '<|tool_call>', '<tool_call|>', '<|tool_response>', '<tool_response|>')
+
+
+def _template_metadata(tokenizer, tools, strategy):
+    template = (tokenizer.get_chat_template(tools=tools or None)
+                if hasattr(tokenizer, 'get_chat_template') else tokenizer.chat_template)
+    return {'boundary_strategy': strategy,
+            'chat_template_sha256': hashlib.sha256(str(template).encode('utf-8')).hexdigest()}
+
+
+def _check_template_fields(render, messages, tools, rendered):
+    """Reject silent payload loss by probing the selected native template.
+
+    Probes are rendered only; they never become model input. IDs and train flags
+    are linkage/supervision metadata, not text the model must reproduce.
+    """
+    import copy
+    content_ranges = {}
+    tool_ranges = []
+
+    def changed(path, replacement, location):
+        candidate = copy.deepcopy({'messages': messages, 'tools': tools})
+        parent = candidate
+        for key in path[:-1]:
+            parent = parent[key]
+        parent[path[-1]] = replacement
+        try:
+            value = render(candidate['messages'], candidate['tools'], False)
+        except Exception as error:
+            raise ValueError(f'The native template cannot verify {location}: {error}') from error
+        if value == rendered:
+            raise ValueError(f'The native template ignored {location}; choose a tokenizer that preserves this conversation and its tools.')
+        first = 0
+        while first < min(len(value), len(rendered)) and value[first] == rendered[first]:
+            first += 1
+        tail = 0
+        while tail < min(len(value), len(rendered)) - first and value[-1 - tail] == rendered[-1 - tail]:
+            tail += 1
+        return first, len(rendered) - tail
+
+    def complete_string(path, original, location):
+        marker = hashlib.sha256((rendered + location).encode()).hexdigest()
+        opening, closing = 'LETRACODE_FIELD_START_' + marker, 'LETRACODE_FIELD_END_' + marker
+        for source in dict.fromkeys((original, original.strip())):
+            candidate = copy.deepcopy({'messages': messages, 'tools': tools})
+            parent = candidate
+            for key in path[:-1]:
+                parent = parent[key]
+            parent[path[-1]] = opening + source + closing
+            try:
+                marked = render(candidate['messages'], candidate['tools'], False)
+            except Exception as error:
+                raise ValueError(f'The native template cannot verify complete {location}: {error}') from error
+            allowed = {source}
+            for ascii_only in (False, True):
+                escaped = json.dumps(source, ensure_ascii=ascii_only)[1:-1]
+                allowed.add(escaped)
+                allowed.add(escaped.replace('<', '\\u003c').replace('>', '\\u003e').replace('&', '\\u0026').replace("'", '\\u0027'))
+            pieces = re.findall(re.escape(opening) + '(.*?)' + re.escape(closing), marked, re.DOTALL)
+            if (pieces and len(pieces) == marked.count(opening) == marked.count(closing)
+                    and all(piece in allowed for piece in pieces)
+                    and marked.replace(opening, '').replace(closing, '') == rendered):
+                return
+        raise ValueError(f'The native template did not preserve complete {location}.')
+
+    def complete_scalar(path, original, location):
+        marker = 'LETRACODE_SCALAR_' + hashlib.sha256((rendered + location).encode()).hexdigest()
+        candidate = copy.deepcopy({'messages': messages, 'tools': tools})
+        parent = candidate
+        for key in path[:-1]:
+            parent = parent[key]
+        parent[path[-1]] = marker
+        try:
+            marked = render(candidate['messages'], candidate['tools'], False)
+        except Exception as error:
+            raise ValueError(f'The native template cannot verify complete {location}: {error}') from error
+        # Native JSON/Gemma string delimiters are removed before comparing the
+        # exact original scalar rendering. Arithmetic, boolean inversion, null
+        # omission, and rounding therefore cannot pass a mere influence probe.
+        candidates = (json.dumps(marker), '<|"|>' + marker + '<|"|>', marker)
+        values = (json.dumps(original, allow_nan=False), str(original))
+        if not any(quoted in marked and marked.replace(quoted, value) == rendered
+                   for quoted in candidates for value in values):
+            raise ValueError(f'The native template did not preserve complete {location}.')
+
+    def complete_key(path, original, replacement, location):
+        key = next(key for key in original if key not in replacement)
+        marker = hashlib.sha256((rendered + location).encode()).hexdigest()
+        opening, closing = 'LETRACODE_KEY_START_' + marker, 'LETRACODE_KEY_END_' + marker
+        candidate = copy.deepcopy({'messages': messages, 'tools': tools})
+        parent = candidate
+        for item in path[:-1]:
+            parent = parent[item]
+        parent[path[-1]] = {opening + name + closing if name == key else name: value
+                           for name, value in original.items()}
+        try:
+            marked = render(candidate['messages'], candidate['tools'], False)
+        except Exception as error:
+            raise ValueError(f'The native template cannot verify complete {location}: {error}') from error
+        allowed = {key, json.dumps(key, ensure_ascii=False)[1:-1], json.dumps(key, ensure_ascii=True)[1:-1]}
+        pieces = re.findall(re.escape(opening) + '(.*?)' + re.escape(closing), marked, re.DOTALL)
+        # Native dictsort may move the marked key, so field placement is checked
+        # separately by its ordinary key-change probe against assistant spans.
+        if (not pieces or len(pieces) != marked.count(opening) or len(pieces) != marked.count(closing)
+                or any(piece not in allowed for piece in pieces)):
+            raise ValueError(f'The native template did not preserve complete {location}.')
+
+    def leaves(value, path, location):
+        if isinstance(value, dict):
+            # Probe user-defined argument/property keys, retaining schema keywords.
+            data_keys = 'arguments' in path or path[-1] in ('properties', '$defs', 'definitions')
+            if data_keys:
+                if not value:
+                    item = {'type': 'string'} if path[-1] == 'properties' else None
+                    yield path, {'letracode_probe_key': item}, location
+                for key in value:
+                    replacement = dict(value)
+                    replacement[key + '_letracode_probe'] = replacement.pop(key)
+                    yield path, replacement, location + '.' + key + ' key'
+            for key, item in value.items():
+                if key == 'strict' and path[-1] == 'function':
+                    continue
+                yield from leaves(item, path + [key], location + '.' + key)
+        elif isinstance(value, list):
+            if not value:
+                yield path, ['letracode_probe_value'], location
+            for index, item in enumerate(value):
+                yield from leaves(item, path + [index], location + f'[{index}]')
+        else:
+            # Use the native value type where template filters depend on it.
+            replacement = (not value if isinstance(value, bool) else
+                           value + 1 if isinstance(value, (int, float)) else
+                           'letracode_probe_value' if value is None else
+                           ('integer' if value == 'string' else 'string') if path[-1] == 'type' and isinstance(value, str) else
+                           str(value) + '_letracode_probe')
+            yield path, replacement, location
+
+    for index, message in enumerate(messages):
+        candidate = copy.deepcopy(messages)
+        candidate[index]['role'] = 'user' if message['role'] != 'user' else 'assistant'
+        try:
+            role_probe = render(candidate, tools, False)
+        except Exception:
+            # A native template rejecting the changed role demonstrably uses it.
+            role_probe = None
+        if role_probe == rendered:
+            raise ValueError(f'The native template ignored message {index + 1} role.')
+        if message.get('content', '').strip():
+            # A prefix/suffix probe catches templates that retain only a substring.
+            # Native whitespace trimming is allowed; internal text must survive.
+            start = 'LETRACODE_CONTENT_START_' + hashlib.sha256(rendered.encode()).hexdigest()
+            end = 'LETRACODE_CONTENT_END_' + hashlib.sha256(rendered.encode()).hexdigest()
+            for content in dict.fromkeys((message['content'], message['content'].strip())):
+                candidate = copy.deepcopy(messages)
+                candidate[index]['content'] = start + content + end
+                marked = render(candidate, tools, False)
+                if (marked.count(start) == 1 and marked.count(end) == 1
+                        and marked.split(start, 1)[1].split(end, 1)[0] == content
+                        and marked.replace(start, '').replace(end, '') == rendered):
+                    left = marked.index(start)
+                    content_ranges[index] = (left, left + len(content))
+                    break
+            else:
+                raise ValueError(f'The native template did not preserve complete message {index + 1} content.')
+        for number, call in enumerate(message.get('tool_calls', [])):
+            function_path = ['messages', index, 'tool_calls', number, 'function']
+            for path, replacement, location in leaves(call['function'], function_path, f'message {index + 1} tool call {number + 1}'):
+                changed(path, replacement, location)
+                original = {'messages': messages, 'tools': tools}
+                for key in path:
+                    original = original[key]
+                if isinstance(original, str):
+                    complete_string(path, original, location)
+                elif location.endswith(' key'):
+                    complete_key(path, original, replacement, location)
+                elif not isinstance(original, (dict, list)):
+                    complete_scalar(path, original, location)
+    for index, tool in enumerate(tools):
+        # Function type is transport metadata; name/description/schema are input.
+        for path, replacement, location in leaves(tool['function'], ['tools', index, 'function'], f'tool {index + 1}'):
+            tool_ranges.append(changed(path, replacement, location))
+            original = {'messages': messages, 'tools': tools}
+            for key in path:
+                original = original[key]
+            if isinstance(original, str) and path[-1] != 'type':
+                complete_string(path, original, location)
+            elif location.endswith(' key'):
+                complete_key(path, original, replacement, location)
+            elif not isinstance(original, (dict, list, str)):
+                complete_scalar(path, original, location)
+    return content_ranges, tool_ranges
+
+
+def _verify_field_spans(fields, messages, spans):
+    content_ranges, tool_ranges = fields
+    for index, (left, right) in content_ranges.items():
+        if messages[index]['role'] == 'assistant':
+            if not any(owner == index and start <= left <= right <= end for owner, start, end in spans):
+                raise ValueError(f'Native template moved message {index + 1} content outside its assistant boundary.')
+        elif any(start < right and left < end for _, start, end in spans):
+            raise ValueError(f'Native template moved message {index + 1} context content into an assistant boundary.')
+    if any(start < right and left < end for left, right in tool_ranges for _, start, end in spans):
+        raise ValueError('Native template moved tool definitions into an assistant boundary.')
+
+
+def _chatml_spans(rendered, messages):
+    matches = list(re.finditer(r'<\|im_start\|>([^\n]+)\n(.*?)<\|im_end\|>', rendered, re.DOTALL))
+    if rendered.count('<|im_start|>') != len(matches) or rendered.count('<|im_end|>') != len(matches):
+        raise ValueError('The native ChatML template has ambiguous role delimiters.')
+    assistants = [match for match in matches if match.group(1) == 'assistant']
+    expected = [(index, message) for index, message in enumerate(messages) if message['role'] == 'assistant']
+    # Verify the role sequence, permitting a native injected system header and
+    # native grouping of consecutive tool results only.
+    def compressed(roles):
+        result = []
+        for role in roles:
+            if role == 'tool' and result and result[-1] == role:
+                continue
+            result.append(role)
+        return result
+    actual_roles = compressed([match.group(1) for match in matches])
+    source_roles = compressed([message['role'] for message in messages])
+    while len(actual_roles) > len(source_roles) and actual_roles[0] == 'system':
+        actual_roles.pop(0)
+    if actual_roles != source_roles or len(assistants) != len(expected):
+        raise ValueError('The native ChatML template did not preserve the conversation role sequence.')
+    return [(index, match.start(2), match.end()) for (index, _), match in zip(expected, assistants)]
+
+
+def _gemma_spans(rendered, messages):
+    """Map Gemma's native merged model turns, excluding embedded tool results."""
+    turns = list(re.finditer(r'<\|turn>([^\n]+)\n(.*?)<turn\|>', rendered, re.DOTALL))
+    if rendered.count('<|turn>') != len(turns) or rendered.count('<turn|>') != len(turns):
+        raise ValueError('The native Gemma template has incomplete or ambiguous turn delimiters.')
+    groups = []
+    for index, message in enumerate(messages):
+        if message['role'] == 'tool':
+            continue
+        role = 'model' if message['role'] == 'assistant' else message['role']
+        if role == 'model' and groups and groups[-1][0] == role:
+            groups[-1][1].append(index)
+        else:
+            groups.append((role, [index]))
+    while len(turns) > len(groups) and turns[0].group(1) == 'system':
+        turns.pop(0)
+    if [turn.group(1) for turn in turns] != [role for role, _ in groups]:
+        raise ValueError('The native Gemma template did not preserve the conversation role sequence.')
+    spans = []
+    for turn, (role, indices) in zip(turns, groups):
+        if role != 'model':
+            continue
+        cursor = turn.start(2)
+        for index in indices:
+            message = messages[index]
+            for call in message.get('tool_calls', []):
+                prefix = '<|tool_call>call:' + call['function']['name'] + '{'
+                if not rendered.startswith(prefix, cursor):
+                    raise ValueError('The native Gemma template did not preserve an assistant tool call.')
+                end = rendered.find('<tool_call|>', cursor)
+                if end < 0 or end >= turn.end(2):
+                    raise ValueError('The native Gemma template has an incomplete tool call.')
+                end += len('<tool_call|>')
+                spans.append((index, cursor, end))
+                cursor = end
+            following = index + 1
+            while following < len(messages) and messages[following]['role'] == 'tool':
+                if not rendered.startswith('<|tool_response>', cursor):
+                    raise ValueError('The native Gemma template did not preserve a tool result.')
+                end = rendered.find('<tool_response|>', cursor)
+                if end < 0 or end >= turn.end(2):
+                    raise ValueError('The native Gemma template has an incomplete tool result.')
+                cursor = end + len('<tool_response|>')
+                following += 1
+            content = message.get('content', '').strip()
+            if not rendered.startswith(content, cursor):
+                raise ValueError('The native Gemma template changed or discarded assistant content.')
+            if content:
+                spans.append((index, cursor, cursor + len(content)))
+                cursor += len(content)
+        if cursor != turn.end(2):
+            raise ValueError('The native Gemma template has unverified assistant content or tool boundaries.')
+        spans.append((indices[-1], cursor, turn.end()))
+    return spans
+
+
 def encode_example(tokenizer, row, max_length, *, gemma=False):
     if not getattr(tokenizer, 'chat_template', None):
         raise ValueError('A local tokenizer chat template is required for assistant fine-tuning; select matching instruct weights/tokenizer.')
-    messages = [{'role': 'user', 'content': row['prompt']}]
+    example = normalize_example(row)
+    tools = example['tools']
+    messages = [{key: value for key, value in message.items() if key != 'train'} for message in example['messages']]
+    for index, message in enumerate(messages):
+        calls = message.get('tool_calls', [])
+        if calls:
+            results = messages[index + 1:index + 1 + len(calls)]
+            if [result.get('tool_call_id') for result in results] != [call['id'] for call in calls]:
+                raise ValueError(f'Message {index + 1}: this training encoder requires tool results in matching call order to preserve associations in native positional tool formats; reorder the linked result messages.')
     options = {'enable_thinking': False} if gemma else {}
-    prompt = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=True, return_dict=False, **options)
-    tokens = tokenizer.apply_chat_template(messages + [{'role': 'assistant', 'content': row['response']}], tokenize=True, add_generation_prompt=False, return_dict=False, **options)
-    if not prompt or tokens[:len(prompt)] != prompt:
-        raise ValueError('Tokenizer chat template does not preserve the exact generation prefix; this template is unsupported for response-only training.')
-    response = tokens[len(prompt):]
-    if not response:
-        raise ValueError('Response must produce tokens after the generation prefix.')
+    if tools:
+        options['tools'] = tools
+    try:
+        tokens = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False, return_dict=False, **options)
+    except Exception as error:
+        raise ValueError(f'The native tokenizer template cannot render this conversation: {error}') from error
     if len(tokens) > max_length:
         raise ValueError(f'Example token length {len(tokens)} exceeds max_length {max_length}; shorten it or increase the limit. No tokens were truncated.')
-    return {'input_ids': tokens, 'labels': [-100] * len(prompt) + response, 'prompt_ids': prompt}
+    labels = [-100] * len(tokens)
+    target_index = next(index for index, message in enumerate(example['messages']) if message['role'] == 'assistant' and message['train'])
+    def render(current_messages, current_tools, tokenize):
+        kwargs = {'enable_thinking': False} if gemma else {}
+        if current_tools:
+            kwargs['tools'] = current_tools
+        return tokenizer.apply_chat_template(current_messages, tokenize=tokenize, add_generation_prompt=False, return_dict=False, **kwargs)
+
+    rendered = render(messages, tools, False)
+    serialized = json.dumps({'messages': messages, 'tools': tools}, ensure_ascii=False)
+    if any(marker in serialized for marker in _NATIVE_MARKERS):
+        raise ValueError('Example text contains a native role/tool delimiter marker; remove the literal marker before training.')
+    fields = _check_template_fields(render, messages, tools, rendered) if isinstance(rendered, str) else None
+    simple = not tools and len(messages) == 2 and [message['role'] for message in messages] == ['user', 'assistant']
+    if simple:
+        prompt = tokenizer.apply_chat_template(messages[:1], tokenize=True, add_generation_prompt=True, return_dict=False, **options)
+        if not prompt or tokens[:len(prompt)] != prompt:
+            raise ValueError('Tokenizer chat template does not preserve the exact generation prefix; this template is unsupported for response-only training.')
+        if len(tokens) == len(prompt):
+            raise ValueError('Response must produce tokens after the generation prefix.')
+        if fields is not None:
+            prompt_text = tokenizer.apply_chat_template(messages[:1], tokenize=False, add_generation_prompt=True, return_dict=False, **options)
+            if not isinstance(prompt_text, str) or not rendered.startswith(prompt_text):
+                raise ValueError('Native template text does not preserve the generation prefix.')
+            _verify_field_spans(fields, messages, [(1, len(prompt_text), len(rendered))])
+        labels[len(prompt):] = tokens[len(prompt):]
+        return {'input_ids': tokens, 'labels': labels, 'prompt_ids': prompt, 'target_message_index': target_index,
+                **_template_metadata(tokenizer, tools, 'exact-generation-prefix')}
+
+    if fields is None:
+        raise ValueError('The native template must expose its rendered text to verify conversation boundaries.')
+    if gemma and '<|turn>model\n' in rendered:
+        spans = _gemma_spans(rendered, messages)
+        strategy = 'native-gemma-turns-and-tool-results'
+    elif '<|im_start|>assistant\n' in rendered:
+        spans = _chatml_spans(rendered, messages)
+        strategy = 'native-chatml-role-boundaries'
+    else:
+        # Unknown dialects remain supported when each native generation prefix
+        # and completed assistant span is an exact prefix of the full sequence.
+        spans = None
+        strategy = 'exact-generation-prefixes'
+    first_target = None
+    if spans is not None:
+        _verify_field_spans(fields, messages, spans)
+        if tokenizer.encode(rendered, add_special_tokens=False) != tokens:
+            raise ValueError('Native rendered text and native tokenization disagree; no loss boundaries can be verified.')
+        boundaries = {}
+        for _, start, end in spans:
+            for offset in (start, end):
+                if offset not in boundaries:
+                    prefix = tokenizer.encode(rendered[:offset], add_special_tokens=False)
+                    if tokens[:len(prefix)] != prefix:
+                        raise ValueError('Native template boundary crosses a token or rewrites its prefix; this example cannot be masked safely.')
+                    boundaries[offset] = len(prefix)
+        for index, start, end in spans:
+            if example['messages'][index]['train']:
+                left, right = boundaries[start], boundaries[end]
+                if first_target is None:
+                    first_target = left
+                labels[left:right] = tokens[left:right]
+    else:
+        verified_spans = []
+        for index, message in enumerate(example['messages']):
+            if message['role'] != 'assistant':
+                continue
+            try:
+                prompt = tokenizer.apply_chat_template(messages[:index], tokenize=True, add_generation_prompt=True, return_dict=False, **options)
+                completed = render(messages[:index + 1], tools, True)
+            except Exception as error:
+                raise ValueError(f'The native template cannot verify message {index + 1}: {error}') from error
+            if (not prompt or completed[:len(prompt)] != prompt or tokens[:len(completed)] != completed):
+                raise ValueError('Native template does not preserve exact generation prefixes for this conversation.')
+            prompt_text = tokenizer.apply_chat_template(messages[:index], tokenize=False, add_generation_prompt=True, return_dict=False, **options)
+            completed_text = render(messages[:index + 1], tools, False)
+            if not completed_text.startswith(prompt_text) or not rendered.startswith(completed_text):
+                raise ValueError('Native template text does not preserve exact generation prefixes.')
+            verified_spans.append((index, len(prompt_text), len(completed_text)))
+            if message['train']:
+                if first_target is None:
+                    first_target = len(prompt)
+                labels[len(prompt):len(completed)] = tokens[len(prompt):len(completed)]
+        _verify_field_spans(fields, messages, verified_spans)
+    if first_target is None or not any(label != -100 for label in labels[1:]):
+        raise ValueError('Example has no verified assistant target tokens.')
+    return {'input_ids': tokens, 'labels': labels, 'prompt_ids': tokens[:first_target],
+            'target_message_index': target_index, **_template_metadata(tokenizer, tools, strategy)}
+
+
+def _encoding_evidence(row):
+    return {key: row[key] for key in ('boundary_strategy', 'chat_template_sha256', 'target_message_index')} | {
+        'input_tokens': len(row['input_ids']),
+        'supervised_tokens': sum(label != -100 for label in row['labels'][1:]),
+        'prompt_tokens': len(row['prompt_ids'])}
+
+
+def _tokenization_metadata(splits):
+    """Keep bounded previews and exact aggregates for every encoded example."""
+    previews, counts, summaries = {}, {}, {}
+    for split, rows in splits.items():
+        preview = []
+        count = total_input = total_supervised = maximum = 0
+        strategies, templates = set(), set()
+        for row in rows:
+            if len(preview) < 3:
+                preview.append(dict(row))
+            count += 1
+            total_input += row['input_tokens']
+            total_supervised += row['supervised_tokens']
+            maximum = max(maximum, row['input_tokens'])
+            strategies.add(row['boundary_strategy'])
+            templates.add(row['chat_template_sha256'])
+        previews[split] = preview
+        counts[split] = len(preview)
+        summaries[split] = {'example_count': count, 'total_input_tokens': total_input,
+                            'total_supervised_tokens': total_supervised, 'max_input_tokens': maximum,
+                            'boundary_strategies': sorted(strategies),
+                            'chat_template_sha256s': sorted(templates)}
+    return {'tokenization_examples': previews, 'tokenization_preview_counts': counts,
+            'tokenization_summary': summaries}
 
 
 def convert_adapter(run_dir, base_model, llama_cpp_dir):
@@ -317,13 +733,15 @@ def run_training(run_dir):
         torch.cuda.manual_seed_all(seed)
         torch.cuda.reset_peak_memory_stats(0)
     progress('Hashing local model weights and approved dataset snapshots')
-    provenance = {'config_sha256': sha256(run_dir / 'config.json'), 'train_sha256': sha256(run_dir / 'train.jsonl'), 'eval_sha256': sha256(run_dir / 'eval.jsonl'), 'base_model': str(base), 'model_config_sha256': sha256(base / 'config.json'), 'model_weight_manifest': {p.name: {'sha256': sha256(p), 'bytes': p.stat().st_size} for p in sorted(base.glob('*.safetensors'))}, 'tokenizer_manifest': {p.name: sha256(p) for p in sorted(base.iterdir()) if p.is_file() and (p.name.startswith('tokenizer') or p.name in ('special_tokens_map.json', 'added_tokens.json', 'chat_template.jinja'))}, 'tokenization': 'local tokenizer chat template; exact generation prefix masked; assistant completion and template terminators contribute loss'}
+    provenance = {'config_sha256': sha256(run_dir / 'config.json'), 'train_sha256': sha256(run_dir / 'train.jsonl'), 'eval_sha256': sha256(run_dir / 'eval.jsonl'), 'base_model': str(base), 'model_config_sha256': sha256(base / 'config.json'), 'model_weight_manifest': {p.name: {'sha256': sha256(p), 'bytes': p.stat().st_size} for p in sorted(base.glob('*.safetensors'))}, 'tokenizer_manifest': {p.relative_to(base).as_posix(): sha256(p) for p in sorted(list(base.iterdir()) + list((base / 'chat_templates').glob('*.jinja')) + list((base / 'additional_chat_templates').glob('*.jinja'))) if p.is_file() and (p.name.startswith('tokenizer') or p.name in ('special_tokens_map.json', 'added_tokens.json', 'chat_template.jinja') or p.parent in (base / 'chat_templates', base / 'additional_chat_templates'))}, 'tokenization': 'complete local native chat/tool template; verified assistant targets and native terminators contribute loss; user/system/tool/context-only assistant tokens masked; no truncation or tool execution'}
     progress('Loading local tokenizer and ' + ('Gemma 4 text decoder' if gemma else 'Llama') + ' safetensors weights')
     tokenizer = AutoTokenizer.from_pretrained(str(base), local_files_only=True, trust_remote_code=False)
     text_config = model_config['text_config'] if gemma else model_config
     limit = min(config['max_length'], text_config.get('max_position_embeddings', config['max_length']))
     train = [encode_example(tokenizer, row, limit, gemma=gemma) for row in train_rows]
     evaluation = [encode_example(tokenizer, row, limit, gemma=gemma) for row in eval_rows]
+    provenance.update(_tokenization_metadata({'train': (_encoding_evidence(row) for row in train),
+                                               'eval': (_encoding_evidence(row) for row in evaluation)}))
     load_options = dict(local_files_only=True, trust_remote_code=False, use_safetensors=True,
                         torch_dtype=compute_dtype)
     quantized_layers = 0
@@ -455,7 +873,13 @@ def run_training(run_dir):
             memory['peak_process_rss_bytes'] = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss) * (1 if sys.platform == 'darwin' else 1024)
         except ImportError:
             pass
-    report = {'base_loss': base_loss, 'candidate_loss': candidate_loss, 'eval_response_tokens': eval_tokens, 'eval_examples': [dict(row, base_output=before, candidate_output=after) for row, before, after in zip(eval_rows[:3], base_examples, candidate_examples)], 'adapter_path': str(adapter), 'adapter_gguf': gguf, 'conversion_error': conversion_error, 'package_versions': {name: importlib.metadata.version(name) for name in packages}, 'provenance': provenance, 'optimization_steps': steps, 'training_details': details, 'memory': memory}
+    comparisons = []
+    for row, encoded, before, after in zip(eval_rows[:3], evaluation[:3], base_examples, candidate_examples):
+        view = comparison_example(row)
+        comparisons.append(dict(row, prompt=view['prompt'], response=view['response'],
+                                target_message_index=encoded['target_message_index'],
+                                base_output=before, candidate_output=after))
+    report = {'base_loss': base_loss, 'candidate_loss': candidate_loss, 'eval_response_tokens': eval_tokens, 'eval_examples': comparisons, 'adapter_path': str(adapter), 'adapter_gguf': gguf, 'conversion_error': conversion_error, 'package_versions': {name: importlib.metadata.version(name) for name in packages}, 'provenance': provenance, 'optimization_steps': steps, 'training_details': details, 'memory': memory}
     temporary = run_dir / 'report.json.tmp'
     temporary.write_text(json.dumps(report, indent=2, allow_nan=False), encoding='utf-8')
     temporary.replace(run_dir / 'report.json')
@@ -500,10 +924,13 @@ def check_training(run_dir):
     text_config = architecture.get('text_config', {}) if gemma else architecture
     limit = min(config['max_length'], text_config.get('max_position_embeddings', config['max_length']))
     lengths = []
+    encodings = {'teaching': [], 'comparison': []}
     for split, rows in (('teaching', train), ('comparison', evaluation)):
         for index, row in enumerate(rows):
             try:
-                lengths.append(len(encode_example(tokenizer, row, limit, gemma=gemma)['input_ids']))
+                encoded = encode_example(tokenizer, row, limit, gemma=gemma)
+                lengths.append(len(encoded['input_ids']))
+                encodings[split].append(_encoding_evidence(encoded))
             except ValueError as exc:
                 raise ValueError(f'{split.capitalize()} example {index + 1}: {exc}') from exc
     converter = Path(config.get('llama_cpp_dir', '')) / 'convert_lora_to_gguf.py'
@@ -514,7 +941,7 @@ def check_training(run_dir):
     if checked.returncode:
         raise ValueError('The adapter converter needs dependencies in this training Python. ' + (checked.stderr or checked.stdout)[-2000:])
     result = {'ready': True, 'max_example_tokens': max(lengths), 'training_examples': len(train),
-              'evaluation_examples': len(evaluation),
+              'evaluation_examples': len(evaluation), **_tokenization_metadata(encodings),
               'summary': f'{len(train)} teaching and {len(evaluation)} comparison examples fit; longest is {max(lengths)} tokens. Runtime and converter are available. Memory capacity is confirmed only during training.'}
     (run_dir / 'readiness.json').write_text(json.dumps(result), encoding='utf-8')
     return result

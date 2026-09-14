@@ -94,7 +94,7 @@ Receipts record what was supplied to a request, including private excerpts. They
 
 Normal chat does not require a training environment. Improve supports local LoRA/QLoRA for compatible text-only Llama models and the supported Gemma 4 E2B/E4B path. It requires compatible original weights and separate training/conversion dependencies; an arbitrary GGUF alone cannot be trained.
 
-Only approved teaching examples are optimized on. Comparison examples are held out, and adopting a candidate is explicit. Lower training loss is not proof of better answers. See the [training guide](docs/FINE-TUNING.md) and [Gemma support record](docs/GEMMA4.md); do not infer native Windows training validation from an installer smoke test.
+Examples can contain [complete conversations with tool use](docs/CONVERSATION-TRAINING.md), including editable messages, linked calls/results and context-only assistant turns. Only approved assistant teaching targets are optimized on. Comparison examples are held out, and adopting a candidate is explicit. Lower training loss is not proof of better answers. See the [training guide](docs/FINE-TUNING.md) and [Gemma support record](docs/GEMMA4.md); do not infer native Windows training validation from an installer smoke test.
 
 <a id="ownership-and-recovery"></a>
 

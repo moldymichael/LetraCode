@@ -140,12 +140,13 @@ def _source_snapshot(base, cancel=None):
         p.name.startswith('tokenizer') or p.name.startswith('chat_template') or
         p.name in ('special_tokens_map.json', 'added_tokens.json', 'generation_config.json') or
         p.name.endswith('.safetensors.index.json')))
-    template_dir = base / 'chat_templates'
-    if template_dir.is_dir():
-        files += sorted(p for p in template_dir.rglob('*') if p.is_file())
+    template_dirs = [base / name for name in ('chat_templates', 'additional_chat_templates')]
+    for template_dir in template_dirs:
+        if template_dir.is_dir():
+            files += sorted(p for p in template_dir.rglob('*') if p.is_file())
     if not any(p.name in ('tokenizer.json', 'tokenizer.model') for p in files):
         raise ValueError('The original local Gemma tokenizer files are required.')
-    if not any(p.name.startswith('chat_template') or template_dir in p.parents for p in files):
+    if not any(p.name.startswith('chat_template') or any(folder in p.parents for folder in template_dirs) for p in files):
         tokenizer_config = _read_json(base / 'tokenizer_config.json')
         if not tokenizer_config.get('chat_template'):
             raise ValueError('The original local Gemma chat template is required.')
