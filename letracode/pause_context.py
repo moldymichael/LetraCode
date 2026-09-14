@@ -32,6 +32,19 @@ def _ident(value):
     return type(value) is int and value > 0
 
 
+def _referenceable(row):
+    if row['status'] == 'complete':
+        return True
+    if row['role'] != 'assistant' or row['status'] != 'incomplete':
+        return False
+    data = payload(row)
+    # A terminal answer can be valid follow-up context while its source
+    # coverage remains limited. Provisional and interrupted replies cannot.
+    return (data.get('task_outcome') == 'source_limited'
+            and data.get('request_completed') is True
+            and data.get('pause_context_closed') is True)
+
+
 def resolve_intent(rows, chat_id=None, *, starting_task=False, pinned_intent=None):
     """Keep every user steering row since the original anchor.
 
@@ -105,7 +118,7 @@ def resolve_intent(rows, chat_id=None, *, starting_task=False, pinned_intent=Non
         anchor = latest
         anchor_id = anchor['id']
     expected_references = [row['id'] for row in rows if row['id'] < anchor_id
-                          and row['role'] in ('user', 'assistant', 'tool') and row['status'] == 'complete']
+                          and row['role'] in ('user', 'assistant', 'tool') and _referenceable(row)]
     if reference_policy == 'recent_v1':
         ended_after = next((row['id'] for row in reversed(rows) if row['id'] < anchor_id
                             and row['role'] == 'notice'
@@ -122,7 +135,7 @@ def resolve_intent(rows, chat_id=None, *, starting_task=False, pinned_intent=Non
     for ident in references:
         row = by_id.get(ident)
         if (row is None or ident >= anchor_id or row['role'] not in ('user', 'assistant', 'tool')
-                or row['status'] != 'complete'):
+                or not _referenceable(row)):
             raise ContextOverflowError(f'Required referenced context is missing or unavailable at saved message {ident}. Restore it or start a new chat with the complete context.')
         referenced.append(row)
     if references != expected_references:
