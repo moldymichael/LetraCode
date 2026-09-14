@@ -45,6 +45,8 @@ def message_status(message):
         data, reply = {}, {}
     status = message['status']
     if message['role'] == 'assistant':
+        if data.get('task_outcome') == 'source_limited':
+            return 'Response saved · Source limitation · Task outcome unverified'
         if data.get('task_outcome') == 'source_incomplete':
             return 'Provisional response · Source coverage incomplete · Task outcome unverified'
         if status == 'complete' and not reply.get('tool_calls'):

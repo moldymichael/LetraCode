@@ -808,7 +808,7 @@ class ConversationWorker(QThread):
                         if source_work and coverage['incomplete']:
                             data['task_outcome'] = 'source_incomplete'
                             self.store.update_message(response_id, draft, 'incomplete', payload=data)
-                            self.store.add_message(self.chat_id, 'notice',
+                            notice_id = self.store.add_message(self.chat_id, 'notice',
                                 'Provisional response: source coverage is incomplete. '
                                 'Any exhaustive-reading claim in the model response is unverified.\n'
                                 + evidence_summary(coverage, max_files=3),
@@ -818,9 +818,23 @@ class ConversationWorker(QThread):
                                 raise observation_halt
                             if recover_source():
                                 continue
-                            self.progress.observe('provisional_response', {},
-                                {'error': 'The model ended without resolving incomplete source coverage; no new action or evidence.'}, response_id)
-                            continue
+                            # Incomplete evidence is not itself a recovery plan.
+                            # A failed/untracked path or unsupported extraction
+                            # tail must stay honest without soliciting more
+                            # answers and unrelated reads that reset stalls.
+                            check_run()
+                            data.update(pause_context_closed=True, task_outcome='source_limited',
+                                        terminal_input_cursor=input_cursor)
+                            self.store.update_message(response_id, draft, 'incomplete', payload=data)
+                            self.store.update_message(notice_id,
+                                'Response saved with source limitations. Automatic source reading stopped: '
+                                'coverage remains incomplete or untracked, and no recoverable source page is available. '
+                                'Any exhaustive-reading claim in the response remains unverified. '
+                                'Saved source results and coverage evidence are retained.', 'incomplete',
+                                payload={'coverage': coverage, 'task_outcome': 'source_limited'})
+                            self.changed.emit()
+                            self.status.emit('Response saved with source limitations · automatic continuation stopped')
+                            return
                         if observation_halt is not None:
                             self.store.update_message(response_id, draft, 'incomplete', payload=data)
                             raise observation_halt

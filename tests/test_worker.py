@@ -572,9 +572,10 @@ def test_many_pauses_recover_old_result_from_bounded_catalog_after_reopen(tmp_pa
     ConversationWorker(reopened, chat, engine, computer_enabled=False, web_enabled=False).run()
     after = reopened.messages(chat)
     claims = [row for row in after[len(before):] if row['content'] == 'Recovered ARCHIVED-DELTA-41; command exited 7.']
-    assert len(claims) == 3 and all(row['status'] == 'incomplete' for row in claims)
-    assert json.loads(after[-1]['payload'])['checkpoint']['reason'] == 'no_progress'
-    assert engine.requests == 5  # Historical failed reads remain explicitly incomplete.
+    assert len(claims) == 1 and claims[0]['status'] == 'incomplete'
+    assert json.loads(claims[0]['payload'])['task_outcome'] == 'source_limited'
+    assert json.loads(after[-1]['payload'])['task_outcome'] == 'source_limited'
+    assert engine.requests == 3  # Historical failures remain incomplete without retrying the answer.
     assert [json.loads(row['payload'])['message']['name'] for row in after[len(before):] if row['role'] == 'tool'] == [
         'list_tool_results', 'read_tool_result']
     assert reopened.tool_result_page(chat, expected[0])['content'] == original
