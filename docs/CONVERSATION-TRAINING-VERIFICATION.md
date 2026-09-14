@@ -132,3 +132,48 @@ edits, the six source-archive/link/reproducibility tests also passed.
 No Windows installer/RPM build, release publication, live installation or live
 data migration was performed. Required remote CI and the other teammate's
 approval remain separate from this local evidence.
+
+## Usability follow-up — September 14, 2026
+
+After trying the installed upgrade, the user reported that adding an example
+and setting up training were confusing. The follow-up starts from `3fca66e`
+and keeps the native training and storage formats unchanged. It adds a simple
+two-field teaching path, a separate read-only example window, one-click
+follow-ups and linked tool results, clearer saving/approval, and visible basic
+setup separate from tuning. Check setup and starting training are distinct
+actions; a successful check and review acknowledgment unlock the training button.
+
+The unchanged focused baseline passed **88 tests**. New behavior tests first
+exposed hidden required setup fields, hidden actionable errors and training
+controls not gated by the completed setup. An initial new test fixture pointed
+its scripted preflight at the wrong module; correcting the fixture reproduced
+the intended missing readiness gate. One existing assertion was updated to
+expect Check setup, rather than unchecked training, to become available after
+a chat job finishes.
+
+```bash
+QT_QPA_PLATFORM=offscreen python3 -m pytest -q
+python3 -m compileall -q letracode packaging tools
+bash -n install.sh uninstall.sh packaging/build-rpm.sh
+git diff --check
+```
+
+Full Fedora suite: **1,228 passed, 48 skipped, six existing multiprocessing-fork
+warnings**, 78.89 seconds. Compilation, shell syntax and whitespace checks
+passed. New tests exercise real Qt controls, saved examples and preparation
+workers with disposable data; a scripted backend confirms the UI handoff without
+claiming real-model training for this presentation change.
+
+Offscreen screens were rendered and inspected at **1100×820** and **850×650**.
+The first compact help render crowded the editor; moving the read-only example
+to a separate window keeps the editing viewport unchanged. Independent review
+of the editor found no actionable issues and passed all **22** tests then in its
+focused scope. No native Windows or interactive desktop session was tested.
+Installation evidence is recorded separately from these source checks.
+
+The final setup review passed **76 tests** and separately exercised a dataset
+edit during the final recheck with a disposable worker/subprocess probe. It
+confirmed no training run was created from changed approvals, and that unchanged
+setup is rechecked before the training worker launches. After the final help
+layout and copy edits, the focused editor/setup and archive checks passed
+**43 tests**. These are UI/protocol checks, not an additional optimization trial.

@@ -4,8 +4,8 @@ from __future__ import annotations
 import json
 import uuid
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QFormLayout, QGroupBox,
+from PySide6.QtCore import Qt, Signal, QTimer
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QPushButton, QScrollArea,
     QSizePolicy, QVBoxLayout, QWidget)
 
@@ -64,6 +64,8 @@ class ToolCallCard(QGroupBox):
         self.arguments.setPlainText(state.get('arguments_text', '{}'))
         layout.addWidget(QLabel('Arguments (JSON object)'))
         layout.addWidget(self.arguments)
+        self.result_button = QPushButton('Add or edit result')
+        layout.addWidget(self.result_button)
         self.name.textChanged.connect(self.changed)
         self.call_id.textChanged.connect(self.changed)
         self.arguments.textChanged.connect(self.changed)
@@ -130,6 +132,8 @@ class ToolDefinitionCard(QGroupBox):
 
 class MessageCard(QGroupBox):
     changed = Signal()
+    result_requested = Signal(object)
+    focus_requested = Signal(object)
 
     def __init__(self, state, parent=None):
         super().__init__(parent)
@@ -137,7 +141,9 @@ class MessageCard(QGroupBox):
         self.call_cards = []
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Maximum)
         layout = QVBoxLayout(self)
-        controls = QHBoxLayout()
+        self.controls = QWidget()
+        controls = QHBoxLayout(self.controls)
+        controls.setContentsMargins(0, 0, 0, 0)
         self.badge = QLabel()
         controls.addWidget(self.badge, 1)
         self.up_button = QPushButton('↑')
@@ -150,7 +156,7 @@ class MessageCard(QGroupBox):
         self.remove_button.setAccessibleName('Remove message')
         for button in (self.up_button, self.down_button, self.remove_button):
             controls.addWidget(button)
-        layout.addLayout(controls)
+        layout.addWidget(self.controls)
         if self.role == 'assistant':
             self.context_only = QCheckBox('Context only — do not learn this turn')
             self.context_only.setChecked(not state.get('train', True))
@@ -174,8 +180,8 @@ class MessageCard(QGroupBox):
             self.collapse.setChecked(state.get('collapsed', True))
             layout.addWidget(self.collapse)
         placeholders = {'system': 'Instructions or background for this conversation.',
-            'user': 'Write the request or follow-up question.',
-            'assistant': 'Write the answer to learn. Function calls can be added below.',
+            'user': 'For example: Explain a metaphor to someone new to poetry.',
+            'assistant': 'Write the reply you want Strand to learn. For example: A metaphor describes one thing as another. “Time is a river” suggests it keeps moving forward.',
             'tool': 'Recorded result returned by the function. This text is never executed.'}
         self.content = _text_editor(placeholders[self.role], self.role.title() + ' message text')
         self.content.setPlainText(state.get('content', ''))
@@ -194,10 +200,19 @@ class MessageCard(QGroupBox):
         if self.role == 'assistant':
             self.calls_layout = QVBoxLayout()
             layout.addLayout(self.calls_layout)
-            _button('Add function call', self.add_call, layout)
+            self.add_call_button = _button('Add function call', self.add_call, layout)
             for call in state.get('tool_calls', []):
                 self.add_call(call)
         self.update_badge()
+
+    def set_advanced(self, advanced):
+        has_details = self.role not in ('user', 'assistant') or bool(self.call_cards)
+        if self.role == 'assistant':
+            has_details = has_details or self.context_only.isChecked()
+            self.context_only.setVisible(advanced or has_details)
+            self.add_call_button.setVisible(advanced or has_details)
+        self.controls.setVisible(advanced or has_details)
+        self.content.setMaximumHeight(150 if advanced or has_details else 90)
 
     def update_badge(self, *_):
         learned = self.role == 'assistant' and not self.context_only.isChecked()
@@ -218,7 +233,10 @@ class MessageCard(QGroupBox):
         self.calls_layout.addWidget(call)
         call.changed.connect(self.changed)
         call.remove_button.clicked.connect(lambda: self.remove_call(call))
+        call.result_button.clicked.connect(lambda: self.result_requested.emit(call))
         self.changed.emit()
+        if not isinstance(state, dict):
+            self.focus_requested.emit(call.name)
         return call
 
     def remove_call(self, call):
@@ -262,15 +280,52 @@ class ConversationEditor(QWidget):
         self._loading = False
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        toolbar = QHBoxLayout()
+        self.example_button = QPushButton('Show an example')
+        self.example_button.setCheckable(True)
+        self.example_help = QDialog(self)
+        self.example_help.setWindowTitle('An example of clear, helpful teaching')
+        self.example_help.resize(500, 260)
+        example_layout = QVBoxLayout(self.example_help)
+        example = QLabel('You say: Explain a metaphor to someone new to poetry.\n\n'
+            'Strand should respond: A metaphor describes one thing as another. '
+            '“Time is a river” suggests it keeps moving forward.\n\n'
+            'You write both the request and the reply you want Strand to learn. '
+            'Use your own wording in your example. Strand does not answer in the teaching editor.')
+        example.setWordWrap(True)
+        example.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        example.setAlignment(Qt.AlignmentFlag.AlignTop)
+        help_scroll = QScrollArea()
+        help_scroll.setWidgetResizable(True)
+        help_scroll.setFrameShape(QScrollArea.Shape.NoFrame)
+        help_scroll.setWidget(example)
+        example_layout.addWidget(help_scroll, 1)
+        close = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        close.rejected.connect(self.example_help.reject)
+        example_layout.addWidget(close)
+        self.example_help.finished.connect(lambda _: self.example_button.setChecked(False))
+        self.example_help.hide()
+        self.example_button.toggled.connect(self.example_help.setVisible)
+        options = QHBoxLayout()
+        self.more_options = QCheckBox('More conversation options')
+        self.more_options.setToolTip('Add individual messages, instructions, context-only turns and recorded function calls.')
+        self.more_options.toggled.connect(self._apply_options)
+        options.addWidget(self.more_options)
+        options.addStretch()
+        options.addWidget(self.example_button)
+        self.followup_button = _button('Add a follow-up', self.add_followup, options)
+        layout.addLayout(options)
+        self.advanced_toolbar = QWidget()
+        toolbar = QHBoxLayout(self.advanced_toolbar)
+        toolbar.setContentsMargins(0, 0, 0, 0)
         self.new_role = QComboBox()
-        for role in ('user', 'assistant', 'tool', 'system'):
-            self.new_role.addItem(role.title(), role)
+        for label, role in (('You say', 'user'), ('Strand should respond', 'assistant'),
+                            ('Tool result', 'tool'), ('System instructions', 'system')):
+            self.new_role.addItem(label, role)
         self.new_role.setAccessibleName('Role for new conversation message')
         toolbar.addWidget(self.new_role)
         _button('Add message', lambda: self.add_message(self.new_role.currentData()), toolbar)
         toolbar.addStretch()
-        layout.addLayout(toolbar)
+        layout.addWidget(self.advanced_toolbar)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         page = QWidget()
@@ -322,6 +377,9 @@ class ConversationEditor(QWidget):
                 self._add_message_state(message)
             for tool in state.get('tools', []):
                 self._add_tool_state(tool)
+            advanced = (self._has_technical_data() or len(self.cards) != 2
+                        or [card.role for card in self.cards] != ['user', 'assistant'])
+            self.more_options.setChecked(advanced)
             self._update_cards()
         finally:
             self._loading = False
@@ -332,22 +390,61 @@ class ConversationEditor(QWidget):
             raise ValueError('Choose system, user, assistant or tool for a message')
         state = self._message_state(message) if message else {'role': role, 'content': ''}
         if role == 'tool' and not message:
+            state['collapsed'] = False
             used = {card.tool_call_id.currentText() for card in self.cards if card.role == 'tool'}
             state['tool_call_id'] = next((call.call_id.text() for card in self.cards
                 for call in card.call_cards if call.call_id.text() not in used), '')
-        card = self._add_message_state(state)
+        card = self._add_message_state(state, index=0 if role == 'system' else None)
         self._edited()
+        self._focus_field(card.content)
         return card
 
-    def _add_message_state(self, state):
+    def add_followup(self):
+        # Persist only the complete pair so autosave never records half an action.
+        user = self._add_message_state({'role': 'user', 'content': ''})
+        self._add_message_state({'role': 'assistant', 'content': ''})
+        self._edited()
+        self._focus_field(user.content)
+
+    def _focus_field(self, field):
+        def reveal():
+            field.setFocus(Qt.FocusReason.OtherFocusReason)
+            self.scroll.ensureWidgetVisible(field, 0, 12)
+        QTimer.singleShot(0, field, reveal)
+
+    def _add_message_state(self, state, index=None):
         card = MessageCard(state, self)
-        self.cards.append(card)
-        self.messages_layout.insertWidget(len(self.cards) - 1, card)
+        index = len(self.cards) if index is None else index
+        self.cards.insert(index, card)
+        self.messages_layout.insertWidget(index, card)
         card.changed.connect(self._edited)
+        card.result_requested.connect(lambda call: self.add_result(card, call))
+        card.focus_requested.connect(self._focus_field)
         card.remove_button.clicked.connect(lambda: self.remove_message(card))
         card.up_button.clicked.connect(lambda: self.move_message(card, -1))
         card.down_button.clicked.connect(lambda: self.move_message(card, 1))
         return card
+
+    def add_result(self, assistant, call):
+        ident = call.call_id.text()
+        for card in self.cards:
+            if card.role == 'tool' and card.tool_call_id.currentText() == ident:
+                card.collapse.setChecked(False)
+                self._focus_field(card.content)
+                return card
+        # Put new results in call order, ahead of any existing final reply.
+        order = [item.call_id.text() for item in assistant.call_cards]
+        index = self.cards.index(assistant) + 1
+        while index < len(self.cards) and self.cards[index].role == 'tool':
+            other = self.cards[index].tool_call_id.currentText()
+            if other not in order or order.index(other) > order.index(ident):
+                break
+            index += 1
+        result = self._add_message_state({'role': 'tool', 'tool_call_id': ident,
+                                         'content': '', 'collapsed': False}, index=index)
+        self._edited()
+        self._focus_field(result.content)
+        return result
 
     def remove_message(self, card):
         self.cards.remove(card)
@@ -368,6 +465,7 @@ class ConversationEditor(QWidget):
     def add_tool(self, definition=None):
         card = self._add_tool_state(self._tool_state(definition) if definition else {})
         self._edited()
+        self._focus_field(card.name)
         return card
 
     def _add_tool_state(self, state):
@@ -388,7 +486,9 @@ class ConversationEditor(QWidget):
         # Keep even invalid/renamed IDs editable instead of silently relinking results.
         call_ids = [call.call_id.text() for card in self.cards for call in card.call_cards]
         for index, card in enumerate(self.cards):
-            card.setTitle(f'{index + 1}. {card.role.title()}')
+            title = {'user': 'You say', 'assistant': 'Strand should respond',
+                     'system': 'System instructions', 'tool': 'Tool result'}[card.role]
+            card.setTitle((f'{index + 1}. ' if len(self.cards) > 2 else '') + title)
             card.up_button.setEnabled(index > 0)
             card.down_button.setEnabled(index < len(self.cards) - 1)
             if card.role == 'tool':
@@ -399,10 +499,25 @@ class ConversationEditor(QWidget):
                 selector.addItems(call_ids)
                 selector.setCurrentText(selected)
                 selector.blockSignals(False)
+        self._apply_options()
+
+    def _has_technical_data(self):
+        return bool(self.tool_cards) or any(card.role not in ('user', 'assistant')
+            or card.call_cards or (card.role == 'assistant' and card.context_only.isChecked())
+            for card in self.cards)
+
+    def _apply_options(self, *_):
+        advanced = self.more_options.isChecked()
+        self.advanced_toolbar.setVisible(advanced)
+        self.tools_group.setVisible(advanced or bool(self.tool_cards))
+        for card in self.cards:
+            card.set_advanced(advanced)
 
     def _edited(self, *_):
         if self._loading:
             return
+        if self._has_technical_data():
+            self.more_options.setChecked(True)
         self._update_cards()
         self.changed.emit()
 

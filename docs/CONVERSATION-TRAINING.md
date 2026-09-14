@@ -1,10 +1,29 @@
 # Teaching Strand with conversations
 
-Improve → Examples now edits a complete text conversation. Start with the two
-cards for a user request and the desired assistant answer. Add messages for
-follow-up questions, assistant answers, function calls and recorded tool results.
-Use the arrows to reorder messages. A tool result starts collapsed; expand it to
-edit the full text. Available function definitions are editable below the messages.
+Open **Improve → 1. Examples**. Write the request in **You say** and the answer
+you want Strand to learn in **Strand should respond**. You write both sides;
+this is an example editor, so Strand does not answer here. **Show an example**
+opens a read-only illustration and leaves your work intact.
+
+Start with one exchange. For example, ask for a beginner's explanation of a
+metaphor, then write a short definition with an everyday example as the desired
+answer. Leave **Use this to teach Strand** selected and choose **Save and approve**
+when you have reviewed it. **Save draft** keeps it unapproved.
+
+Before training, create and approve a different example with **Use this to test
+Strand** selected. This comparison example is *held out*: it tests the result
+and is never used to train. Choose **Next: set up training →** to continue.
+The [training guide](FINE-TUNING.md#try-a-first-lesson) gives a complete first lesson.
+
+## Build a longer conversation
+
+**Add a follow-up** adds a new **You say** and **Strand should respond** pair.
+Use **More conversation options** for individual messages, system instructions,
+background-only assistant turns and recorded tools. The arrows reorder messages.
+A newly added empty tool result opens for editing. Saved results load collapsed
+unless your draft retained an expanded view; expand one to read or edit its full
+text. Available function definitions appear below the messages when those
+options are shown.
 
 An assistant card marked **Learn this turn** contributes training targets,
 including its function calls. Select **Context only — do not learn this turn**
@@ -14,7 +33,7 @@ results provide context and never contribute target tokens. At least one
 assistant turn must be a teaching target. The same selection determines held-out
 loss for conversations kept for comparison.
 
-Save, review, then approve the example. Changing a message, its position, a call,
+Review the conversation and choose **Save and approve**. Changing a message, its position, a call,
 a result, a tool definition, a target checkbox or the teaching/comparison split
 revokes approval. An unfinished edit remains a draft, including incomplete JSON
 arguments and schemas, when switching examples or restarting. Collapsing a result
@@ -22,11 +41,15 @@ does not change the example. Approval never starts training by itself.
 
 ## Tool exchanges
 
-Add an available function with its name, description and JSON parameter schema.
+Open **More conversation options** and add an available function with its name,
+description and JSON parameter schema.
 On an assistant card, add a function call, select/write its function name and
-supply its arguments as a JSON object. Each call has an editable ID. Add a tool
-message and select that ID in **Result for call ID**. Its body is the recorded
-result, including an error result if that is the example you want to teach.
+supply its arguments as a JSON object. Choose **Add or edit result** on the call
+to open its linked result. A new result is inserted in call order before the
+following reply. Write the recorded result, including an error result if that
+is the example you want to teach. For manual editing, each call has an editable
+ID; add a **Tool result** message under **More conversation options** and select
+that ID in **Result for call ID**.
 
 Multiple calls in one assistant message are supported. Each call needs exactly
 one result, linked by ID, before the conversation continues. Results can arrive
@@ -100,8 +123,24 @@ for complete recorded tool conversations.
 
 ## Preparation and real training
 
-Use **Prepare and train → Check preparation** with the matching local original
-model and tokenizer. The model family restrictions remain those in the
+In **2. Set up and train**, review the approved teaching/comparison counts and
+the selected model and tools. At least one approved example of each use is
+required. The basic location fields open when a required location is missing;
+they are separate from optional CPU/GPU and memory settings.
+
+Select the **Original model folder** with its safetensors weights and tokenizer,
+the **Matching chat model** GGUF, the **Training environment** Python executable
+and the **Conversion tools folder** containing the llama.cpp source scripts.
+The [setup guide](FINE-TUNING.md#set-up-and-train) explains these fields. **Create
+matching chat model** is available for the supported Gemma path only.
+
+Choose **Check setup** to validate these files and the full examples without
+training. A failed check shows its reason; **Show full check details** provides
+the technical details. After a successful check, select the review checkbox to
+enable **Train a trial version**. Training rechecks setup before starting, and
+edits to examples or settings require another check.
+
+The model family restrictions remain those in the
 [training guide](FINE-TUNING.md): text-only Llama and the supported Gemma 4
 E2B/E4B path. Training dependencies and model files are separate from the desktop
 application. No model download is performed when a run starts.

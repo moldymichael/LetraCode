@@ -60,7 +60,8 @@ def test_busy_chat_disables_training_start_and_preserves_example_draft(tmp_path)
     assert not window.learn_button.isEnabled()
     window.set_busy(False)
     assert panel.prompt.toPlainText() == 'Draft prompt'
-    assert panel.start_button.isEnabled()
+    assert panel.check_button.isEnabled()
+    assert not panel.start_button.isEnabled()  # Still needs a successful setup check.
     window.close()
 
 

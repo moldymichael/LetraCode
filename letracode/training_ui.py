@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog
 from .training import TrainingConfig, TrainingRepository
 from .training_conversation_ui import ConversationEditor
 from .training_examples import normalize_example
-from .training_worker import ActivationWorker, TrainingWorker
+from .training_worker import ActivationWorker, TrainingWorker, training_model_family
 from .training_experience import (ExperienceWorker, check_readiness, compare_version,
     can_retry_conversion, converted_artifact_state,
     discover_configuration, effective_report, examples_fingerprint, prepare_matching_model, retry_conversion,
@@ -51,7 +51,7 @@ class FineTuningPanel(QWidget):
         heading = QLabel('Help Strand improve')
         font = heading.font(); font.setPointSizeF(font.pointSizeF() + 4); font.setBold(True)
         heading.setFont(font); layout.addWidget(heading)
-        intro = QLabel('Show Strand a good answer. Build a candidate from your reviewed examples, compare it with Strand, then choose which version to use. Saved examples and training never change your current assistant by themselves.')
+        intro = QLabel('Write examples of how you want Strand to respond. Train a trial version, compare its answers, then decide whether to use it.')
         intro.setWordWrap(True); layout.addWidget(intro)
         self.tabs = QTabWidget(); layout.addWidget(self.tabs, 1)
         self._examples_tab()
@@ -81,48 +81,62 @@ class FineTuningPanel(QWidget):
 
     def _examples_tab(self):
         page = QWidget(); outer = QVBoxLayout(page)
-        hint = QLabel('Review the complete conversation in order. Assistant turns marked Learn are teaching targets; other messages provide context. Keep different conversations for comparison. New and edited examples need your approval.')
+        hint = QLabel('You write both sides: what someone asks, and the response you want Strand to learn. Start with one exchange. Saving an example does not start training.')
         hint.setWordWrap(True); outer.addWidget(hint)
         body = QSplitter(); outer.addWidget(body, 1)
+        sidebar = QWidget(); sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 0, 0, 0)
+        sidebar_layout.addWidget(QLabel('Your saved examples'))
+        self.examples_empty = QLabel('Your examples will appear here. Write your first one on the right.')
+        self.examples_empty.setWordWrap(True); sidebar_layout.addWidget(self.examples_empty)
         self.examples_list = QListWidget(); self.examples_list.currentItemChanged.connect(self.select_example)
-        body.addWidget(self.examples_list)
+        sidebar_layout.addWidget(self.examples_list, 1); body.addWidget(sidebar)
         editor = QWidget(); form = QVBoxLayout(editor)
         self.conversation = ConversationEditor()
         # Compatibility accessors below still expose the simple pair text widgets.
         self._empty_prompt = QPlainTextEdit(self); self._empty_prompt.hide()
         self._empty_response = QPlainTextEdit(self); self._empty_response.hide()
         form.addWidget(self.conversation, 1)
-        self.split = QComboBox(); self.split.addItem('Teach this conversation', 'train'); self.split.addItem('Keep for comparison', 'eval')
+        self.split = QComboBox(); self.split.addItem('Use this to teach Strand', 'train'); self.split.addItem('Use this to test Strand', 'eval')
+        self.split.setAccessibleName('How to use this example')
         form.addWidget(self.split)
+        self.example_use_hint = QLabel(); self.example_use_hint.setWordWrap(True)
+        form.addWidget(self.example_use_hint)
+        self.example_status = QLabel(); self.example_status.setTextFormat(Qt.TextFormat.PlainText)
+        form.addWidget(self.example_status)
         row = QHBoxLayout()
-        self._button('New example', self.new_example, row)
-        self._button('Save draft', self.save_example, row)
-        self._button('Approve example', self.approve_example, row)
+        self.new_example_button = self._button('New example', self.new_example, row)
+        self.save_example_button = self._button('Save draft', self.save_example, row)
+        self.approve_example_button = self._button('Save and approve', self.approve_example, row)
+        font = self.approve_example_button.font(); font.setBold(True); self.approve_example_button.setFont(font)
+        self.approve_example_button.setToolTip('Save your edits and include this example in the selected teaching or comparison set. Training starts separately.')
         self._button('Delete', self.delete_example, row)
         form.addLayout(row); body.addWidget(editor); body.setSizes([280, 650])
         actions = QHBoxLayout()
         self._button('Import JSONL…', self.import_examples, actions)
         self._button('Export examples…', self.export_examples, actions)
         actions.addStretch(); self.counts = QLabel(); actions.addWidget(self.counts)
-        outer.addLayout(actions); self.tabs.addTab(page, 'Examples')
+        self.continue_button = self._button('Next: set up training →', lambda: self.tabs.setCurrentIndex(1), actions)
+        outer.addLayout(actions); self.tabs.addTab(page, '1. Examples')
 
     def _training_tab(self):
         page = QWidget(); form = QVBoxLayout(page)
-        help_text = QLabel('Start with Check preparation. It checks whether your model and training tools are ready, and tells you how to fix anything missing. Strand keeps your current version until you compare answers and choose a candidate.')
+        help_text = QLabel('Training makes a trial version of Strand from your approved examples. Your current Strand stays in use until you compare the answers and choose the new version.')
         help_text.setWordWrap(True); form.addWidget(help_text)
-        self.readiness = QLabel('Not checked yet. You can save and review examples at any time.')
-        self.readiness.setTextFormat(Qt.TextFormat.PlainText)
-        self.readiness.setWordWrap(True); form.addWidget(self.readiness)
-        preparation = QHBoxLayout()
-        self.check_button = self._button('Check preparation', self.check_preparation, preparation)
-        self.prepare_button = self._button('Prepare matching model', self.prepare_model, preparation)
-        form.addLayout(preparation)
-        self.details_toggle = QCheckBox('Show preparation details and advanced settings')
-        form.addWidget(self.details_toggle)
-        self.advanced = QWidget(); advanced_layout = QVBoxLayout(self.advanced)
-        advanced_layout.setContentsMargins(0, 0, 0, 0)
-        self.details_toggle.toggled.connect(self.advanced.setVisible)
-        self.advanced.hide()
+        examples = QGroupBox('Your examples'); examples_layout = QVBoxLayout(examples)
+        self.setup_examples = QLabel(); self.setup_examples.setWordWrap(True)
+        examples_layout.addWidget(self.setup_examples)
+        row = QHBoxLayout()
+        self.review_examples_button = self._button('Review examples', lambda: self.tabs.setCurrentIndex(0), row)
+        row.addStretch(); examples_layout.addLayout(row); form.addWidget(examples)
+        files = QGroupBox('Model and tools · set up once'); files_layout = QVBoxLayout(files)
+        self.setup_summary = QLabel(); self.setup_summary.setTextFormat(Qt.TextFormat.PlainText)
+        self.setup_summary.setWordWrap(True); files_layout.addWidget(self.setup_summary)
+        self.locations_toggle = QCheckBox('Choose or change model and tool locations')
+        files_layout.addWidget(self.locations_toggle)
+        self.setup_locations = QWidget(); locations_layout = QVBoxLayout(self.setup_locations)
+        locations_layout.setContentsMargins(0, 0, 0, 0)
+        self.locations_toggle.toggled.connect(self.setup_locations.setVisible)
         paths = QFormLayout(); self.fields = {}
         saved = discover_configuration(self.store, self.main_window.engine_config)
         if not isinstance(saved, dict):
@@ -134,34 +148,54 @@ class FineTuningPanel(QWidget):
         training_python = Path.home() / '.local/share/letracode-training-qlora/bin/python'
         if not saved.get('python_executable') and training_python.is_file():
             defaults['python_executable'] = str(training_python)
-        self.profile = QComboBox()
-        self.profile.addItem('Llama / current custom settings', 'custom')
-        self.profile.addItem('Gemma 4 E2B · first target for 8 GB', 'gemma4-e2b')
-        self.profile.addItem('Gemma 4 E4B · experimental', 'gemma4-e4b')
-        self.profile.setToolTip('Apply starting memory settings without changing model paths, epochs or learning rate. The selected model folder determines the architecture.')
-        paths.addRow('Starting settings', self.profile)
-        method = QComboBox()
-        method.addItem('4-bit QLoRA (NVIDIA GPU)', 'qlora')
-        method.addItem('LoRA (full precision)', 'lora')
-        method.setCurrentIndex(method.findData(saved.get('training_method', defaults['training_method'])))
-        self.fields['training_method'] = method
-        paths.addRow('Training method', method)
-        for name, label, kind in (
-            ('python_executable', 'Training Python', 'python'),
-            ('base_model', 'Training model folder', 'directory'),
-            ('base_gguf', 'Matching chat GGUF (for adoption)', 'gguf'),
-            ('llama_cpp_dir', 'llama.cpp source folder (for conversion)', 'directory')):
+        for name, label, kind, help_text in (
+            ('base_model', 'Original model folder', 'directory', 'Folder containing the original .safetensors weights and tokenizer. A chat .gguf file alone cannot be trained.'),
+            ('base_gguf', 'Matching chat model', 'gguf', 'The .gguf made from those same original weights. Used to try the trained version in Chat.'),
+            ('python_executable', 'Training environment', 'python', 'The Python program with the training packages installed. Reuse the detected environment if you have one.'),
+            ('llama_cpp_dir', 'Conversion tools folder', 'directory', 'The llama.cpp source folder containing its Python conversion scripts. The chat engine program alone is not enough.')):
             value = saved.get(name, defaults.get(name, ''))
             if name == 'python_executable' and not value:
                 value = defaults[name]
             field = QLineEdit(str(value)); self.fields[name] = field
-            row = QWidget(); horizontal = QHBoxLayout(row); horizontal.setContentsMargins(0, 0, 0, 0)
+            field.setAccessibleName(label)
+            field.setPlaceholderText('Choose ' + label.lower() + '…')
+            container = QWidget(); vertical = QVBoxLayout(container); vertical.setContentsMargins(0, 0, 0, 0)
+            horizontal = QHBoxLayout()
             horizontal.addWidget(field)
-            button = QPushButton('Browse…'); horizontal.addWidget(button)
+            button = QPushButton('Choose…'); button.setAccessibleName('Choose ' + label.lower()); horizontal.addWidget(button)
             button.clicked.connect(lambda _=False, f=field, k=kind: self.browse(f, k))
-            paths.addRow(label, row)
-        advanced_layout.addLayout(paths)
+            vertical.addLayout(horizontal)
+            hint = QLabel(help_text); hint.setWordWrap(True); vertical.addWidget(hint)
+            paths.addRow(label, container)
+        locations_layout.addLayout(paths)
+        guide = QPushButton('Help finding these files'); guide.clicked.connect(self.open_training_guide)
+        locations_layout.addWidget(guide)
+        files_layout.addWidget(self.setup_locations)
+        self.locations_toggle.setChecked(any(not str(saved.get(key, defaults.get(key, ''))).strip()
+            for key in ('base_model', 'base_gguf', 'python_executable', 'llama_cpp_dir')))
+        self.setup_locations.setVisible(self.locations_toggle.isChecked())
+        self.prepare_button = QPushButton('Create matching chat model'); self.prepare_button.clicked.connect(self.prepare_model)
+        self.prepare_button.setToolTip('For Gemma 4: convert the selected original weights into a matching chat file. This can take a while and does not train Strand.')
+        files_layout.addWidget(self.prepare_button)
+        form.addWidget(files)
+        self.details_toggle = QCheckBox('Adjust training settings (optional)')
+        form.addWidget(self.details_toggle)
+        self.advanced = QWidget(); advanced_layout = QVBoxLayout(self.advanced)
+        advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.details_toggle.toggled.connect(self.advanced.setVisible); self.advanced.hide()
         advanced = QGroupBox('Advanced training settings'); settings = QFormLayout(advanced)
+        self.profile = QComboBox()
+        self.profile.addItem('Keep current settings', 'custom')
+        self.profile.addItem('Gemma 4 E2B · small memory preset', 'gemma4-e2b')
+        self.profile.addItem('Gemma 4 E4B · experimental preset', 'gemma4-e4b')
+        self.profile.setToolTip('Changes memory settings only. Choose the actual model using Original model folder above.')
+        settings.addRow('Memory preset', self.profile)
+        method = QComboBox()
+        method.addItem('NVIDIA GPU · use less memory (QLoRA)', 'qlora')
+        method.addItem('CPU or GPU · full precision (LoRA)', 'lora')
+        method.setCurrentIndex(method.findData(saved.get('training_method', defaults['training_method'])))
+        self.fields['training_method'] = method
+        settings.addRow('Training method', method)
         for name, label, low, high in (('epochs', 'Passes through training data', 1, 100),
                                      ('rank', 'LoRA rank', 1, 256),
                                      ('max_length', 'Maximum example length (tokens)', 32, 8192),
@@ -195,27 +229,38 @@ class FineTuningPanel(QWidget):
         self.fields['gradient_accumulation_steps'].valueChanged.connect(self.update_effective_batch)
         self.profile.currentIndexChanged.connect(self.apply_profile)
         advanced_layout.addWidget(advanced)
-        gemma_hint = QLabel('Supported training: original text-only Llama and Gemma 4 E2B/E4B weights. Gemma uses CUDA QLoRA with frozen per-layer embeddings in system RAM. Example length and available memory determine capacity; the preparation check counts every example without truncating it. Start conservatively. Historical hardware measurements are in Help → Training guide.')
+        gemma_hint = QLabel('Start with the saved settings. Longer conversations need a higher example-length limit and more memory. If an example is too long, the setup check asks you to fix it; it never cuts off the conversation. Gemma 4 requires NVIDIA GPU training.')
         gemma_hint.setWordWrap(True); advanced_layout.addWidget(gemma_hint)
         form.addWidget(self.advanced)
-        technical_note = QLabel('Conversion needs the selected llama.cpp checkout’s Python dependencies in the training environment. QLoRA is an optimization method; held-out loss is supporting evidence rather than a guarantee of better answers.')
-        technical_note.setWordWrap(True); advanced_layout.addWidget(technical_note)
+        start = QGroupBox('Check, then train'); start_layout = QVBoxLayout(start)
+        self.readiness = QLabel('Next: choose your files and approve at least one teaching example and one different comparison example. Then check setup.')
+        self.readiness.setTextFormat(Qt.TextFormat.PlainText)
+        self.readiness.setWordWrap(True); start_layout.addWidget(self.readiness)
+        self.check_button = QPushButton('Check setup'); self.check_button.clicked.connect(self.check_preparation)
+        self.check_button.setToolTip('Checks the selected files, training packages and complete examples. This does not start training.')
+        start_layout.addWidget(self.check_button)
+        self.diagnostics_toggle = QCheckBox('Show full check details')
+        start_layout.addWidget(self.diagnostics_toggle)
         self.preparation_diagnostics = QLabel()
         self.preparation_diagnostics.setTextFormat(Qt.TextFormat.PlainText)
-        self.preparation_diagnostics.setWordWrap(True); advanced_layout.addWidget(self.preparation_diagnostics)
-        warning = QLabel('Only your approved examples are used. Larger models and longer examples need more memory. Training may improve some answers and worsen others, so compare them before choosing a version. Nothing is downloaded during preparation or training.')
-        warning.setWordWrap(True); form.addWidget(warning)
-        self.review_check = QCheckBox('Use my approved teaching and comparison examples for this candidate')
-        form.addWidget(self.review_check)
-        self.start_button = QPushButton('Check preparation and train'); self.start_button.clicked.connect(self.start_training)
-        self.start_button.setToolTip('Checks preparation first. Training starts only after those checks pass and uses your approved examples.')
-        form.addWidget(self.start_button); form.addStretch()
+        self.preparation_diagnostics.setWordWrap(True); start_layout.addWidget(self.preparation_diagnostics)
+        self.preparation_diagnostics.hide()
+        self.diagnostics_toggle.toggled.connect(self.preparation_diagnostics.setVisible)
+        self.review_check = QCheckBox('I have reviewed the approved examples shown above')
+        self.review_check.toggled.connect(lambda _: self.update_controls())
+        start_layout.addWidget(self.review_check)
+        self.start_button = QPushButton('Train a trial version'); self.start_button.clicked.connect(self.start_training)
+        start_layout.addWidget(self.start_button)
+        note = QLabel('Strand learns the selected assistant replies and tool calls. User messages, tool results and background-only replies provide context. Recorded tools are never run.')
+        note.setWordWrap(True); start_layout.addWidget(note)
+        form.addWidget(start); form.addStretch()
         scroll = QScrollArea(); scroll.setWidgetResizable(True); scroll.setWidget(page)
-        self.training_form = page; self.tabs.addTab(scroll, 'Prepare and train')
+        self.training_form = page; self.tabs.addTab(scroll, '2. Set up and train')
+        self.update_setup_summary()
 
     def _versions_tab(self):
         page = QWidget(); layout = QVBoxLayout(page)
-        self.stage = QLabel('No candidates yet. Start in Examples, then use Prepare and train to build one.'); self.stage.setWordWrap(True)
+        self.stage = QLabel('No trial versions yet. Add examples, then use Set up and train to make one.'); self.stage.setWordWrap(True)
         layout.addWidget(self.stage)
         split = QSplitter()
         self.runs_list = QListWidget(); self.runs_list.currentItemChanged.connect(self.select_run)
@@ -247,7 +292,40 @@ class FineTuningPanel(QWidget):
         layout.addWidget(self.report_toggle)
         note = QLabel('Compare answers for correctness, useful detail and style. Keep worse or mixed results in your review too. Scores in the technical report are supporting evidence. Previous versions are kept so you can restore one.')
         note.setWordWrap(True); layout.addWidget(note)
-        self.tabs.addTab(page, 'Compare and choose')
+        self.tabs.addTab(page, '3. Compare and choose')
+
+    def open_training_guide(self):
+        self.main_window.show_guide('FINE-TUNING.md', 'Training setup guide')
+
+    def update_setup_summary(self):
+        labels = (('base_model', 'Original model'), ('base_gguf', 'Chat model'),
+                  ('python_executable', 'Training environment'), ('llama_cpp_dir', 'Conversion tools'))
+        summary = []
+        for key, label in labels:
+            value = self.fields[key].text().strip()
+            path = Path(value).expanduser() if value else None
+            name = path.name if path else 'Choose a file or folder below'
+            if path and key == 'python_executable':
+                name = path.parent.parent.name if path.parent.name in ('bin', 'Scripts') else path.name
+            if path and not path.exists():
+                name += ' · not found'
+            summary.append(f'{label}: {name}')
+        device = 'NVIDIA GPU' if self.fields['device'].currentText() == 'cuda' else 'CPU'
+        summary.append(f'Training will use: {device}. Check setup to verify compatibility and example sizes.')
+        self.setup_summary.setText('\n'.join(summary))
+        try:
+            gemma = training_model_family({'base_model': self.fields['base_model'].text().strip()}) == 'gemma4'
+        except (OSError, ValueError):
+            gemma = False
+        self.prepare_button.setVisible(gemma)
+
+    def invalidate_preparation(self, message):
+        self._readiness_result = None
+        self._train_after_check = False
+        self.review_check.setChecked(False)
+        self.readiness.setText(message)
+        self.preparation_diagnostics.clear()
+        self.update_controls()
 
     def browse(self, field, kind):
         if kind == 'directory':
@@ -339,9 +417,26 @@ class FineTuningPanel(QWidget):
             if key == self._editor_key:
                 self.examples_list.setCurrentItem(item)
         self.examples_list.blockSignals(False)
+        self.examples_empty.setVisible(self.examples_list.count() == 0)
         training = sum(row['approved'] and row['split'] == 'train' for row in rows)
         evaluation = sum(row['approved'] and row['split'] == 'eval' for row in rows)
         self.counts.setText(f'Approved: {training} teaching · {evaluation} comparison')
+        self.example_use_hint.setText('Strand will learn the replies and calls marked Learn this turn.' if self.split.currentData() == 'train' and self.conversation._has_technical_data()
+            else 'Strand will learn the response you write.' if self.split.currentData() == 'train'
+            else 'This checks the trial version against an example it has not trained on.')
+        current = next((row for row in rows if row['id'] == self.example_id), None)
+        self.example_status.setText(('Approved for ' + ('teaching' if current['split'] == 'train' else 'comparison')
+            if current and current['approved'] else 'Draft · save and approve when the conversation is ready'))
+        self.setup_examples.setText(f'{training} teaching · {evaluation} comparison approved\n' +
+            ('Add at least one teaching example and one different comparison example before training.' if not training or not evaluation
+             else 'Teaching examples teach the responses you want. Comparison examples test the result and are not trained on.'))
+        if self._readiness_result and self._readiness_result.get('ready'):
+            try:
+                fingerprint = examples_fingerprint(self.repository)
+            except ValueError:
+                fingerprint = None
+            if self._readiness_result.get('examples_fingerprint') != fingerprint:
+                self.invalidate_preparation('Approved examples changed. Check setup again to use the updated selection.')
 
     def select_example(self, current, previous=None):
         if current is None:
@@ -397,7 +492,8 @@ class FineTuningPanel(QWidget):
             try:
                 self.repository.save_example(messages=row['messages'], tools=row['tools'], split=row['split'],
                     approved=True, source=row['source'], example_id=row['id'])
-                self.refresh_examples(); self.progress.setText('Example approved for its selected use.')
+                self.refresh_examples()
+                self.progress.setText('Saved and approved. Add another example, or continue to Set up and train. Training has not started.')
             except ValueError as error:
                 self.error(error)
 
@@ -442,9 +538,8 @@ class FineTuningPanel(QWidget):
     def persist_configuration(self, *_):
         # Keep incomplete setup too; paths are validated only when a run starts.
         self.store.set_setting('training_config', dataclasses.asdict(self.configuration()))
-        self._readiness_result = None
-        if hasattr(self, 'readiness'):
-            self.readiness.setText('Preparation changed. Check it before training; your current Strand is unchanged.')
+        self.update_setup_summary()
+        self.invalidate_preparation('Settings changed. Check setup again before training.')
 
     def training_method_changed(self, *_):
         qlora = self.fields['training_method'].currentData() == 'qlora'
@@ -474,8 +569,11 @@ class FineTuningPanel(QWidget):
     def start_training(self):
         if self.job is not None or self.chat_busy:
             return
+        if not self._readiness_result or not self._readiness_result.get('ready'):
+            self.check_preparation()
+            return
         if not self.review_check.isChecked():
-            self.error('Review your approved examples, then select the checkbox to use them for this candidate.')
+            self.progress.setText('Review the example counts above and tick the checkbox before starting training.')
             return
         self.check_preparation(train_after=True)
 
@@ -484,28 +582,39 @@ class FineTuningPanel(QWidget):
             return
         config = self.configuration()
         self._train_after_check = train_after
-        self.readiness.setText('Checking local files, reviewed examples, runtime, token lengths and conversion…')
+        self.readiness.setText('Checking your model files, training tools and complete examples. This may take a few minutes…')
         self.start_experience(lambda cancel, status: check_readiness(self.repository, config, cancel, status),
                               self.preparation_checked)
 
     def preparation_checked(self, result):
+        if result['ready']:
+            try:
+                current = examples_fingerprint(self.repository)
+            except ValueError:
+                current = None
+            if (current != result.get('examples_fingerprint') or
+                    dataclasses.asdict(self.configuration()) != result.get('configuration')):
+                self.invalidate_preparation('Examples or settings changed during the check. Check setup again before training.')
+                self.progress.setText(self.readiness.text())
+                return
         self._readiness_result = result
         self.preparation_diagnostics.setText('\n'.join(check['name'] + ': ' + check['detail'] for check in result['checks']))
-        summary = []
-        for check in result['checks']:
-            detail = check['detail']
-            if not check['ready'] and check['name'] == 'Local training files':
-                detail = 'Finish model setup in preparation details. Help → Training guide explains the required files.'
-            elif not check['ready'] and check['name'] == 'Runtime, tokenizer and conversion tools':
-                detail = 'Training tools or example sizes need attention. Open preparation details for the exact check result.'
-            summary.append(('✓ ' if check['ready'] else '• ') + detail)
-        self.readiness.setText(('Ready for local training' if result['ready'] else 'Preparation needs attention') + '\n' +
-            '\n'.join(summary))
+        failed = [check for check in result['checks'] if not check['ready']]
+        if failed:
+            # Keep the actual failing item visible; full logs remain available separately.
+            summary = '\n\n'.join(check['name'] + ': ' + check['detail'][-1200:] for check in failed)
+            self.readiness.setText('Fix these items, then check setup again:\n' + summary)
+            if any(check['name'] in ('Local training files', 'Chat model compatibility') for check in failed):
+                self.locations_toggle.setChecked(True)
+        else:
+            self.readiness.setText('Setup passed. Review the example counts above, tick the checkbox, then choose Train a trial version. Training will recheck these files and examples before it starts.')
         if not result['ready']:
             self._train_after_check = False
-            self.progress.setText('Finish the listed preparation step, then check again. Your current Strand is unchanged.')
+            self.review_check.setChecked(False)
+            self.progress.setText('Setup needs the changes shown above. Training has not started.')
         else:
-            self.progress.setText('Preparation passed. Memory use is still confirmed during training; your current version stays saved.')
+            self.progress.setText('Setup passed. You can now train a trial version; your current Strand stays saved.')
+        self.update_controls()
 
     def prepare_model(self):
         if self.job is not None or self.chat_busy:
@@ -516,8 +625,8 @@ class FineTuningPanel(QWidget):
 
     def model_prepared(self, result):
         self.fields['base_gguf'].setText(result['base_gguf'])
-        self.readiness.setText('Matching local model prepared. Check preparation to validate your runtime and examples.')
-        self.progress.setText('Matching Chat model and provenance saved. The active Strand model is unchanged.')
+        self.readiness.setText('Matching chat model created. Choose Check setup to verify it with your examples.')
+        self.progress.setText('Chat model created. Training has not started.')
 
     def start_experience(self, operation, callback, *, unload=False):
         if self.job is not None or self.chat_busy:
@@ -547,7 +656,7 @@ class FineTuningPanel(QWidget):
             if (not self._readiness_result or not self._readiness_result.get('ready')
                     or self._readiness_result.get('configuration') != dataclasses.asdict(config)
                     or self._readiness_result.get('examples_fingerprint') != examples_fingerprint(self.repository)):
-                raise ValueError('Examples or preparation changed after the check. Check preparation again before training.')
+                raise ValueError('Examples or settings changed after the check. Check setup again before training.')
             run = self.repository.create_run(config)
             self.store.set_setting('training_config', dataclasses.asdict(config))
         except (OSError, ValueError) as error:
@@ -637,7 +746,7 @@ class FineTuningPanel(QWidget):
             self.show_run(self.repository.run(self.run_id))
         else:
             self.stage.setText('Choose a candidate to see its next step.' if runs else
-                'No candidates yet. Start in Examples, then use Prepare and train to build one.')
+                'No trial versions yet. Add examples, then use Set up and train to make one.')
         self.update_controls()
 
     def select_run(self, current, previous=None):
@@ -843,8 +952,13 @@ class FineTuningPanel(QWidget):
 
     def update_controls(self):
         busy = self.chat_busy or self.job is not None
-        self.start_button.setEnabled(not busy)
-        self.start_button.setText('Train a candidate' if self._readiness_result and self._readiness_result.get('ready') else 'Check preparation and train')
+        ready = bool(self._readiness_result and self._readiness_result.get('ready'))
+        self.start_button.setEnabled(not busy and ready and self.review_check.isChecked())
+        self.start_button.setText('Train a trial version')
+        self.start_button.setToolTip('Check setup first.' if not ready else
+            'Tick the reviewed-examples checkbox above.' if not self.review_check.isChecked() else
+            'Recheck setup, then train using the approved teaching examples. Comparison examples are held out.')
+        self.review_check.setEnabled(not busy and ready)
         self.training_form.setEnabled(not busy)
         self.stop_button.setEnabled(self.job is not None)
         run = self.repository.run(self.run_id) if self.run_id else None
