@@ -6,18 +6,18 @@ character selectors with a generic error, leaving the model to repeat the error
 until the three-stall limit. Incomplete source answers were also retried without
 the application taking the missing reading step itself.
 
-`read_file` now returns exact `next_read_file` arguments containing only `path`,
-`offset`, and `max_chars`. An explicit character offset takes precedence over
+`read_file` returns exact `next_read_file` arguments containing `path`,
+`offset`, `max_chars`, and `scope` when explicitly supplied. An explicit character offset takes precedence over
 leftover line selectors. A line start with a character count is converted using
 the actual source line boundary. Invalid pagination has a distinct error code and
 canonical retry arguments; it supplies no coverage. Missing files, denied reads,
 and unsupported sources remain ordinary failures. BOM, CRLF, Unicode, cut long
 lines, source hashes, and PDF/DOCX extraction provenance retain their meanings.
 
-If the model ends with incomplete ordinary-source coverage, repeats an already
+If the model ends with incomplete required whole-file coverage, repeats an already
 seen source page, or returns invalid pagination (including a batch), the worker
 issues application-generated read calls. It selects the earliest missing
-**exposed** character range of each observed source version. Reading the ending
+**exposed** character range of each required source version. Reading the ending
 first therefore still leaves the opening and middle to recover. Changed versions
 retain separate ranges, and a file shrinking below the old cursor triggers a
 read from a valid starting point.
@@ -31,9 +31,24 @@ model's stall allowance before it can see the fitting page. Older recovery
 boundaries can yield context while the original user request and saved evidence
 remain available. No synthetic user “Continue” messages are added.
 
-Premature final responses remain provisional while a concrete missing source
-page can be recovered. If a tool-free response leaves only failed/untracked
-reads or an unsupported extraction tail, the worker saves it with a **Source
+Search results are evidence passages; their appearance does not require reading
+every matching file. `read_file(scope="passage")` supports focused reading.
+Direct `read_file` calls retain the historical `whole_file` default, and a later
+passage call cannot cancel an existing whole-file requirement. Explicit user
+directions to read named files completely also preserve that requirement when
+the model starts with search or passage reads. Only real user messages can
+change those directions; quoted instructions and source text cannot. The saved
+coverage ledger records all observed passages independently of this reading scope.
+
+Search progress means new returned evidence: a new source/version or added
+character ranges. Reworded queries, reordered hits, changed scores, subsets of
+known hits and empty results do not reset the no-progress counter. The original
+run limits remain unchanged. See the [September 14 continuation investigation
+and real-model verification](CONTINUATION-SCOPE-VERIFICATION.md).
+
+Premature final responses remain provisional while a concrete missing required source
+page can be recovered. If a tool-free response leaves only incidental passages,
+failed/untracked reads or an unsupported extraction tail, the worker saves it with a **Source
 limitation** status and stops automatic continuation. The failure remains in the
 ledger; an alternative successful filename does not erase it. New unrelated
 reads cannot extend this terminal response into another answer cycle. Final

@@ -436,12 +436,14 @@ def evidence_state(rows, origin_user_id):
             'scope': 'Observed ordinary source results only; system excerpts and inventory are untracked.'}
 
 
-def summary(state, max_files=8):
+def summary(state, max_files=8, *, required_paths=None):
     """Small coverage guidance with source IDs; never an understanding claim."""
     _int(max_files, 'summary file limit')
     if max_files > MAX_FILES:
         raise ValueError('Source summary exceeds the 128-file limit.')
     files = state['files']
+    if required_paths is not None:
+        files = sorted(files, key=lambda file: (file['path'] not in required_paths, file['path']))
     complete = sum(file['complete_supported_text'] for file in files)
     text = (f'Ordinary read coverage: {complete}/{len(files)} observed files have complete supported-text exposure. '
             'This does not verify whole-work scope, understanding, or task completion. '
@@ -459,6 +461,8 @@ def summary(state, max_files=8):
             path = path[:187] + '...'
         line = (f"{path}; version {file['source_sha256'][:12]}/{file['extractor_version'][:60]}; "
                 f"missing {gaps}; saved source result IDs {file['source_result_ids'][-6:]}"
+                + (('; whole-file reading required' if file['path'] in required_paths else '; passage evidence only')
+                   if required_paths is not None else '')
                 + ('; extraction truncated' if file['source_truncated'] else '') + '\n')
         if len(text) + len(line) > 2300:
             break
@@ -467,5 +471,8 @@ def summary(state, max_files=8):
     if shown < len(files):
         text += f'{len(files) - shown} files omitted from this summary; full ranges remain in the ledger.\n'
     if state['incomplete']:
-        text += 'Coverage remains incomplete or untracked. Recover saved results or read missing source pages; do not claim complete inspection.'
+        text += ('Coverage remains incomplete or untracked; do not claim complete inspection. '
+                 + ('Complete only required whole-file reads. Search hits/passages do not require full reading. '
+                    'Answer narrow questions with limits; reworded searches are not new evidence.'
+                    if required_paths is not None else 'Recover saved results or read missing source pages.'))
     return text[:2500]

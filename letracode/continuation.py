@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import re
 import time
 
 
@@ -46,6 +47,7 @@ _VOLATILE = frozenset(('id', 'result_id', 'receipt_id', 'call_id', 'tool_call_id
                         'duration', 'duration_seconds', 'elapsed_seconds'))
 _SAVED_CURSORS = frozenset(('after_id', 'through_id', 'next_after_id'))
 _PAGE_ARGUMENTS = frozenset(('offset', 'next_offset', 'start_line', 'end_line', 'max_lines', 'max_chars'))
+_SEARCH_TOOLS = frozenset(('search_project', 'search_memory'))
 
 
 def _without_metadata(value, omitted):
@@ -144,6 +146,8 @@ class RunProgress:
         self.requests, self.actions, self.segments, self.stalls = 0, 0, 1, 0
         self._halted = None
         self._seen = set()
+        self._search_ranges = {}
+        self._search_atoms = set()
         self._source_hashes = {}
         self._generation = 0
         self._effects = {}
@@ -216,12 +220,53 @@ class RunProgress:
             self._generation += 1
         return changed
 
+    def _search_novelty(self, name, args, result):
+        """Credit added source evidence, not a new query, ranking, or subset.
+
+        Source versions and character-range unions identify ordinary search
+        passages. Older or less structured results use individual normalized
+        evidence atoms, so rearranging known results never creates progress.
+        Empty searches and changing scan statistics add no source evidence.
+        """
+        hits = result.get('results', []) if isinstance(result, dict) else result
+        if not isinstance(hits, list):
+            return False
+        scope = result.get('scope', args.get('scope')) if isinstance(result, dict) else args.get('scope')
+        novel = False
+        for hit in hits:
+            if not isinstance(hit, dict):
+                continue
+            path, text, offset = hit.get('path'), hit.get('text'), hit.get('offset')
+            version = hit.get('source_sha256') or hit.get('sha256')
+            extraction = hit.get('extraction')
+            extractor = extraction.get('version') if isinstance(extraction, dict) else None
+            if (isinstance(path, str) and path and isinstance(text, str) and text
+                    and type(offset) is int and offset >= 0 and isinstance(version, str)
+                    and re.fullmatch(r'[a-f0-9]{64}', version)):
+                identity = (name, _canonical(scope), path, version, _canonical(extractor))
+                previous = self._search_ranges.get(identity, [])
+                merged = []
+                for start, end in sorted([*previous, (offset, offset + len(text))]):
+                    if merged and start <= merged[-1][1]:
+                        merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                    else:
+                        merged.append((start, end))
+                novel = novel or merged != previous
+                self._search_ranges[identity] = merged
+            else:
+                # These are returned observations only. Query arguments,
+                # ordering, scores and wrapper metadata never identify them.
+                atom = _canonical([name, scope, _without_metadata(hit, _VOLATILE | {'score', 'rank'})])
+                novel = novel or atom not in self._search_atoms
+                self._search_atoms.add(atom)
+        return novel
+
     def observe(self, name, args, result, result_id, progress=None):
         """Record a saved outcome, returning whether it advances this run.
 
         Repetitions and failures share a consecutive stall budget. `progress`
         may report newly covered source ranges; explicit False overrides source
-        page novelty, while None infers novelty. It cannot turn failure or empty
+        page/search novelty, while None infers novelty. It cannot turn failure or empty
         EOF pages into success. Result row IDs never establish progress.
         """
         if self._halted is not None:
@@ -237,7 +282,9 @@ class RunProgress:
         fingerprint = _fingerprint(name, args, result, empty_page)
         unchanged = isinstance(result, dict) and result.get('unchanged') is True
         novel = fingerprint not in self._seen
-        if source_page and progress is False:
+        if name in _SEARCH_TOOLS:
+            novel = successful and self._search_novelty(name, args, result)
+        if (source_page or name in _SEARCH_TOOLS) and progress is False:
             novel = False
         progressed = successful and not unchanged and (progress is True or changed or novel)
         if empty_page:

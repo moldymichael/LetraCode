@@ -136,7 +136,7 @@ def test_legacy_untracked_source_retains_limitation_without_answer_retries(tmp_p
 def test_real_missing_exposure_is_paged_before_the_terminal_answer(tmp_path, failed_guess):
     store, chat, origin, source = fixture(tmp_path)
     text = 'Source evidence αβ\n' * 800 + 'END OF SOURCE'
-    source.write_text(text)
+    source.write_text(text, encoding='utf-8', newline='')
     steps = ([read(source.with_suffix(''))] if failed_guess else []) + [read(source, max_chars=100), None]
     engine = ScriptedSource(steps)
     ConversationWorker(store, chat, engine).run()

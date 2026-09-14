@@ -100,7 +100,7 @@ TOOL_SCHEMAS = [
     schema('read_tool_result','Retrieve a saved tool result from this chat, without running the action again. Use result_id from its compacted receipt or list_tool_results and follow next_offset.', {'result_id':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['result_id']),
     schema('list_tool_results','Discover saved tool results from this chat, including earlier paused or compacted turns, without rerunning actions. Metadata is partial; use read_tool_result for full saved output. Start after_id=0. For each next page keep through_id and set after_id=next_after_id. limit is 1–20, default 10.', {'after_id':{'type':'integer'},'through_id':{'type':'integer'},'limit':{'type':'integer'}}, []),
     schema('list_files','List any folder the OS account can read, including hidden names (no recursive enumeration). Sources prioritize relevance; they are not access boundaries.', {'path':STRING}, ['path']),
-    schema('read_file','Read numbered lines (start_line/max_lines) or Unicode characters (offset/max_chars, default 4000, range 1–16000). Follow exact next_read_file args, including cut lines; invalid paging returns retry_read_file. Explicit offset wins; max_chars+start_line converts the line to an offset. sha256 is UTF-8 edit authority; PDF/DOCX are read-only (source_sha256/extraction.version). EOF alone proves no whole-file coverage: check source_truncated, extraction scope and verified exposure.', {'path':STRING,'start_line':{'type':'integer'},'max_lines':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['path']),
+    schema('read_file','Read numbered lines (start_line/max_lines) or Unicode characters (offset/max_chars, default 4000, range 1–16000). scope=passage targets a passage; whole_file (default) enables automatic completion for requested full reading. Follow next_read_file when needed; retry_read_file repairs invalid paging. Offset wins; max_chars+start_line converts to characters. sha256 authorizes UTF-8 edits; PDF/DOCX are read-only (source_sha256/extraction.version). EOF alone is not complete exposure: check source_truncated and extraction scope.', {'path':STRING,'scope':{'type':'string','enum':['passage','whole_file']},'start_line':{'type':'integer'},'max_lines':{'type':'integer'},'offset':{'type':'integer'},'max_chars':{'type':'integer'}}, ['path']),
     schema('search_project','Search bounded overlapping character windows of linked source text. Returns diverse partial passages with paths, source lines and character offsets; use read_file to page further.', {'query':STRING}, ['query']),
     # Hermes indexes schema.type as a scalar; anyOf keeps the same nullable contract.
     schema('write_file','Create or replace UTF-8 text with an approved diff and backup. expected_sha256 must match read_file for an existing file; null means create only if absent. Prefer edit_file for a small change.', {'path':STRING,'content':STRING,'expected_sha256':{'anyOf':[{'type':'string'},{'type':'null'}]}}, ['path','content','expected_sha256']),
@@ -321,6 +321,8 @@ class ToolExecutor:
         return {'entries':result, 'limit':300, 'hidden_files_omitted':False}
 
     def _read_file(self, args):
+        if args.get('scope', 'whole_file') not in ('passage', 'whole_file'):
+            raise ValueError('Read scope must be passage or whole_file.')
         path = self._path(args).resolve()
         # Check the actual source first: missing, unreadable or unsupported
         # files cannot be fixed by changing a page cursor.
@@ -332,7 +334,8 @@ class ToolExecutor:
 
         def character_arguments(offset):
             return {'path': str(path), 'offset': offset,
-                    'max_chars': max_chars if valid_size else 4000}
+                    'max_chars': max_chars if valid_size else 4000,
+                    **({'scope': args['scope']} if 'scope' in args else {})}
 
         def pagination_error(message, offset=0):
             # A suggested retry has no coverage: only text returned by a

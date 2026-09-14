@@ -167,7 +167,10 @@ def configured_window(tmp_path, monkeypatch):
     from letracode import ui
     monkeypatch.setattr(ui, 'LocalEngine', RecordingEngine)
     store = Store(tmp_path / 'data')
-    store.set_setting('engine', {'executable': '/llama-server', 'model_path': '/a.gguf', 'secondary_model_path': '/b.gguf'})
+    # Test model routing/retry independently of schema size and checkout paths
+    # in the synthetic tokenizer. Dedicated budgeting tests cover overflow.
+    store.set_setting('engine', {'executable': '/llama-server', 'model_path': '/a.gguf',
+                                'secondary_model_path': '/b.gguf', 'context_size': 16384})
     return MainWindow(store)
 
 

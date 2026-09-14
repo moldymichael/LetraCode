@@ -17,7 +17,7 @@ from .engine import Cancelled, ContextOverflowError
 from .pause_context import payload as row_payload, resolve_intent
 from .continuation import RunHalted, RunLimits, RunProgress, interrupted_outcome
 from .evidence import evidence_state, request_exposure, source_evidence, summary as evidence_summary
-from .reading import SourceReadRecovery
+from .reading import SourceReadRecovery, required_source_paths
 from .tools import ApprovalRequest, TOOL_SCHEMAS, ToolExecutor, tool_enabled
 from .store import now
 
@@ -596,11 +596,11 @@ class ConversationWorker(QThread):
                     'Ten action rounds form one segment; safe progress continues automatically. '
                     'This grants no new user permission. Preserve the original question and latest steering. '
                     'Use saved results, not repeated commands/edits, to recover earlier evidence. '
-                    'A tool-free answer is not proof of task completion. If source coverage is incomplete, '
-                    'retrieve missing pages needed for the original question or explicitly report the limitation; '
-                    'never claim whole-work inspection from partial pages.\n'
+                    'Answer within the evidence: complete required whole-file reads, '
+                    'but do not expand narrow questions into exhaustive reading of search hits.\n'
                     + 'Recent action/verification outcomes: ' + json.dumps(brief, ensure_ascii=False)
-                    + '\n' + evidence_summary(state, max_files=3))
+                    + '\n' + evidence_summary(state, max_files=3,
+                                                required_paths=required_source_paths(current, origin, state)))
 
             context_receipt = {}
             def packed_messages():
@@ -657,7 +657,7 @@ class ConversationWorker(QThread):
                 if not any(tool['function']['name'] == 'read_file' for tool in tools):
                     return False
                 state = evidence_state(current, origin)
-                arguments = reading.next_read(state, path)
+                arguments = reading.next_read(state, path, required_paths=required_source_paths(current, origin, state))
                 if arguments is None:
                     arguments = retry
                 if arguments is None:
@@ -805,13 +805,15 @@ class ConversationWorker(QThread):
                             for row in current)
                         if source_work:
                             data['coverage'] = coverage
+                            data['required_source_paths'] = sorted(required_source_paths(current, origin, coverage))
                         if source_work and coverage['incomplete']:
                             data['task_outcome'] = 'source_incomplete'
                             self.store.update_message(response_id, draft, 'incomplete', payload=data)
                             notice_id = self.store.add_message(self.chat_id, 'notice',
                                 'Provisional response: source coverage is incomplete. '
                                 'Any exhaustive-reading claim in the model response is unverified.\n'
-                                + evidence_summary(coverage, max_files=3),
+                                + evidence_summary(coverage, max_files=3,
+                                                   required_paths=set(data['required_source_paths'])),
                                 payload={'coverage': coverage, 'task_outcome': 'source_incomplete'})
                             self.changed.emit()
                             if observation_halt is not None:
@@ -828,7 +830,8 @@ class ConversationWorker(QThread):
                             self.store.update_message(response_id, draft, 'incomplete', payload=data)
                             self.store.update_message(notice_id,
                                 'Response saved with source limitations. Automatic source reading stopped: '
-                                'coverage remains incomplete or untracked, and no recoverable source page is available. '
+                                'coverage remains incomplete or untracked, and no further required source page can be recovered. '
+                                'Search passages and targeted reads do not imply whole-file inspection. '
                                 'Any exhaustive-reading claim in the response remains unverified. '
                                 'Saved source results and coverage evidence are retained.', 'incomplete',
                                 payload={'coverage': coverage, 'task_outcome': 'source_limited'})
@@ -875,7 +878,7 @@ class ConversationWorker(QThread):
                                 effect_args = executor.execution_arguments(name, args)
                             except (ValueError, OSError, RuntimeError) as error:
                                 identity_error = str(error)
-                        prior = source_signature(self.store.messages(self.chat_id)) if name == 'read_file' else None
+                        prior = source_signature(self.store.messages(self.chat_id)) if name in ('read_file', 'search_project') else None
                         if halted or self.cancel_event.is_set():
                             result = json.dumps({'error': 'Not executed: this run was stopped before this action.',
                                 'executed': False, 'code': halted.reason if halted else 'cancelled'})
@@ -919,7 +922,7 @@ class ConversationWorker(QThread):
                             halted = RunHalted('action_blocker', 'An action failed or was interrupted with effects that need review. Its saved result is evidence, not permission to retry.')
                         else:
                             try:
-                                progress = (prior != source_signature(self.store.messages(self.chat_id))) if name == 'read_file' else None
+                                progress = (prior != source_signature(self.store.messages(self.chat_id))) if name in ('read_file', 'search_project') else None
                                 # Repair invalid paging and repeated source pages
                                 # before a third identical attempt can halt the
                                 # run. Only application-validated paging errors

@@ -35,6 +35,7 @@ Results apply to the commits, dates, environments and test types stated in each 
 | [Windows 0.3.0 release](WINDOWS-RELEASE.md) | Historical native storage, process and installer/portable verification. |
 | [General verification](VERIFICATION.md) | Accumulated dated checks across earlier milestones. |
 | [Reliability verification](RELIABILITY-VERIFICATION.md) | Task recovery and continuation checks. |
+| [Continuation scope verification](CONTINUATION-SCOPE-VERIFICATION.md) | Search evidence, required reading, preserved source limitations and fresh Qwen reruns. |
 | [Real-model acceptance](REAL-MODEL-ACCEPTANCE.md) | Named local engine/model runs and their limits. |
 | [Supervised coding proof](SUPERVISED-CODING-PROOF.md) | Observed coding-workflow evidence and unresolved outcomes. |
 | [Fine-tuning verification](FINE-TUNING-VERIFICATION.md) | Original training integration checks. |
@@ -50,6 +51,8 @@ These remain useful for tracing decisions and migrations. They are not instructi
 [README 0.5.0](README-0.5.0.md), [evaluation and Memory](EVALUATION-MEMORY.md), [project files](PROJECT-FILES-UPDATE.md), and [multi-model update](MULTI-MODEL-UPDATE.md) describe earlier interfaces or milestones.
 
 Recorded maintainer installations: [0.4.0](INSTALLED-0.4.0-UPDATE.md), [0.6.0](INSTALLED-0.6.0-UPDATE.md), [comparison repair](INSTALLED-COMPARISON-UPDATE.md), and [reading repair](INSTALLED-READING-UPDATE.md).
+
+September 14 continuation updates: [initial failed-read repair](INSTALLED-SOURCE-LIMITATIONS-UPDATE.md) and [reading-scope and search-progress repair](INSTALLED-CONTINUATION-SCOPE-UPDATE.md).
 
 ## Keeping this useful
 

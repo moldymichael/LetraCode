@@ -39,6 +39,19 @@ the existing run limits. The user-requested installation is complete; see the
 
 ## Earlier implementation milestones
 
+### September 14 continuation investigation follow-up
+
+The earlier failed-read repair did not distinguish incidental search passages
+from required whole-file reading, and changed search arguments could count as
+progress without new evidence. The focused repair now keeps those concepts
+separate while retaining the full source ledger and explicit complete reading.
+See [behavior and fresh Qwen verification](CONTINUATION-SCOPE-VERIFICATION.md)
+and the [installed update](INSTALLED-CONTINUATION-SCOPE-UPDATE.md).
+The separate conversation-training work and local UI changes are preserved;
+this record does not claim a main merge or published release.
+
+### Previous versions
+
 The **0.5.0 QLoRA update** adds explicit CUDA 4-bit NF4 training with double
 quantization, all-linear adapters, gradient checkpointing and token-weighted
 accumulation. New training setup recommends QLoRA; existing full-precision runs
