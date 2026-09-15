@@ -17,6 +17,7 @@ Start with [the project overview](../README.md). This index separates instructio
 
 | Document | Use / scope |
 | --- | --- |
+| [Development roadmap](ROADMAP.md) | North star, priority order, failure-layer classification and guidance for choosing the next work. |
 | [Contributing](../CONTRIBUTING.md) | Two-person branches/reviews, Windows/Fedora source setup, commands, code map and evidence expectations. |
 | [Release process](RELEASING.md) | Release-owner/verifier handoff, platform evidence, artifact checks and publication checklist. |
 | [Agent instructions](../AGENTS.md) | Baseline selection, preservation and verification rules. |
